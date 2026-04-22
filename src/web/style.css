@@ -1,0 +1,1126 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+/* Keyboard-focus outlines — browser defaults are removed by the reset
+   above, so we put a visible ring back for anyone navigating by Tab.
+   `:focus-visible` fires only on keyboard focus, not on click, so
+   mouse users don't see stray rings on buttons. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+button:focus-visible,
+[role='button']:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* Narrow-viewport notice. ccaudit is a dense table-heavy app; phone
+   layout would be a different product. Show a gentle advisory when
+   the viewport is too small to lay out the filter cluster cleanly. */
+#narrow {
+  display: none;
+  padding: 40px 24px;
+  text-align: center;
+  color: var(--fg3);
+  font-size: 13px;
+  line-height: 1.6;
+}
+#narrow strong {
+  color: var(--fg);
+  display: block;
+  font-size: 15px;
+  margin-bottom: 12px;
+}
+
+@media (max-width: 720px) {
+  #app {
+    display: none;
+  }
+  #narrow {
+    display: block;
+  }
+}
+/* TOKENS */
+html,
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: 'SF Mono', 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 13px;
+  height: 100%;
+  overflow: hidden;
+}
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+header {
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  padding: 8px 16px;
+  background: var(--bg2);
+}
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+#search {
+  width: 220px;
+  flex-shrink: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  padding: 3px 8px;
+  border-radius: 3px;
+  font: inherit;
+  font-size: 11px;
+  outline: none;
+}
+#search:focus {
+  border-color: var(--fg3);
+}
+/* Breadcrumb showing project / session path. Sits between #title and the
+   filter cluster. Both segments are <a>-ish — clickable when populated,
+   dim-and-muted (—) when not applicable. */
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--fg3);
+  margin-left: 4px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+.crumb-lbl {
+  color: var(--fg3);
+  text-transform: lowercase;
+  letter-spacing: 0.2px;
+}
+.crumb {
+  color: var(--fg);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 280px;
+  text-decoration: none;
+}
+.crumb:hover {
+  color: var(--accent);
+}
+.crumb.dim {
+  color: var(--fg3);
+  cursor: default;
+  pointer-events: none;
+}
+.crumb-sep {
+  color: var(--fg3);
+}
+#back {
+  background: none;
+  border: none;
+  color: var(--fg2);
+  padding: 2px 6px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 14px;
+  width: 24px;
+  text-align: center;
+}
+#back:hover {
+  color: var(--fg);
+}
+#back.hidden {
+  visibility: hidden;
+}
+main {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0;
+}
+main::-webkit-scrollbar {
+  width: 5px;
+}
+main::-webkit-scrollbar-track {
+  background: transparent;
+}
+main::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+
+.msg {
+  padding: 6px 16px 6px 12px;
+  border-bottom: 1px solid var(--border);
+}
+/* CSS-level kind filters: toggling a kind off flips the class on main
+   so messages disappear instantly without a JS re-render. */
+main.hide-k-User [data-msgkind='User'],
+main.hide-k-Assistant [data-msgkind='Assistant'],
+main.hide-k-ToolUse [data-msgkind='ToolUse'],
+main.hide-k-ToolResult [data-msgkind='ToolResult'],
+main.hide-k-Thinking [data-msgkind='Thinking'],
+main.hide-k-System [data-msgkind='System'] {
+  display: none;
+}
+.msg-h {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 2px;
+}
+.tg {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+/* In-message tag pills. Color comes from the kind token; background
+   is a fixed-alpha tint of the same. color-mix keeps both sides of the
+   pair in lockstep with the token, no duplicated colour literals. */
+.tg-u {
+  color: var(--k-user);
+  background: color-mix(in srgb, var(--k-user) 12%, transparent);
+}
+.tg-a {
+  color: var(--k-assistant);
+  background: color-mix(in srgb, var(--k-assistant) 12%, transparent);
+}
+.tg-t {
+  color: var(--k-tooluse);
+  background: color-mix(in srgb, var(--k-tooluse) 10%, transparent);
+}
+.tg-r {
+  color: var(--k-toolresult);
+  background: color-mix(in srgb, var(--k-toolresult) 14%, transparent);
+}
+.tg-k {
+  color: var(--k-thinking);
+  background: color-mix(in srgb, var(--k-thinking) 10%, transparent);
+}
+.tg-s {
+  color: var(--k-system);
+  background: color-mix(in srgb, var(--k-system) 14%, transparent);
+}
+/* Sticky header row above the message list labeling the meta columns
+   on the right. Grid cells reuse the widths from `.msg-meta` below so
+   the labels align with the values. */
+.msg-header {
+  display: flex;
+  align-items: baseline;
+  padding: 6px 16px 6px 12px;
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 10;
+  border-bottom: 1px solid var(--border);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: var(--fg3);
+}
+.msg-header-lbl {
+  flex: 1;
+}
+.msg-header .msg-meta span {
+  color: var(--fg3);
+}
+.msg-header .msg-meta span:nth-child(2) {
+  text-align: center;
+}
+.msg-sort {
+  cursor: pointer;
+  user-select: none;
+}
+.msg-sort:hover {
+  color: var(--fg);
+}
+.msg-sort.active {
+  color: var(--accent);
+}
+
+/* Per-message meta block — sits on the right of .msg-h as a fixed-column
+   trio: date | who-tag | tokens. Same grid convention as every other
+   listing in the app, so the eye lands on the same places at the same
+   horizontal position no matter which view it's in. */
+.msg-meta {
+  margin-left: auto;
+  display: grid;
+  grid-template-columns: 110px 62px 80px;
+  align-items: baseline;
+  gap: 8px;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+.msg-tm {
+  color: var(--fg3);
+  font-size: 10px;
+  text-align: right;
+  white-space: nowrap;
+}
+.msg-tk {
+  font-size: 10px;
+  color: var(--fg3);
+  text-align: right;
+  white-space: nowrap;
+}
+.msg-meta .tg {
+  text-align: center;
+}
+.msg-b {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.5;
+  font-size: 12px;
+}
+.dim {
+  color: var(--fg3);
+}
+.msg-u {
+  background: var(--bg2);
+}
+
+.st {
+  display: flex;
+  gap: 14px;
+  padding: 6px 16px;
+  color: var(--fg3);
+  font-size: 11px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.sv {
+  color: var(--fg);
+}
+/* Empty / error / "no data" states — structured as glyph + title +
+   body so the user gets immediate shape (this is the empty state, not
+   a loading one) and optional detail. Same layout for every surface. */
+.empty {
+  padding: 48px 24px;
+  text-align: center;
+  color: var(--fg3);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+.empty-icon {
+  font-size: 28px;
+  line-height: 1;
+  color: var(--fg3);
+  opacity: 0.5;
+  margin-bottom: 8px;
+}
+.empty-title {
+  font-size: 13px;
+  color: var(--fg);
+  font-weight: 500;
+}
+.empty-body {
+  font-size: 11px;
+  color: var(--fg3);
+  max-width: 440px;
+}
+.empty.error .empty-icon {
+  color: var(--red);
+  opacity: 0.7;
+}
+.empty.error .empty-title {
+  color: var(--red);
+}
+.hl {
+  background: #ffd84a;
+  color: #1a1510;
+  border-radius: 2px;
+  padding: 0 2px;
+  font-weight: 600;
+}
+.loading {
+  padding: 40px;
+  text-align: center;
+  color: var(--fg3);
+}
+
+.filters {
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.fbtn {
+  font-size: 10px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: none;
+  color: var(--fg3);
+  cursor: pointer;
+  font-family: inherit;
+}
+/* When a kind-filter button is `.on` it picks up that kind's token so
+   the button color matches the matching in-message tag pill. */
+.fbtn.on {
+  color: var(--fg);
+  border-color: var(--fg3);
+}
+.fbtn[data-kind='User'].on {
+  color: var(--k-user);
+  border-color: var(--k-user);
+}
+.fbtn[data-kind='Assistant'].on {
+  color: var(--k-assistant);
+  border-color: var(--k-assistant);
+}
+.fbtn[data-kind='ToolUse'].on {
+  color: var(--k-tooluse);
+  border-color: var(--k-tooluse);
+}
+.fbtn[data-kind='ToolResult'].on {
+  color: var(--k-toolresult);
+  border-color: var(--k-toolresult);
+}
+.fbtn[data-kind='Thinking'].on {
+  color: var(--k-thinking);
+  border-color: var(--k-thinking);
+}
+.fbtn[data-kind='System'].on {
+  color: var(--k-system);
+  border-color: var(--k-system);
+}
+.fbtn:hover {
+  border-color: var(--fg3);
+}
+
+/* Custom site-themed dropdown — replaces native <select> everywhere.
+   Button + absolutely-positioned menu; delegated JS handles toggle
+   and item selection. No OS popup. */
+.drop {
+  position: relative;
+  display: inline-block;
+  font-family: inherit;
+}
+.drop-btn {
+  font-size: 11px;
+  padding: 3px 20px 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+  font-family: inherit;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.drop-btn:hover {
+  border-color: var(--fg3);
+}
+.drop-arr {
+  font-size: 8px;
+  color: var(--fg3);
+  margin-left: 2px;
+  line-height: 1;
+}
+.drop-menu {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  min-width: 100%;
+  width: max-content;
+  max-width: min(420px, 90vw);
+  background: var(--bg2);
+  border: 1px solid var(--fg3);
+  border-radius: 3px;
+  max-height: 320px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  z-index: 200;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  padding: 2px;
+}
+/* Right-side dropdowns (inside the filter cluster) open leftward so
+   the menu doesn't get clipped by the viewport edge. */
+.filterset .drop-menu {
+  left: auto;
+  right: 0;
+}
+.drop-menu.hidden {
+  display: none;
+}
+.drop-item {
+  padding: 4px 12px;
+  font-size: 11px;
+  color: var(--fg);
+  cursor: pointer;
+  white-space: nowrap;
+  border-radius: 2px;
+}
+.drop-item:hover {
+  background: var(--bg3);
+}
+.drop-item.on {
+  color: var(--accent);
+}
+/* Multi-select model dropdown: flex layout reserves space at the right
+   so the trailing ✓ doesn't shift label widths between selected/not. */
+[data-drop='model'] .drop-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 18px;
+}
+[data-drop='model'] .drop-item::after {
+  content: '✓';
+  color: var(--accent);
+  font-size: 10px;
+  opacity: 0;
+  transition: opacity 0.08s;
+}
+[data-drop='model'] .drop-item.on::after {
+  opacity: 0.7;
+}
+
+/* Themed checkbox — appearance:none strips the OS paint, ::after
+   draws the check in site colors. */
+.fchk {
+  font-size: 11px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--fg3);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  user-select: none;
+  font-family: inherit;
+}
+.fchk input {
+  appearance: none;
+  width: 11px;
+  height: 11px;
+  margin: 0;
+  border: 1px solid var(--fg3);
+  border-radius: 2px;
+  background: var(--bg);
+  cursor: pointer;
+  position: relative;
+  flex-shrink: 0;
+}
+.fchk input:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.fchk input:checked::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 3px;
+  width: 3px;
+  height: 6px;
+  border: solid var(--bg);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.fchk.on {
+  color: var(--fg);
+  border-color: var(--fg3);
+}
+.dateinp {
+  font-size: 11px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: inherit;
+  outline: none;
+  color-scheme: dark;
+}
+.dateinp:hover,
+.dateinp:focus {
+  border-color: var(--fg3);
+}
+.dateinp::-webkit-calendar-picker-indicator {
+  filter: invert(0.6);
+  cursor: pointer;
+}
+.filterset {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.presets {
+  display: flex;
+  gap: 2px;
+}
+.pbtn {
+  font-size: 11px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--fg3);
+  cursor: pointer;
+  font-family: inherit;
+}
+.pbtn:hover {
+  border-color: var(--fg3);
+  color: var(--fg);
+}
+.pbtn.on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.pbtn.reset {
+  color: var(--yellow);
+  border-color: color-mix(in srgb, var(--yellow) 25%, transparent);
+}
+.pbtn.reset:hover {
+  color: var(--yellow);
+  border-color: var(--yellow);
+}
+.pbtn.dim {
+  color: var(--fg3);
+  border-color: var(--border);
+  opacity: 0.4;
+  cursor: default;
+}
+.pbtn.dim:hover {
+  color: var(--fg3);
+  border-color: var(--border);
+}
+
+pre.code {
+  background: var(--bg3);
+  padding: 8px 10px;
+  border-radius: 3px;
+  overflow-x: auto;
+  margin: 6px 0;
+  font-size: 11px;
+  border: 1px solid var(--border);
+  line-height: 1.45;
+}
+pre.code code {
+  display: block;
+  white-space: pre;
+}
+.kw {
+  color: var(--magenta);
+}
+.st {
+  color: var(--green);
+}
+.nm {
+  color: var(--yellow);
+}
+.cm {
+  color: var(--fg3);
+  font-style: italic;
+}
+.msg-merge {
+  color: var(--fg3);
+  font-size: 10px;
+  margin-left: 4px;
+}
+
+#btt {
+  position: fixed;
+  bottom: 18px;
+  right: 20px;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--bg2);
+  color: var(--fg);
+  cursor: pointer;
+  font-size: 14px;
+  z-index: 50;
+  align-items: center;
+  justify-content: center;
+  display: none;
+  font-family: inherit;
+}
+#btt.on {
+  display: flex;
+}
+#btt:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+details.msg {
+  padding: 0;
+}
+details.msg > summary {
+  padding: 6px 16px 6px 12px;
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+details.msg > summary::-webkit-details-marker {
+  display: none;
+}
+details.msg > summary::before {
+  content: '\25b6';
+  font-size: 8px;
+  color: var(--fg3);
+  transition: transform 0.1s;
+}
+details.msg[open] > summary::before {
+  transform: rotate(90deg);
+}
+details.msg > .msg-b {
+  padding: 2px 16px 8px 28px;
+}
+.msg-preview {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  color: var(--fg2);
+}
+.resume {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 11px;
+  border: 1px solid var(--border);
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+.resume:hover {
+  border-color: var(--accent);
+}
+.search-proj {
+  color: var(--fg3);
+  margin-right: 6px;
+}
+.msg-match {
+  border-left: 2px solid var(--accent);
+}
+.msg-focus {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.match-info {
+  color: var(--accent);
+  font-size: 11px;
+}
+.match-info kbd {
+  font-size: 10px;
+  padding: 0 3px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  color: var(--fg2);
+}
+.cost-val {
+  color: var(--green);
+}
+
+.dash {
+  padding: 16px;
+}
+.dash h2 {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg2);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin: 20px 0 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.dash h2:first-child {
+  margin-top: 0;
+}
+.cards {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px 12px;
+  overflow: hidden;
+}
+.card-val {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg);
+  line-height: 1.3;
+  word-break: break-all;
+}
+.card-val.green {
+  color: var(--green);
+}
+.card-lbl {
+  font-size: 10px;
+  color: var(--fg3);
+  margin-top: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.heatmap-wrap {
+  position: relative;
+  overflow-x: auto;
+}
+.heatmap {
+  display: flex;
+  gap: 2px;
+  padding: 4px 0;
+}
+.heatmap-col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+  max-width: 14px;
+}
+.heatmap-cell {
+  aspect-ratio: 1;
+  border-radius: 2px;
+  background: var(--bg3);
+  position: relative;
+  cursor: pointer;
+}
+.heatmap-cell.l1 {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.heatmap-cell.l2 {
+  background: color-mix(in srgb, var(--accent) 36%, transparent);
+}
+.heatmap-cell.l3 {
+  background: color-mix(in srgb, var(--accent) 58%, transparent);
+}
+.heatmap-cell.l4 {
+  background: color-mix(in srgb, var(--accent) 82%, transparent);
+}
+.heatmap-lbl {
+  display: flex;
+  gap: 3px;
+  margin-top: 6px;
+  align-items: center;
+}
+.heatmap-lbl span {
+  font-size: 9px;
+  color: var(--fg3);
+}
+.heatmap-lbl .heatmap-cell {
+  width: 11px;
+  height: 11px;
+  flex-shrink: 0;
+  cursor: default;
+  aspect-ratio: initial;
+}
+
+.dash-charts {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) 2fr;
+  grid-template-areas: 'pie hist' 'pie heat';
+  gap: 10px;
+  width: 80%;
+  margin: 0 auto 12px;
+}
+.pie-panel {
+  grid-area: pie;
+}
+.hist-panel {
+  grid-area: hist;
+}
+.heat-panel {
+  grid-area: heat;
+}
+.chart-panel {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 12px 14px;
+  min-width: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.chart-panel h3 {
+  font-size: 10px;
+  color: var(--fg3);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  margin-bottom: 8px;
+  font-weight: 500;
+}
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.panel-head h3 {
+  margin-bottom: 0;
+}
+.hist-toggle {
+  display: flex;
+  gap: 2px;
+}
+.hist-toggle .pbtn {
+  font-size: 10px;
+  padding: 2px 8px;
+  text-transform: lowercase;
+  letter-spacing: normal;
+}
+
+.pie-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+.pie-svg {
+  width: 100%;
+  max-width: 340px;
+  height: auto;
+  display: block;
+}
+.pie-svg path {
+  cursor: pointer;
+  transition: opacity 0.1s;
+}
+.pie-svg path:hover {
+  opacity: 0.8;
+}
+.pie-legend {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 10px;
+  line-height: 1.4;
+}
+/* Pie legend rows: swatch | name (flex) | pct (fixed) | cost (fixed).
+   Grid layout aligns the right two columns regardless of model name
+   length, which used to ride along on a single right-anchored span and
+   bounce around with the percentage's character count. */
+.pie-item {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) 42px 70px;
+  align-items: center;
+  gap: 6px;
+}
+.pie-sw {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+.pie-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--fg);
+}
+.pie-pct {
+  color: var(--fg3);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.pie-cost {
+  color: var(--fg3);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.hist-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+/* Fixed-aspect viewBox (~3.6:1) matched to the typical panel aspect.
+   width:100% + height:auto scales uniformly so the chart fills the
+   panel in both dimensions without distortion. */
+.hist-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.hist-legend {
+  display: flex;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--fg2);
+  flex-wrap: wrap;
+  align-items: center;
+  padding: 0 4px;
+}
+.hist-legend .pie-sw {
+  margin-right: 3px;
+}
+.hist-log-toggle {
+  font-size: 10px;
+  padding: 1px 6px;
+  color: var(--fg3);
+}
+.hist-log-toggle:hover {
+  color: var(--fg);
+  border-color: var(--fg3);
+}
+.hist-hit {
+  cursor: pointer;
+}
+.hist-hit:hover {
+  fill: rgba(255, 255, 255, 0.04);
+}
+.heatmap-tip {
+  position: fixed;
+  background: var(--bg2);
+  border: 1px solid var(--fg3);
+  border-radius: 4px;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--fg);
+  pointer-events: none;
+  z-index: 100;
+  white-space: nowrap;
+  display: none;
+}
+.heatmap-tip .tip-date {
+  color: var(--fg2);
+  margin-bottom: 2px;
+}
+/* Unified table — used everywhere a list of rows is rendered (landing
+   projects, project's sessions list, search results, dashboard sub-
+   tables). Single column schema so columns align across pages and the
+   eye learns one mental model. Header cells are click-sortable.
+   Column widths are sized to fit BOTH the header (which may embed a
+   count like "Tokens (1_823_456_789)") AND the widest realistic value. */
+.utable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  table-layout: fixed;
+}
+.utable th {
+  text-align: left;
+  color: var(--fg3);
+  font-weight: 500;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  background: var(--bg);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  user-select: none;
+}
+.utable th.r {
+  text-align: right;
+}
+.utable th.sortable {
+  cursor: pointer;
+}
+.utable th.sortable:hover {
+  color: var(--fg);
+}
+/* Active sort column — subtle accent on the header text. No arrow
+   chrome; clicking again reverses direction (users figure that out). */
+.utable th.active {
+  color: var(--accent);
+}
+.utable td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+.utable td.r {
+  text-align: right;
+}
+.utable td.dim {
+  color: var(--fg3);
+}
+.utable td.tipcell {
+  cursor: help;
+}
+.utable tr.clickable {
+  cursor: pointer;
+}
+.utable tr.clickable:hover td {
+  background: var(--bg2);
+}
+/* Keyboard cursor (j/k/arrows). Same background as :hover — no edge
+   bar or accent, just the highlighted row. */
+.utable tr.sel td {
+  background: var(--bg2);
+}
+.utable .col-date {
+  width: 140px;
+}
+.utable .col-sess {
+  width: 120px;
+}
+.utable .col-msgs {
+  width: 120px;
+}
+.utable .col-tok {
+  width: 200px;
+}
+.utable .col-cost {
+  width: 160px;
+}
+.utable .col-dur {
+  width: 110px;
+}
+/* "More" expander row at the bottom of paginated dashboard tables.
+   Two chips: "▼ N more" (+12) and "▾ All" (jump to Infinity). Each is
+   independently clickable; the row itself isn't a target so misclicks
+   between them don't fire either action. */
+.utable .more-row td {
+  text-align: center;
+  color: var(--fg3);
+  padding: 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.utable .more-chip {
+  display: inline-block;
+  padding: 2px 10px;
+  margin: 0 4px;
+  cursor: pointer;
+  border-radius: 3px;
+}
+.utable .more-chip:hover {
+  color: var(--accent);
+  background: var(--bg2);
+}
+.utable .more-all {
+  color: var(--fg);
+}

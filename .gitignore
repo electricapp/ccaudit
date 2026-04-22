@@ -1,0 +1,10 @@
+/target
+/node_modules
+/.claude/
+
+# Build artifacts — platform binaries are produced by the release workflow
+# (see .github/workflows/release.yml) and must not be committed. Covers
+# both the current `ccaudit` name and the legacy `cclog` name defensively
+# so a leftover-on-disk binary can never get re-staged by accident.
+/npm/*/ccaudit
+/npm/*/cclog

@@ -1,0 +1,3 @@
+# Binaries for each platform are copied into this directory at build
+# time by the Makefile (`make pypi-stage-<target>`). This placeholder
+# keeps the directory in git — it's empty at rest.

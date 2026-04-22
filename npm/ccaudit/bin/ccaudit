@@ -1,0 +1,35 @@
+#!/usr/bin/env node
+const { spawnSync } = require("child_process");
+const path = require("path");
+const os = require("os");
+
+const PLATFORMS = {
+  "darwin-arm64": "@ccaudit/darwin-arm64",
+  "darwin-x64": "@ccaudit/darwin-x64",
+  "linux-x64": "@ccaudit/linux-x64",
+  "linux-arm64": "@ccaudit/linux-arm64",
+};
+
+const key = `${os.platform()}-${os.arch()}`;
+const pkg = PLATFORMS[key];
+if (!pkg) {
+  console.error(`ccaudit: unsupported platform ${key}`);
+  process.exit(1);
+}
+
+let bin;
+try {
+  bin = path.join(require.resolve(`${pkg}/package.json`), "..", "ccaudit");
+} catch {
+  // Fallback: check sibling directory (monorepo / local dev layout)
+  const local = path.join(__dirname, "..", "..", pkg.split("/")[1], "ccaudit");
+  if (require("fs").existsSync(local)) {
+    bin = local;
+  } else {
+    console.error(`ccaudit: package ${pkg} not installed`);
+    process.exit(1);
+  }
+}
+
+const r = spawnSync(bin, process.argv.slice(2), { stdio: "inherit" });
+process.exit(r.status ?? 1);

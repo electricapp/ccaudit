@@ -1,0 +1,19 @@
+{
+  "name": "ccaudit",
+  "version": "0.1.0",
+  "description": "Fast Claude Code token usage analyzer (ccusage-compatible CLI, Rust native).",
+  "license": "MIT",
+  "keywords": ["claude", "claude-code", "ccusage", "tokens", "usage", "cost"],
+  "bin": {
+    "ccaudit": "bin/ccaudit"
+  },
+  "files": ["bin/ccaudit"],
+  "optionalDependencies": {
+    "@ccaudit/darwin-arm64": "0.1.0",
+    "@ccaudit/darwin-x64": "0.1.0",
+    "@ccaudit/linux-x64": "0.1.0",
+    "@ccaudit/linux-arm64": "0.1.0"
+  },
+  "os": ["darwin", "linux"],
+  "cpu": ["arm64", "x64"]
+}

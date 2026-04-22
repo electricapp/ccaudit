@@ -1,0 +1,79 @@
+name: CI
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+# Lock down default perms; each job adds only what it needs.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.84.0"
+
+jobs:
+  # ── Rust: build + test + clippy + rustfmt ──
+  rust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal --component clippy,rustfmt
+          rustup default "${RUST_TOOLCHAIN}"
+          rustc --version
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy (all features, deny warnings)
+        run: cargo clippy --all-features --all-targets -- -D warnings
+
+      - name: build (release, all features)
+        run: cargo build --release --all-features
+
+      - name: test
+        run: cargo test --release --all-features
+
+  # ── Web assets: prettier + eslint + stylelint + JS unit tests ──
+  web:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: "22"
+
+      - name: Install pinned dev tooling
+        run: npm ci
+
+      - name: prettier
+        run: ./node_modules/.bin/prettier --check src/web/app.js src/web/style.css src/web/util.js src/web/test.js
+
+      - name: eslint
+        run: ./node_modules/.bin/eslint src/web/app.js src/web/util.js
+
+      - name: stylelint
+        run: ./node_modules/.bin/stylelint src/web/style.css
+
+      - name: JS unit tests (headless)
+        run: node src/web/run-tests.js

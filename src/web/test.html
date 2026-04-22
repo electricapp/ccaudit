@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>ccaudit — util tests</title>
+    <style>
+      body {
+        font-family: -apple-system, system-ui, sans-serif;
+        background: #14110e;
+        color: #ddd;
+        margin: 0;
+        padding: 24px;
+        line-height: 1.5;
+      }
+      h1 {
+        font-size: 16px;
+        margin: 0 0 16px;
+      }
+      #out {
+        font-family: 'SF Mono', Menlo, monospace;
+        font-size: 12px;
+      }
+      .ok {
+        color: #7bc97b;
+      }
+      .fail {
+        color: #ff7b7b;
+      }
+      .skip {
+        color: #888;
+      }
+      .suite {
+        margin-top: 14px;
+        color: #aaa;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+        font-size: 10px;
+      }
+      #summary {
+        margin-top: 24px;
+        padding-top: 12px;
+        border-top: 1px solid #333;
+        font-size: 14px;
+      }
+      #summary.pass {
+        color: #7bc97b;
+      }
+      #summary.fail {
+        color: #ff7b7b;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>ccaudit — util tests</h1>
+    <p style="color: #888; font-size: 12px">
+      Pure JS test runner. No Node, no build step. Open this file in a browser (file:// works) to
+      run.
+    </p>
+    <div id="out"></div>
+    <div id="summary"></div>
+    <!-- util.js first — defines the functions under test as globals. -->
+    <script src="util.js"></script>
+    <!-- test.js uses those globals and writes results into #out. -->
+    <script src="test.js"></script>
+  </body>
+</html>

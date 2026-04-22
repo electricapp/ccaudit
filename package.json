@@ -1,0 +1,19 @@
+{
+  "name": "ccaudit-web-tooling",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Lint/format tooling for the web view's standalone JS+CSS (src/web/{app.js,style.css}). Not a publishable package — exists only so eslint/stylelint/prettier are pinned and one-command runnable.",
+  "scripts": {
+    "lint:js": "eslint src/web/app.js",
+    "lint:css": "stylelint src/web/style.css",
+    "format": "prettier --write src/web/app.js src/web/style.css",
+    "lint": "npm run lint:js && npm run lint:css"
+  },
+  "devDependencies": {
+    "eslint": "^9.0.0",
+    "globals": "^15.0.0",
+    "prettier": "^3.0.0",
+    "stylelint": "^16.0.0",
+    "stylelint-config-standard": "^36.0.0"
+  }
+}

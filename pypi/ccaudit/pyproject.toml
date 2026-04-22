@@ -1,0 +1,52 @@
+# ccaudit — PyPI packaging.
+#
+# One package, many platform wheels (ruff / rye pattern). At release
+# time the Makefile copies the pre-built binary from
+# `target/<triple>/release/ccaudit` into `src/ccaudit/bin/ccaudit`, then
+# runs `python -m build --wheel -C--build-option=--plat-name=<tag>`
+# once per target. The resulting wheels have distinct platform tags;
+# PyPI / uv / pip pick the right one at install time.
+#
+# The Python package itself is almost empty — just an entry point that
+# finds the bundled binary and execs it. See `src/ccaudit/__main__.py`.
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ccaudit"
+version = "0.1.0"
+description = "Fast Claude Code log viewer — CLI + TUI + web. Single Rust binary, ~10 ms warm start."
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "electricapp" }]
+keywords = ["claude", "claude-code", "ccusage", "tokens", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Rust",
+    "Topic :: Utilities",
+]
+
+[project.scripts]
+ccaudit = "ccaudit.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/electricapp/ccaudit"
+Repository = "https://github.com/electricapp/ccaudit"
+Issues = "https://github.com/electricapp/ccaudit/issues"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# The `bin/ccaudit` file is staged in by the Makefile before wheel build.
+# Without this, setuptools strips it from the source distribution.
+[tool.setuptools.package-data]
+ccaudit = ["bin/ccaudit", "bin/ccaudit.exe"]

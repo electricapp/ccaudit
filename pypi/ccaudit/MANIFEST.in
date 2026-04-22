@@ -1,0 +1,4 @@
+# The bundled binary is dropped in at build time by the Makefile.
+# Setuptools' default sdist pickles exclude non-Python files, so list
+# the binary explicitly — otherwise the sdist would ship without it.
+recursive-include src/ccaudit/bin *
