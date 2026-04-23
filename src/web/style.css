@@ -368,35 +368,37 @@ main.hide-k-System [data-msgkind='System'] {
   cursor: pointer;
   font-family: inherit;
 }
-/* When a kind-filter button is `.on` it picks up that kind's token so
-   the button color matches the matching in-message tag pill. */
+/* When a kind-filter button is `.on` it gets a pill-style tint fill.
+   Kinds with distinct hues (user/assistant/tooluse/thinking) use a
+   tint of that hue. ToolResult and System both alias FG3 (see
+   src/style.rs), so a tint of their "color" is just more grey — they
+   fall through to the base on-state below, which uses a solid bg3
+   fill + full-brightness fg text so on/off is unambiguous. */
 .fbtn.on {
   color: var(--fg);
-  border-color: var(--fg3);
+  border-color: var(--fg2);
+  background: var(--bg3);
+  font-weight: 600;
 }
 .fbtn[data-kind='User'].on {
   color: var(--k-user);
   border-color: var(--k-user);
+  background: color-mix(in srgb, var(--k-user) 14%, transparent);
 }
 .fbtn[data-kind='Assistant'].on {
   color: var(--k-assistant);
   border-color: var(--k-assistant);
+  background: color-mix(in srgb, var(--k-assistant) 14%, transparent);
 }
 .fbtn[data-kind='ToolUse'].on {
   color: var(--k-tooluse);
   border-color: var(--k-tooluse);
-}
-.fbtn[data-kind='ToolResult'].on {
-  color: var(--k-toolresult);
-  border-color: var(--k-toolresult);
+  background: color-mix(in srgb, var(--k-tooluse) 12%, transparent);
 }
 .fbtn[data-kind='Thinking'].on {
   color: var(--k-thinking);
   border-color: var(--k-thinking);
-}
-.fbtn[data-kind='System'].on {
-  color: var(--k-system);
-  border-color: var(--k-system);
+  background: color-mix(in srgb, var(--k-thinking) 12%, transparent);
 }
 .fbtn:hover {
   border-color: var(--fg3);

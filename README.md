@@ -4,8 +4,9 @@ Fast, local Claude Code log viewer. CLI, TUI, and static web — Rust binary, <1
 
 Read your `~/.claude/projects/` logs without opening Node. Know what you spent, on what, and see the full conversation.
 
-<!-- TODO: add `docs/tui.png`, `docs/web.png`, and a short GIF once captured. -->
-<!-- ![TUI](docs/tui.png) · ![Web](docs/web.png) -->
+<p align="center">
+  <img src="docs/dashboard.png" alt="ccaudit web dashboard" width="900">
+</p>
 
 ```
 ccaudit daily                         # token usage + cost, today and lately
