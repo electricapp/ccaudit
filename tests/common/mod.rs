@@ -72,8 +72,8 @@ impl Harness {
 
 fn bin_path() -> PathBuf {
     // Cargo exposes the test binary's sibling via CARGO_BIN_EXE_ccaudit.
-    let p =
-        std::env::var("CARGO_BIN_EXE_ccaudit").unwrap_or_else(|_| "target/release/ccaudit".to_string());
+    let p = std::env::var("CARGO_BIN_EXE_ccaudit")
+        .unwrap_or_else(|_| "target/release/ccaudit".to_string());
     let pb = PathBuf::from(&p);
     if pb.exists() {
         return pb;
