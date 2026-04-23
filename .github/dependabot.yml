@@ -1,9 +1,3 @@
-# Dependabot — aggressive daily updates across every manifest in the repo.
-#
-# Five ecosystems are watched (cargo, two npm entry points, pip, and
-# github-actions). Platform-specific npm packages under npm/<triple>/
-# are intentionally omitted: they contain no dependencies, only a name +
-# the bundled native binary.
 version: 2
 updates:
   # Rust dependencies (Cargo.toml / Cargo.lock).
