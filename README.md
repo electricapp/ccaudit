@@ -2,8 +2,6 @@
 
 Fast, local Claude Code log viewer. CLI, TUI, and static web — Rust binary, <1.3 MB.
 
-Read your `~/.claude/projects/` logs without opening Node. Know what you spent, on what, and see the full conversation.
-
 <p align="center">
   <img src="docs/dashboard.png" alt="ccaudit web dashboard" width="900">
 </p>
