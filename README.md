@@ -6,6 +6,10 @@ Fast, local Claude Code log viewer. CLI, TUI, and static web — Rust binary, <1
   <img src="docs/dashboard.png" alt="ccaudit web dashboard" width="900">
 </p>
 
+<p align="center">
+  <img src="docs/cli-daily.png" alt="ccaudit daily CLI output" width="900">
+</p>
+
 ```
 ccaudit daily                         # token usage + cost, today and lately
 ccaudit tui                           # interactive terminal browser
