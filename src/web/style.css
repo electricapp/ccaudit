@@ -279,7 +279,7 @@ main.hide-k-System [data-msgkind='System'] {
 }
 .msg-b {
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
   line-height: 1.5;
   font-size: 12px;
 }
@@ -449,7 +449,7 @@ main.hide-k-System [data-msgkind='System'] {
   overflow-y: auto;
   overflow-x: hidden;
   z-index: 200;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 4px 12px rgb(0, 0, 0, 0.4);
   padding: 2px;
 }
 /* Right-side dropdowns (inside the filter cluster) open leftward so
@@ -993,7 +993,7 @@ details.msg > .msg-b {
   cursor: pointer;
 }
 .hist-hit:hover {
-  fill: rgba(255, 255, 255, 0.04);
+  fill: rgb(255, 255, 255, 0.04);
 }
 .heatmap-tip {
   position: fixed;
