@@ -2,7 +2,11 @@ name: CI
 on:
   push:
     branches: [master, main]
+    paths-ignore:
+      - '**/*.md'
   pull_request:
+    paths-ignore:
+      - '**/*.md'
 
 # Lock down default perms; each job adds only what it needs.
 permissions:
