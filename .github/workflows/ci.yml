@@ -10,7 +10,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: "1.84.0"
+  RUST_TOOLCHAIN: "1.95.0"
 
 jobs:
   # ── Rust: build + test + clippy + rustfmt ──
