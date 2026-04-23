@@ -7,6 +7,11 @@ updates:
       interval: daily
     open-pull-requests-limit: 99
     labels: ["dependencies", "rust"]
+    ignore:
+      # bincode 3.0 is a full rewrite with a new API and changed on-disk
+      # format; on-disk cache migration deferred. Allow minor/patch.
+      - dependency-name: "bincode"
+        update-types: ["version-update:semver-major"]
 
   # Web-asset dev tooling (eslint / prettier / stylelint pinned in
   # the top-level package.json).
