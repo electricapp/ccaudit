@@ -1,0 +1,50 @@
+# Dependabot — aggressive daily updates across every manifest in the repo.
+#
+# Five ecosystems are watched (cargo, two npm entry points, pip, and
+# github-actions). Platform-specific npm packages under npm/<triple>/
+# are intentionally omitted: they contain no dependencies, only a name +
+# the bundled native binary.
+version: 2
+updates:
+  # Rust dependencies (Cargo.toml / Cargo.lock).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 99
+    labels: ["dependencies", "rust"]
+
+  # Web-asset dev tooling (eslint / prettier / stylelint pinned in
+  # the top-level package.json).
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 99
+    labels: ["dependencies", "npm"]
+
+  # Main npm wrapper package (tiny JS shim that locates and execs the
+  # bundled native binary at install time).
+  - package-ecosystem: npm
+    directory: "/npm/ccaudit"
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 99
+    labels: ["dependencies", "npm"]
+
+  # PyPI packaging — build-system requirements in pyproject.toml.
+  - package-ecosystem: pip
+    directory: "/pypi/ccaudit"
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 99
+    labels: ["dependencies", "python"]
+
+  # GitHub Actions workflows — Dependabot bumps both the SHA pin and
+  # the trailing version comment.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 99
+    labels: ["dependencies", "actions"]
