@@ -27,15 +27,15 @@ Inspired by:
 - [claude-code-log](https://github.com/daaain/claude-code-log)
 - [claude-session-dashboard](https://github.com/dlupiak/claude-session-dashboard)
 
-|                       | ccaudit                    | ccusage        | claude-code-log    | claude-session-dashboard |
+|                       | ccaudit                  | ccusage        | claude-code-log    | claude-session-dashboard |
 | --------------------- | ------------------------ | -------------- | ------------------ | ------------------------ |
 | Runtime               | Rust binary (~1.3 MB)    | Node.js        | Python             | Node.js + browser        |
-| Indexing time         | ~10 ms (warm mmap cache) | ~12 s          | ~90 s              | on-demand per request    |
+| Indexing time         | ~10 ms (warm), <1s (cold)| ~12 s          | ~90 s              | on-demand per request    |
 | CLI reports           | yes (daily/monthly/…)    | reference impl | —                  | —                        |
-| TUI browser           | yes (`ccaudit tui`)        | —              | —                  | —                        |
-| Web dashboard         | yes (`ccaudit web`)        | —              | HTML export        | yes (local server)       |
+| TUI browser           | yes (`ccaudit tui`)      | —              | —                  | —                        |
+| Web dashboard         | yes (`ccaudit web`)      | —              | HTML export        | yes (local server)       |
 | Session detail viewer | yes                      | —              | yes                | yes                      |
-| Install               | one binary / npm / cargo | npm            | `pip install` + py | `npx` / `npm install -g` |
+| Install               | binary / npm / cargo     | npm            | `pip install` + py | `npx` / `npm install -g` |
 
 `claude-session-dashboard` has one thing ccaudit doesn't: an **agent-delegation Gantt chart** for the sub-agent dispatch tree per session. Worth it if you run agentic workflows and want to see the delegation order.
 
