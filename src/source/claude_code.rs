@@ -8,6 +8,7 @@
 use super::{ParsedLine, ParsedSession, Pricing, Source, SourceFile, day_from_ts, fnv1a};
 use crate::parse::{self, Message, MessageKind, Session};
 use std::borrow::Cow;
+#[cfg(target_os = "macos")]
 use std::fs;
 use std::path::{Path, PathBuf};
 
