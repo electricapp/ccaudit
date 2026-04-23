@@ -442,7 +442,7 @@ impl App {
         }
     }
 
-    fn move_top(&mut self) {
+    const fn move_top(&mut self) {
         match self.view {
             View::Projects => self.project_state.select(Some(0)),
             View::Sessions => self.session_state.select(Some(0)),
@@ -451,7 +451,7 @@ impl App {
         }
     }
 
-    fn move_bottom(&mut self) {
+    const fn move_bottom(&mut self) {
         match self.view {
             View::Projects => {
                 let len = self.filtered_projects.len();
