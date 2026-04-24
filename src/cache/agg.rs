@@ -267,6 +267,11 @@ fn aggregate_from_preaggs(
                 BucketKey(i64::from(d.year()) * 12 + i64::from(d.month() - 1))
             }
             Bucket::Session => BucketKey(i64::from(p.project_id)),
+            // The fast-path guard in `aggregate` only dispatches here for
+            // Day/Month (see the `matches!(bucket, Bucket::Day | Bucket::Month)`
+            // check). Block bucketing needs sub-day `ts_unix` precision the
+            // preaggs don't carry, so it lives on the slow path.
+            #[allow(clippy::unreachable)]
             Bucket::Block => unreachable!("blocks need per-line ts; not on fast path"),
         };
         let bkey = BreakdownKey(key, if breakdown { p.model_id } else { u16::MAX });

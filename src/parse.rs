@@ -560,6 +560,9 @@ pub fn parse_session(path: &Path) -> Option<Session> {
 // The usage reports themselves don't call this path — they use the
 // much faster `cache::load()` directly.
 
+// Prints a one-line bincode-cache hit/miss summary to stderr so the user
+// can tell cold runs from warm ones.
+#[allow(clippy::print_stderr)]
 pub fn load_all_projects() -> Vec<Project> {
     let projects_dir = match dirs::home_dir() {
         Some(h) => h.join(".claude").join("projects"),

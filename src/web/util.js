@@ -108,6 +108,22 @@ function dayStr(iso) {
   return iso && iso.length >= 10 ? iso.slice(0, 10) : null;
 }
 
+// Fresh heatmap bucket. Populated in two passes: session/msg counts are
+// added in the session loop (keyed on `started_at`), then tokens + cost
+// are added from DAILY rows (keyed per-message UTC day).
+function emptyDay() {
+  return {
+    tokens: 0,
+    input: 0,
+    output: 0,
+    cache_read: 0,
+    cache_create: 0,
+    cost: 0,
+    msgs: 0,
+    sessions: 0,
+  };
+}
+
 // Lift an IndexSession's per-type token counts into the canonical
 // shape used by every list-view row (breakdown tooltip + row.tokens sum).
 function tokenParts(s) {

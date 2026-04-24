@@ -56,6 +56,8 @@ struct JsonRow {
     limit_pct: Option<f64>,
 }
 
+// Writes the ccusage-compatible JSON document to stdout.
+#[allow(clippy::print_stdout)]
 pub fn print<S: Source + ?Sized>(
     cache: &LoadedCache,
     rollup: &FxHashMap<BreakdownKey, BucketUsage>,

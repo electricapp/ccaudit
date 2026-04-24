@@ -7,6 +7,8 @@ use crate::cli::Options;
 use crate::source::{Source, day_to_date};
 use chrono::NaiveDate;
 
+// Writes the one-line status bar summary to stdout.
+#[allow(clippy::print_stdout)]
 pub fn print<S: Source + ?Sized>(cache: &LoadedCache, opts: &Options, source: &S) {
     let today = day_to_date(current_day(opts.tz_offset_secs));
     let filter = FilterOpts {

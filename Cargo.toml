@@ -62,11 +62,37 @@ trivial_numeric_casts = "warn"
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
-nursery = { level = "warn", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "warn", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
-indexing_slicing = "warn"
+indexing_slicing = "deny"
+# Cherry-picked restriction-group lints. The full `restriction` group is
+# opinionated to the point of being contradictory, so enabling all of it
+# is a footgun — instead we pick individual rules that catch real bugs:
+#   print_stderr/print_stdout — flagged debug prints leaking to production
+#   dbg_macro                 — leftover dbg!() from local debugging
+#   todo/unimplemented        — stubs that shouldn't ship
+#   mem_forget                — suspicious, almost never intentional
+#   rc_buffer                 — wrong Rc<String>/Rc<Vec<T>> shape
+#   unreachable               — panics dressed up as control flow
+#   get_unwrap                — .get(i).unwrap() is just indexing
+dbg_macro = "deny"
+print_stderr = "warn"
+print_stdout = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+mem_forget = "deny"
+rc_buffer = "deny"
+get_unwrap = "deny"
+# `clippy::cargo` catches things like wildcard deps + negative feature
+# names. `multiple_crate_versions` is opted out because it fires on
+# transitive dep graphs — we can't dedupe versions pulled in by indirect
+# dependencies (e.g. ratatui + bincode bringing in two `syn` majors)
+# without patching upstream.
+multiple_crate_versions = "allow"
 cast_possible_truncation = "allow"
 cast_precision_loss = "allow"
 cast_sign_loss = "allow"

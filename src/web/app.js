@@ -1,4 +1,9 @@
 let IDX = [],
+  // Daily rollup shipped inside index.json. Derived from the same cache
+  // preaggs the CLI usage report reads, so the heatmap and `ccaudit daily`
+  // agree to the cent. Shape: {p:[proj_names], m:[model_names], d:[day_strs],
+  // rows:[[day_idx, proj_idx, model_idx, in, out, cr, cw, cost], ...]}.
+  DAILY = null,
   SIX = null,
   view = 'projects',
   prevView = null,
@@ -107,7 +112,8 @@ Promise.all([
   fetch('/search.json').then((r) => r.json()),
 ])
   .then(([idx, six]) => {
-    IDX = idx;
+    IDX = idx.projects;
+    DAILY = idx.daily;
     SIX = six;
     buildRouteIndex();
     populateModelFilter();
@@ -1881,32 +1887,17 @@ function computeDashAgg() {
       mRec.cost_cache_read += ccr;
       mRec.cost_cache_create += ccc;
       if (s.started_at && s.started_at > mRec.lastActive) mRec.lastActive = s.started_at;
-      const day = dayStr(s.started_at);
-      if (day) {
-        const dRec =
-          byDay[day] ||
-          (byDay[day] = {
-            tokens: 0,
-            input: 0,
-            output: 0,
-            cache_read: 0,
-            cache_create: 0,
-            cost: 0,
-            msgs: 0,
-            sessions: 0,
-          });
-        dRec.tokens += tokSum;
-        dRec.input += tin;
-        dRec.output += tout;
-        dRec.cache_read += tcache_r;
-        dRec.cache_create += tcache_w;
-        dRec.cost += tcost;
+      // msgs + session counts per day are still keyed on `started_at`
+      // (a session is "one session" regardless of how it's distributed
+      // across midnights). Token + cost bucketing is handled below in
+      // the DAILY.rows pass so cross-midnight tokens attribute to the
+      // calendar day the message actually landed on.
+      const startDay = dayStr(s.started_at);
+      if (startDay) {
+        const dRec = byDay[startDay] || (byDay[startDay] = emptyDay());
         dRec.msgs += s.msg_count;
         dRec.sessions++;
-        if (dRec.tokens > maxDayTokens) maxDayTokens = dRec.tokens;
-        if (!earliest || day < earliest) earliest = day;
-        if (!latest || day > latest) latest = day;
-        activeDays.add(day);
+        activeDays.add(startDay);
       }
       const rows = s.hourly;
       if (rows && rows.length) {
@@ -1964,6 +1955,75 @@ function computeDashAgg() {
       };
     }
   });
+  // Token + cost per day come from DAILY — the same cache preaggs that
+  // back `ccaudit daily`. Preaggs are keyed on (day, model, project)
+  // with cross-session dedup applied at build time, so a session that
+  // spans midnight attributes to both days correctly.
+  //
+  // Filters: project scope maps to a project-name allow-set; date and
+  // model filters replay the dropdown state against each row's day
+  // string / model name.
+  //
+  // Session scope has no per-session dimension in DAILY (preaggs fold
+  // sessions together). For a scope that small the heatmap is a
+  // decoration anyway, so fall back to the session's own `hourly`
+  // rolled up per UTC day with cost distributed proportional to tokens.
+  if (dashScope.kind === 'session') {
+    const one = allSessions.length === 1 ? allSessions[0].s : null;
+    if (one && one.hourly && one.hourly.length) {
+      let sessTok = 0;
+      for (const r of one.hourly) sessTok += r[1] + r[2] + r[3] + r[4];
+      const costPerTok = sessTok > 0 ? (one.cost || 0) / sessTok : 0;
+      for (const r of one.hourly) {
+        const day = new Date(r[0] * 1000).toISOString().slice(0, 10);
+        const dRec = byDay[day] || (byDay[day] = emptyDay());
+        const rowTok = r[1] + r[2] + r[3] + r[4];
+        dRec.input += r[1];
+        dRec.output += r[2];
+        dRec.cache_read += r[3];
+        dRec.cache_create += r[4];
+        dRec.tokens += rowTok;
+        dRec.cost += rowTok * costPerTok;
+        if (dRec.tokens > maxDayTokens) maxDayTokens = dRec.tokens;
+        if (!earliest || day < earliest) earliest = day;
+        if (!latest || day > latest) latest = day;
+        activeDays.add(day);
+      }
+    }
+  } else if (DAILY && DAILY.rows && DAILY.rows.length) {
+    // Allowed project indices into DAILY.p — matches by name against the
+    // same prettified slug used on both sides (see `prettify_project_name`
+    // in source/claude_code.rs).
+    const allowProj = new Set();
+    IDX.forEach((p, pi) => {
+      if (dashScope.kind === 'project' && pi !== dashScope.pi) return;
+      const idx = DAILY.p.indexOf(p.name);
+      if (idx >= 0) allowProj.add(idx);
+    });
+    const noModelFilter = modelFilters.size === 0;
+    for (const row of DAILY.rows) {
+      const [di, pi, mi, inp, out, cr, cw, cost] = row;
+      if (!allowProj.has(pi)) continue;
+      const day = DAILY.d[di];
+      if (dateFrom && day < dateFrom) continue;
+      if (dateTo && day > dateTo) continue;
+      if (!noModelFilter) {
+        const name = mi < 0 ? '' : DAILY.m[mi];
+        if (!modelFilters.has(name)) continue;
+      }
+      const dRec = byDay[day] || (byDay[day] = emptyDay());
+      dRec.input += inp;
+      dRec.output += out;
+      dRec.cache_read += cr;
+      dRec.cache_create += cw;
+      dRec.tokens += inp + out + cr + cw;
+      dRec.cost += cost;
+      if (dRec.tokens > maxDayTokens) maxDayTokens = dRec.tokens;
+      if (!earliest || day < earliest) earliest = day;
+      if (!latest || day > latest) latest = day;
+      activeDays.add(day);
+    }
+  }
   const nDays = Math.max(1, activeDays.size);
   for (let h = 0; h < 24; h++) {
     const b = byHour[h];

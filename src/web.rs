@@ -1,4 +1,6 @@
+use crate::cache::LoadedCache;
 use crate::parse::{self, MessageKind, Project};
+use crate::source::{Source, day_to_date};
 use crate::style;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -125,7 +127,112 @@ fn build_hourly(session: &parse::Session) -> Vec<[u64; 5]> {
         .collect()
 }
 
-pub fn generate(projects: &[Project], out_dir: &Path) -> std::io::Result<()> {
+/// Compact daily rollup shipped alongside `index.json`. Derived from
+/// `cache::aggregate(.., Bucket::Day, ..)` — the exact same code path
+/// that powers `ccaudit daily`, so the heatmap and the CLI usage table
+/// agree to the cent.
+///
+/// `rows` are flat `[day_idx, project_idx, model_idx, input, output,
+/// cache_read, cache_create, cost]`. Strings are interned into the top
+/// `p` / `m` / `d` arrays so a year of history stays under ~100 KB.
+#[derive(Serialize)]
+struct DailyIndex<'a> {
+    p: Vec<&'a str>,    // project names (index space matches `rows[_][1]`)
+    m: Vec<&'a str>,    // model names — empty string for unknown
+    d: Vec<String>,     // day strings in YYYY-MM-DD form
+    rows: Vec<DailyRow>,
+}
+
+// `serde_json` serializes `(i32, i32, i32, u64, u64, u64, u64, f64)` as
+// a heterogeneous JSON array — matches the compact wire format the
+// `hourly` field already uses.
+#[derive(Serialize)]
+struct DailyRow(i32, i32, i32, u64, u64, u64, u64, f64);
+
+fn build_daily_index<'a, S: Source + ?Sized>(
+    cache: &'a LoadedCache,
+    source: &S,
+) -> DailyIndex<'a> {
+    // Preaggs are already cross-session-deduped and priced per-message
+    // model at build time, keyed on (day, model_id, project_id). So
+    // the "daily" rollup is just a projection: group by (day, project,
+    // model) and collect ordered indices for each string dimension.
+    let mut day_idx: HashMap<i32, i32> = HashMap::new();
+    let mut days: Vec<i32> = Vec::new();
+
+    // Skip rows whose model is filtered by this provider (Claude Code's
+    // `<synthetic>` compaction calls). The usage reports drop these via
+    // `source.skip_model`; matching that keeps the heatmap consistent
+    // with the CLI numbers instead of inflating cache-write dollars.
+    let keep_model = |mid: u16| -> bool {
+        if mid == u16::MAX {
+            return true;
+        }
+        cache
+            .models
+            .get(mid as usize)
+            .is_none_or(|m| !source.skip_model(m))
+    };
+
+    let mut rows: Vec<DailyRow> = Vec::with_capacity(cache.preaggs().len());
+    for p in cache.preaggs() {
+        if !keep_model(p.model_id) {
+            continue;
+        }
+        let di = *day_idx.entry(p.day).or_insert_with(|| {
+            let i = i32::try_from(days.len()).unwrap_or(i32::MAX);
+            days.push(p.day);
+            i
+        });
+        // project_id == u16::MAX is reserved for providers without a
+        // project concept; Claude Code always sets one, but stay defensive.
+        let pi = if (p.project_id as usize) < cache.projects.len() {
+            i32::from(p.project_id)
+        } else {
+            -1
+        };
+        let mi = if p.model_id == u16::MAX {
+            -1
+        } else {
+            i32::from(p.model_id)
+        };
+        rows.push(DailyRow(
+            di,
+            pi,
+            mi,
+            u64::from(p.input),
+            u64::from(p.output),
+            u64::from(p.cache_read),
+            u64::from(p.cache_create),
+            p.total_cost(),
+        ));
+    }
+
+    // Day strings are small but numerous — render once here rather than
+    // letting the JS do it per cell. Same YYYY-MM-DD form the existing
+    // heatmap keys on, so the lookup stays O(1).
+    let d: Vec<String> = days
+        .iter()
+        .map(|&d| day_to_date(d).format("%Y-%m-%d").to_string())
+        .collect();
+
+    DailyIndex {
+        p: cache.projects.iter().map(String::as_str).collect(),
+        m: cache.models.iter().map(String::as_str).collect(),
+        d,
+        rows,
+    }
+}
+
+// Prints build-stats lines ("search index: …KB", "wrote …") to stderr
+// so the user sees what the `ccaudit web` run produced.
+#[allow(clippy::print_stderr)]
+pub fn generate<S: Source + ?Sized>(
+    projects: &[Project],
+    cache: &LoadedCache,
+    source: &S,
+    out_dir: &Path,
+) -> std::io::Result<()> {
     use rayon::prelude::*;
 
     let sessions_dir = out_dir.join("s");
@@ -234,7 +341,22 @@ pub fn generate(projects: &[Project], out_dir: &Path) -> std::io::Result<()> {
         }
     }
 
-    let index_json = serde_json::to_string(&index).map_err(std::io::Error::other)?;
+    // Single top-level document for the web client: `projects` is the
+    // existing session/message tree; `daily` is derived from the shared
+    // aggregation cache (same substrate as `ccaudit daily`) so the
+    // heatmap can't drift from the CLI numbers. One fetch, one HTTP
+    // cache entry, one source of truth.
+    #[derive(Serialize)]
+    struct Index<'a> {
+        projects: &'a [IndexProject<'a>],
+        daily: DailyIndex<'a>,
+    }
+    let daily = build_daily_index(cache, source);
+    let index_doc = Index {
+        projects: &index,
+        daily,
+    };
+    let index_json = serde_json::to_string(&index_doc).map_err(std::io::Error::other)?;
     fs::write(out_dir.join("index.json"), &index_json)?;
 
     #[derive(Serialize)]

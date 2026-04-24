@@ -365,6 +365,7 @@ fn format_offset(secs: i32) -> String {
     format!("{sign}{:02}:{:02}", a / 3600, (a % 3600) / 60)
 }
 
+#[allow(clippy::print_stderr)] // this function's job is to write help to stderr
 pub fn print_help() {
     eprintln!("ccaudit - fast Claude Code token usage analyzer");
     eprintln!();
@@ -396,6 +397,7 @@ pub fn print_help() {
     eprintln!("Run `ccaudit <SUBCOMMAND> --help` for mode-specific flags.");
 }
 
+#[allow(clippy::print_stderr)] // this function's job is to write help to stderr
 pub fn print_subcommand_help(cmd: Cmd) {
     match cmd {
         Cmd::Daily => print_report_help("daily", "daily token usage + cost", None),
@@ -469,6 +471,7 @@ pub fn print_subcommand_help(cmd: Cmd) {
 
 // Shared template for the four reporting subcommands. `extra` threads a
 // single mode-specific flag (currently only --cost-limit for blocks).
+#[allow(clippy::print_stderr)] // this function's job is to write help to stderr
 fn print_report_help(name: &str, tagline: &str, extra: Option<(&str, &str)>) {
     eprintln!("ccaudit {name} - {tagline}");
     eprintln!();

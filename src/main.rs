@@ -24,6 +24,9 @@ mod web;
 
 use std::process;
 
+// `main` is the one place the binary gets to write to stdio directly:
+// errors to stderr, `refresh-prices` summary + profiling to stderr/stdout.
+#[allow(clippy::print_stdout, clippy::print_stderr)]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -146,6 +149,8 @@ fn run_tui(projects: Vec<parse::Project>) -> std::io::Result<Option<ui::PostActi
 }
 
 #[cfg(feature = "tui")]
+// Writes an exec-failed error to stderr before exiting non-zero.
+#[allow(clippy::print_stderr)]
 fn resume_session(id: &str) {
     use std::process::Command;
     // Replace our process with `claude -r <id>` on Unix so the user's
@@ -172,8 +177,16 @@ fn resume_session(id: &str) {
 }
 
 #[cfg(feature = "web")]
+// Writes error messages to stderr before exiting non-zero.
+#[allow(clippy::print_stderr)]
 fn run_web_cmd(opts: &cli::Options) {
     let projects = parse::load_all_projects();
+    // `cache` is the same aggregation substrate the CLI usage reports use
+    // (daily/monthly/blocks). Web now emits its daily rollup from this
+    // shared cache rather than re-deriving it from session totals, so the
+    // heatmap bucketing matches the usage table — no cross-midnight drift.
+    let source = source::pick(opts.source);
+    let cache = cache::load(source);
     let out_dir = opts
         .out_dir
         .as_deref()
@@ -183,7 +196,7 @@ fn run_web_cmd(opts: &cli::Options) {
                 .map(|h| h.join(".claude").join("ccaudit-web"))
                 .unwrap_or_else(|| std::path::PathBuf::from("ccaudit-web"))
         });
-    if let Err(e) = web::generate(&projects, &out_dir) {
+    if let Err(e) = web::generate(&projects, &cache, source, &out_dir) {
         eprintln!("error: {e}");
         process::exit(1);
     }

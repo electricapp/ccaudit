@@ -3,6 +3,8 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::{fs, thread};
 
+// Prints the "serving at http://…" banner to stderr before blocking on accept.
+#[allow(clippy::print_stderr)]
 pub fn serve(dir: &Path, port: u16) -> std::io::Result<()> {
     let addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&addr)?;

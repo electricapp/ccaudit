@@ -30,7 +30,8 @@ Inspired by:
 |                       | ccaudit                  | ccusage        | claude-code-log    | claude-session-dashboard |
 | --------------------- | ------------------------ | -------------- | ------------------ | ------------------------ |
 | Runtime               | Rust binary (~1.3 MB)    | Node.js        | Python             | Node.js + browser        |
-| Indexing time         | ~10 ms (warm), <1s (cold)| ~12 s          | ~90 s              | on-demand per request    |
+| Indexing time (10GB)  | <10 ms (warm), <1s (cold)| ~18s           | ~120 s             | on-demand per request    |
+| Equivalent throughput | >10GB/s (cold)           | 500MB/s        | ~80MB/s            | n/a                      |
 | CLI reports           | yes (daily/monthly/…)    | reference impl | —                  | —                        |
 | TUI browser           | yes (`ccaudit tui`)      | —              | —                  | —                        |
 | Web dashboard         | yes (`ccaudit web`)      | —              | HTML export        | yes (local server)       |
