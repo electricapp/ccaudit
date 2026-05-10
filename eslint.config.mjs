@@ -30,6 +30,7 @@ export default [
         hl: 'readonly',
         dn: 'readonly',
         dayStr: 'readonly',
+        emptyDay: 'readonly',
         tokenParts: 'readonly',
         costParts: 'readonly',
         tokTip: 'readonly',

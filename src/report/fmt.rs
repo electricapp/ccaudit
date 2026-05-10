@@ -4,7 +4,6 @@
 use crate::cache::{BreakdownKey, Bucket, BucketKey, BucketUsage, LoadedCache};
 use crate::cli::{Cmd, Options};
 use crate::source::{Source, day_to_date};
-use rustc_hash::FxHashMap;
 
 // ── Column widths ──
 
@@ -128,6 +127,12 @@ pub fn format_cost(c: f64) -> String {
     // Fixed 2-decimal currency with thousands separators on the dollar
     // portion ($5706.77 → $5_706.77). Convert to cents to dodge fp
     // formatting drift. Negative-defensive though we don't expect them.
+    // The "<$0.01" branch matches the JS `fc()` helper exactly so a row
+    // priced at half a cent doesn't show as `$0.00` in the CLI but
+    // `<$0.01` on the web — the two views must agree visibly.
+    if c > 0.0 && c < 0.01 {
+        return "<$0.01".to_string();
+    }
     let cents = (c * 100.0).round() as i64;
     let sign = if cents < 0 { "-$" } else { "$" };
     let abs = cents.unsigned_abs();
@@ -249,8 +254,8 @@ pub fn chrono_locale(opts: &Options) -> chrono::Locale {
 
 // ── Sorting ──
 
-pub fn sort_keys(
-    rollup: &FxHashMap<BreakdownKey, BucketUsage>,
+pub fn sort_keys<S: std::hash::BuildHasher>(
+    rollup: &std::collections::HashMap<BreakdownKey, BucketUsage, S>,
     bucket: Bucket,
 ) -> Vec<BreakdownKey> {
     let mut ks: Vec<BreakdownKey> = rollup.keys().copied().collect();
@@ -269,11 +274,13 @@ pub fn sort_keys(
     ks
 }
 
-/// Keep only the `tail` most recent bucket groups. Operates on
-/// already-sorted keys (see `sort_keys`): time buckets are ascending
-/// (keep the last N), sessions are descending (keep the first N). With
-/// `--breakdown`, several keys may share a `BucketKey` — we keep all rows
-/// belonging to a retained bucket so per-model sub-rows aren't split.
+/// Keep only the `tail` most recent bucket groups.
+///
+/// Operates on already-sorted keys (see `sort_keys`): time buckets are
+/// ascending (keep the last N), sessions are descending (keep the first
+/// N). With `--breakdown`, several keys may share a `BucketKey` — we
+/// keep all rows belonging to a retained bucket so per-model sub-rows
+/// aren't split.
 pub fn apply_tail(keys: Vec<BreakdownKey>, tail: Option<u32>, bucket: Bucket) -> Vec<BreakdownKey> {
     let Some(n) = tail else { return keys };
     let n = n as usize;

@@ -3,25 +3,13 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-mod cache;
-mod cli;
-mod parse;
-mod report;
-mod source;
-mod style;
-
+#[cfg(any(feature = "tui", feature = "web"))]
+use ccaudit::parse;
 #[cfg(feature = "tui")]
-mod search;
-#[cfg(feature = "tui")]
-#[allow(clippy::indexing_slicing)]
-mod ui;
-
+use ccaudit::ui;
+use ccaudit::{cache, cli, report, source};
 #[cfg(feature = "web")]
-mod serve;
-#[cfg(feature = "web")]
-#[allow(clippy::indexing_slicing)]
-mod web;
-
+use ccaudit::{serve, web};
 use std::process;
 
 // `main` is the one place the binary gets to write to stdio directly:
@@ -67,13 +55,21 @@ fn main() {
         cli::Cmd::Tui => {
             #[cfg(feature = "tui")]
             {
-                let projects = parse::load_all_projects();
+                let projects = parse::load_all_projects(source::pick(opts.source));
                 match run_tui(projects) {
                     Ok(Some(ui::PostAction::Resume(id))) => {
                         resume_session(&id);
                     }
                     Ok(Some(ui::PostAction::OpenWeb)) => {
+                        #[cfg(feature = "web")]
                         run_web_cmd(&opts);
+                        #[cfg(not(feature = "web"))]
+                        {
+                            eprintln!(
+                                "error: this build does not include the web report. Rebuild with `--features web` to use `o` from the TUI."
+                            );
+                            process::exit(1);
+                        }
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -180,12 +176,12 @@ fn resume_session(id: &str) {
 // Writes error messages to stderr before exiting non-zero.
 #[allow(clippy::print_stderr)]
 fn run_web_cmd(opts: &cli::Options) {
-    let projects = parse::load_all_projects();
+    let source = source::pick(opts.source);
+    let projects = parse::load_all_projects(source);
     // `cache` is the same aggregation substrate the CLI usage reports use
     // (daily/monthly/blocks). Web now emits its daily rollup from this
     // shared cache rather than re-deriving it from session totals, so the
     // heatmap bucketing matches the usage table — no cross-midnight drift.
-    let source = source::pick(opts.source);
     let cache = cache::load(source);
     let out_dir = opts
         .out_dir
@@ -196,9 +192,12 @@ fn run_web_cmd(opts: &cli::Options) {
                 .map(|h| h.join(".claude").join("ccaudit-web"))
                 .unwrap_or_else(|| std::path::PathBuf::from("ccaudit-web"))
         });
-    if let Err(e) = web::generate(&projects, &cache, source, &out_dir) {
+    if let Err(e) = web::generate(&projects, &cache, &out_dir) {
         eprintln!("error: {e}");
         process::exit(1);
+    }
+    if opts.no_serve {
+        return;
     }
     if let Err(e) = serve::serve(&out_dir, opts.port.unwrap_or(3131)) {
         eprintln!("error: {e}");

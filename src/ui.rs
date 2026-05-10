@@ -1,4 +1,4 @@
-use crate::parse::{MessageKind, Project};
+use crate::parse::{self, MessageKind, Project};
 use crate::report::fmt::{format_cost, format_datetime, format_datetime_short, format_number};
 use crate::search::Searcher;
 use crate::style;
@@ -26,10 +26,12 @@ enum View {
     Dashboard,
 }
 
-/// Set when the user asks the TUI to hand off to another program (e.g.
-/// `c` → resume a Claude Code session, `o` → launch the web view). The
-/// TUI quits cleanly and `main.rs` runs the action after terminal
-/// teardown, so the new process inherits a clean stdio.
+/// Hand-off request from the TUI to another program.
+///
+/// Set when the user asks the TUI to launch something else (e.g. `c` →
+/// resume a Claude Code session, `o` → launch the web view). The TUI
+/// quits cleanly and `main.rs` runs the action after terminal teardown,
+/// so the new process inherits a clean stdio.
 pub enum PostAction {
     Resume(String),
     OpenWeb,
@@ -137,14 +139,14 @@ fn compute_dashboard(projects: &[Project]) -> DashboardAgg {
                 + s.total_cache_create;
             let started = s.started_at.map(format_datetime_short).unwrap_or_default();
             total_sessions += 1;
-            total_msgs += s.messages.len();
+            total_msgs += s.msg_count as usize;
             total_cost += cost;
             total_input += s.total_input_tokens;
             total_output += s.total_output_tokens;
             total_cache_w += s.total_cache_create;
             total_cache_r += s.total_cache_read;
             pc += cost;
-            pm += s.messages.len();
+            pm += s.msg_count as usize;
             ptok += stok;
             pdur += sdur;
             if s.started_at.is_some() && started > plast {
@@ -158,7 +160,7 @@ fn compute_dashboard(projects: &[Project]) -> DashboardAgg {
                 .entry(model)
                 .or_insert_with(|| (0, 0, 0, 0.0, 0, String::new()));
             entry.0 += 1;
-            entry.1 += s.messages.len();
+            entry.1 += s.msg_count as usize;
             entry.2 += stok;
             entry.3 += cost;
             entry.4 += sdur;
@@ -170,7 +172,7 @@ fn compute_dashboard(projects: &[Project]) -> DashboardAgg {
                 pi,
                 si,
                 cost,
-                msgs: s.messages.len(),
+                msgs: s.msg_count as usize,
                 tokens: stok,
                 duration_ms: sdur,
                 started_at: started,
@@ -476,28 +478,51 @@ impl App {
 
     fn enter(&mut self) {
         match self.view {
-            View::Projects => {
-                if let Some(i) = self.project_state.selected() {
-                    if let Some(&pi) = self.filtered_projects.get(i) {
-                        self.selected_project = Some(pi);
-                        self.view = View::Sessions;
-                        self.search_query.clear();
-                        self.update_filter();
-                        self.session_state.select(Some(0));
-                    }
-                }
-            }
-            View::Sessions => {
-                if let Some(i) = self.session_state.selected() {
-                    if let Some(&si) = self.filtered_sessions.get(i) {
-                        self.selected_session = Some(si);
-                        self.view = View::Messages;
-                        self.message_scroll = 0;
-                    }
-                }
-            }
+            View::Projects => self.enter_project(),
+            View::Sessions => self.enter_session(),
             View::Messages | View::Dashboard => {}
         }
+    }
+
+    fn enter_project(&mut self) {
+        let Some(i) = self.project_state.selected() else {
+            return;
+        };
+        let Some(&pi) = self.filtered_projects.get(i) else {
+            return;
+        };
+        self.selected_project = Some(pi);
+        self.view = View::Sessions;
+        self.search_query.clear();
+        self.update_filter();
+        self.session_state.select(Some(0));
+    }
+
+    fn enter_session(&mut self) {
+        let Some(i) = self.session_state.selected() else {
+            return;
+        };
+        let Some(&si) = self.filtered_sessions.get(i) else {
+            return;
+        };
+        let Some(pi) = self.selected_project else {
+            return;
+        };
+        // Lazy-load messages — only the session the user opened pays
+        // the deserialize cost.
+        if let Some(s) = self
+            .projects
+            .get_mut(pi)
+            .and_then(|p| p.sessions.get_mut(si))
+        {
+            if s.messages.is_empty() {
+                let path = s.file_path.clone();
+                let _ = parse::ensure_messages_loaded(s, &path);
+            }
+        }
+        self.selected_session = Some(si);
+        self.view = View::Messages;
+        self.message_scroll = 0;
     }
 
     fn back(&mut self) {
@@ -600,37 +625,30 @@ impl App {
     }
 
     fn render_statusbar(&self, f: &mut Frame, area: Rect) {
+        // Status bar repaints on every key. The dashboard struct holds the
+        // global totals (computed once in App::new) so we don't re-walk
+        // every session per frame.
         let (left, right) = match self.view {
-            View::Projects => {
-                let total_sessions: usize = self.projects.iter().map(|p| p.sessions.len()).sum();
-                let total_cost: f64 = self
-                    .projects
-                    .iter()
-                    .flat_map(|p| &p.sessions)
-                    .map(|s| s.cost)
-                    .sum();
-                (
-                    format!(
-                        " {} projects | {} sessions | {}",
-                        self.projects.len(),
-                        format_number(total_sessions as u64),
-                        format_cost(total_cost),
-                    ),
-                    String::from(
-                        "j/k nav | / search | enter select | o open web | d dashboard | q quit ",
-                    ),
-                )
-            }
+            View::Projects => (
+                format!(
+                    " {} projects | {} sessions | {}",
+                    self.projects.len(),
+                    format_number(self.dashboard.total_sessions as u64),
+                    format_cost(self.dashboard.total_cost),
+                ),
+                String::from(
+                    "j/k nav | / search | enter select | o open web | d dashboard | q quit ",
+                ),
+            ),
             View::Sessions => {
                 if let Some(pi) = self.selected_project {
                     let p = &self.projects[pi];
-                    let cost: f64 = p.sessions.iter().map(|s| s.cost).sum();
                     (
                         format!(
                             " {} | {} sessions | {}",
                             p.name,
                             format_number(p.sessions.len() as u64),
-                            format_cost(cost),
+                            format_cost(p.total_cost),
                         ),
                         String::from(
                             "j/k nav | / search | enter view | tab detail | c resume | o web | esc back ",
@@ -643,13 +661,12 @@ impl App {
             View::Messages => {
                 if let (Some(pi), Some(si)) = (self.selected_project, self.selected_session) {
                     let s = &self.projects[pi].sessions[si];
-                    let cost = s.cost;
                     (
                         format!(
                             " {} msgs | {} | {}",
-                            format_number(s.messages.len() as u64),
+                            format_number(u64::from(s.msg_count)),
                             s.model.as_deref().unwrap_or("?"),
-                            format_cost(cost),
+                            format_cost(s.cost),
                         ),
                         String::from("j/k scroll | PgDn/PgUp page | c resume | esc back "),
                     )
@@ -657,18 +674,13 @@ impl App {
                     (String::new(), String::new())
                 }
             }
-            View::Dashboard => {
-                let total_cost: f64 = self
-                    .projects
-                    .iter()
-                    .flat_map(|p| &p.sessions)
-                    .map(|s| s.cost)
-                    .sum();
-                (
-                    format!(" dashboard | {} total", format_cost(total_cost)),
-                    String::from("j/k scroll | d close | q quit "),
-                )
-            }
+            View::Dashboard => (
+                format!(
+                    " dashboard | {} total",
+                    format_cost(self.dashboard.total_cost)
+                ),
+                String::from("j/k scroll | d close | q quit "),
+            ),
         };
 
         let padding_len = (area.width as usize)
@@ -684,23 +696,10 @@ impl App {
     }
 
     fn render_projects(&mut self, f: &mut Frame, area: Rect) {
-        // Layout: [search?] [header] [list]
-        let search_h = if self.searching { 3 } else { 0 };
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(search_h),
-                Constraint::Length(1),
-                Constraint::Min(0),
-            ])
-            .split(area);
-
+        let chunks = list_layout(area, self.searching, false);
         if self.searching {
-            let input = Paragraph::new(format!(" {}", self.search_query))
-                .block(Block::default().borders(Borders::ALL).title(" search "));
-            f.render_widget(input, chunks[0]);
+            self.render_search_input(f, chunks[0]);
         }
-
         f.render_widget(unified_header_line(LIST_COLS_PROJECTS), chunks[1]);
 
         let items: Vec<ListItem> = self
@@ -712,74 +711,30 @@ impl App {
                     .last_active
                     .map(format_datetime_short)
                     .unwrap_or_else(|| "?".into());
-                let msg_count: u64 = p.sessions.iter().map(|s| s.messages.len() as u64).sum();
-                let dur_ms: u64 = p
-                    .sessions
-                    .iter()
-                    .filter_map(|s| match (s.started_at, s.ended_at) {
-                        (Some(a), Some(b)) if b > a => {
-                            Some((b - a).num_milliseconds().max(0) as u64)
-                        }
-                        _ => None,
-                    })
-                    .sum();
-                let cost: f64 = p.sessions.iter().map(|s| s.cost).sum();
-                let line = unified_row_line(
+                // All four numeric columns are precomputed on `Project`
+                // — no per-frame summing across sessions.
+                ListItem::new(unified_row_line(
                     &date,
                     &p.name,
                     Some(p.sessions.len() as u64),
-                    msg_count,
+                    p.total_msgs,
                     p.total_tokens,
-                    cost,
-                    dur_ms,
-                );
-                ListItem::new(line)
+                    p.total_cost,
+                    p.total_dur_ms,
+                ))
             })
             .collect();
-
-        let list = List::new(items).highlight_style(
-            Style::default()
-                .bg(style::tui(style::ROW_SEL_BG))
-                .fg(style::tui(style::ACCENT))
-                .add_modifier(Modifier::BOLD),
-        );
-
-        f.render_stateful_widget(list, chunks[2], &mut self.project_state);
+        f.render_stateful_widget(highlighted_list(items), chunks[2], &mut self.project_state);
     }
 
     fn render_sessions(&mut self, f: &mut Frame, area: Rect) {
         let Some(pi) = self.selected_project else {
             return;
         };
-
-        // Vertical layout: [search (0|3)] [list] [detail (0|7)]
-        let search_h = if self.searching { 3 } else { 0 };
-        let detail_h = if self.session_detail_open { 7 } else { 0 };
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(search_h),
-                Constraint::Min(0),
-                Constraint::Length(detail_h),
-            ])
-            .split(area);
-
+        let chunks = list_layout(area, self.searching, self.session_detail_open);
         if self.searching {
-            let input = Paragraph::new(format!(" {}", self.search_query))
-                .block(Block::default().borders(Borders::ALL).title(" search "));
-            f.render_widget(input, chunks[0]);
+            self.render_search_input(f, chunks[0]);
         }
-
-        // Re-layout to insert a one-line header above the list.
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(search_h),
-                Constraint::Length(1),
-                Constraint::Min(0),
-                Constraint::Length(detail_h),
-            ])
-            .split(area);
         f.render_widget(unified_header_line(LIST_COLS_SESSIONS), chunks[1]);
 
         let sessions = &self.projects[pi].sessions;
@@ -796,31 +751,30 @@ impl App {
                     (Some(a), Some(b)) if b > a => (b - a).num_milliseconds().max(0) as u64,
                     _ => 0,
                 };
-                let line = unified_row_line(
+                ListItem::new(unified_row_line(
                     &date,
                     s.display_name(),
                     None, // per-session row: session count is degenerate
-                    s.messages.len() as u64,
+                    u64::from(s.msg_count),
                     s.total_tokens(),
                     s.cost,
                     dur_ms,
-                );
-                ListItem::new(line)
+                ))
             })
             .collect();
-
-        let list = List::new(items).highlight_style(
-            Style::default()
-                .bg(style::tui(style::ROW_SEL_BG))
-                .fg(style::tui(style::ACCENT))
-                .add_modifier(Modifier::BOLD),
-        );
-
-        f.render_stateful_widget(list, chunks[2], &mut self.session_state);
+        f.render_stateful_widget(highlighted_list(items), chunks[2], &mut self.session_state);
 
         if self.session_detail_open {
+            // Detail pane lives in the trailing chunk produced by
+            // `list_layout` when `with_detail` is true.
             self.render_session_detail(f, chunks[3], pi);
         }
+    }
+
+    fn render_search_input(&self, f: &mut Frame, area: Rect) {
+        let input = Paragraph::new(format!(" {}", self.search_query))
+            .block(Block::default().borders(Borders::ALL).title(" search "));
+        f.render_widget(input, area);
     }
 
     fn render_session_detail(&self, f: &mut Frame, area: Rect, pi: usize) {
@@ -1305,6 +1259,33 @@ const LIST_COLS_SESSIONS: &[UCol] = &[
         width: 10,
     },
 ];
+
+// Shared list scaffolding for Projects + Sessions views. Layout is
+// always [search?] [header] [list] [detail?]; chunks unused on a given
+// view shrink to length 0. Returning four chunks unconditionally keeps
+// the indexing in `render_projects`/`render_sessions` uniform.
+fn list_layout(area: Rect, searching: bool, with_detail: bool) -> std::rc::Rc<[Rect]> {
+    let search_h = if searching { 3 } else { 0 };
+    let detail_h = if with_detail { 7 } else { 0 };
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(search_h),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(detail_h),
+        ])
+        .split(area)
+}
+
+fn highlighted_list(items: Vec<ListItem>) -> List {
+    List::new(items).highlight_style(
+        Style::default()
+            .bg(style::tui(style::ROW_SEL_BG))
+            .fg(style::tui(style::ACCENT))
+            .add_modifier(Modifier::BOLD),
+    )
+}
 
 fn unified_header_line_line(cols: &[UCol]) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(cols.len());

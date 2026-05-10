@@ -121,6 +121,9 @@ impl LoadedCache {
 
 // ── Public entry point ──
 
+/// Load (or cold-rebuild) the per-source cache. Mmaps the existing
+/// `.db` if every source file's `(mtime, size)` still matches; rebuilds
+/// (parsing only the changed files) otherwise.
 pub fn load<S: Source + ?Sized>(source: &S) -> LoadedCache {
     // Lazy mode: skip the filesystem scan and use the cache as-is. Opt-in
     // via CCAUDIT_LAZY=1 for status-bar integrations where one-run
@@ -347,10 +350,21 @@ fn cold_rebuild<S: Source + ?Sized>(source: &S, sources: Vec<SourceFile>) -> Loa
         }
     }
 
-    let freshly_parsed: Vec<ParsedSession> = to_parse
-        .par_iter()
-        .filter_map(|s| source.parse_session(s))
-        .collect();
+    // Skip rayon for small batches: spawning + thread-pool overhead
+    // dominates on a handful of sessions (typical "warm" reparse touches
+    // 1–3 changed files). Threshold picked to amortize spinup roughly.
+    const PAR_THRESHOLD: usize = 8;
+    let freshly_parsed: Vec<ParsedSession> = if to_parse.len() >= PAR_THRESHOLD {
+        to_parse
+            .par_iter()
+            .filter_map(|s| source.parse_session(s))
+            .collect()
+    } else {
+        to_parse
+            .iter()
+            .filter_map(|s| source.parse_session(s))
+            .collect()
+    };
 
     let mut all_parsed: Vec<ParsedSession> = freshly_parsed;
     if let Some(old) = existing {
@@ -361,7 +375,11 @@ fn cold_rebuild<S: Source + ?Sized>(source: &S, sources: Vec<SourceFile>) -> Loa
         }
     }
 
-    let built: BuiltCache = build::build(all_parsed, source);
+    finalize(all_parsed, source)
+}
+
+fn finalize<S: Source + ?Sized>(parsed: Vec<ParsedSession>, source: &S) -> LoadedCache {
+    let built: BuiltCache = build::build(parsed, source);
     if let Some(path) = source.cache_path() {
         let _ = build::write_cache(&built, &path);
     }

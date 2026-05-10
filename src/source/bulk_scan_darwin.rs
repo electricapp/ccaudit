@@ -82,9 +82,11 @@ pub struct BulkEntry {
     pub size: u64,
 }
 
-/// Batch-stat every entry in `dir` with one kernel round-trip per buffer
-/// fill (typically the whole directory in one call). Returns `None` on
-/// any FFI error so the caller can fall back to the portable path.
+/// Batch-stat every entry in `dir` with one kernel round-trip per buffer fill.
+///
+/// Typically the whole directory comes back in a single call. Returns
+/// `None` on any FFI error so the caller can fall back to the portable
+/// path.
 #[allow(unsafe_code)]
 pub fn scan(dir: &Path) -> Option<Vec<BulkEntry>> {
     let c_path = CString::new(dir.as_os_str().as_bytes()).ok()?;

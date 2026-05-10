@@ -14,9 +14,10 @@ categories = ["command-line-utilities", "development-tools"]
 authors = ["electricapp"]
 
 [features]
-default = ["full"]
-# Full build: TUI browser + static web report + json dump + usage report
-# + locale-aware date formatting.
+# Default omits `locale` — chrono's unstable-locales pulls ~260 KB of
+# Unicode tables that no path needs unless the user passes `--locale`.
+# `cargo install ccaudit --features full` opts into the full set.
+default = ["tui", "web"]
 full = ["tui", "web", "locale"]
 # Interactive TUI (ratatui/crossterm/nucleo fuzzy search, unicode width).
 tui = ["dep:ratatui", "dep:crossterm", "dep:nucleo-matcher", "dep:unicode-width"]
@@ -26,12 +27,15 @@ web = []
 # Locale-aware date formatting for --locale (chrono unstable-locales).
 # Adds ~260KB of locale tables; skip for lean builds.
 locale = ["chrono/unstable-locales"]
+# SIMD-accelerated JSON parsing for the JSONL hot path. Adds ~300KB to
+# the binary and pulls AVX2/NEON intrinsics; ~30-50% faster on `parse cold`.
+simd-json = ["dep:simd-json"]
 
 [dependencies]
 # --- Always-on (used by --usage, the default command, and the JSONL parser) ---
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-bincode = "1"
+postcard = { version = "1", features = ["alloc"], default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 memmap2 = "0.9"
@@ -41,12 +45,13 @@ rustc-hash = "2"
 rayon = "1.12"
 mimalloc = { version = "0.1", default-features = false }
 itoa = "1"
-ryu = "1"
 # --- Optional (TUI only) ---
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.29", optional = true }
 nucleo-matcher = { version = "0.3", optional = true }
 unicode-width = { version = "0.2", optional = true }
+# --- Optional (--features simd-json) ---
+simd-json = { version = "0.17", optional = true, default-features = false, features = ["serde_impl"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -114,8 +119,13 @@ struct_field_names = "allow"
 needless_raw_string_hashes = "allow"
 
 [profile.release]
-opt-level = "z"
-lto = "fat"
+# `3` over `z`: this binary is CPU-bound on the cache aggregation /
+# parse loop; size-optimized codegen costs measurable runtime there.
+# `thin` LTO over `fat`: comparable optimisation in practice for a
+# single-crate binary, much faster link, no measurable speed delta on
+# the hot paths. Together: ~50–100 KB binary larger, faster runtime.
+opt-level = 3
+lto = "thin"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"

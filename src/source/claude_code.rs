@@ -8,7 +8,6 @@
 use super::{ParsedLine, ParsedSession, Pricing, Source, SourceFile, day_from_ts, fnv1a};
 use crate::parse::{self, Message, MessageKind, Session};
 use std::borrow::Cow;
-#[cfg(target_os = "macos")]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -142,14 +141,12 @@ const HAIKU: Pricing = Pricing {
 
 // ── Claude Code-specific project name prettifier ──
 
-// Logs live in `~/.claude/projects/-Users-<username>-<rest>/`. We drop
-// the prefix to get "code/ccaudit" style names for display.
+// Logs live in `~/.claude/projects/-Users-<username>-<rest>/`. Tokenize
+// on dashes, then hand off to the shared `prettify_user_path` helper so
+// Claude and Codex agree on the display shape for the same path.
 pub fn prettify_project_name(raw: &str) -> String {
     let parts: Vec<&str> = raw.split('-').filter(|s| !s.is_empty()).collect();
-    if parts.len() > 2 && parts.first().copied() == Some("Users") {
-        return parts.get(2..).map_or_else(String::new, |s| s.join("/"));
-    }
-    raw.to_string()
+    super::prettify_user_path(&parts).unwrap_or_else(|| raw.to_string())
 }
 
 fn project_name_for(path: &Path) -> Option<String> {
@@ -167,18 +164,14 @@ fn session_id_for(path: &Path) -> String {
         .to_string()
 }
 
+// Single source for the session-display-name fallback chain. `Session::display_name`
+// (in `parse.rs`) and the JS `dn()` helper (in `web/util.js`) follow the same
+// rule. Sanitize control chars here so the cache stores a clean string —
+// renderers can still defensively re-escape.
 fn display_name_of(session: &Session) -> String {
-    let raw = if let Some(s) = &session.summary {
-        s.as_str()
-    } else if let Some(m) = &session.first_user_msg {
-        m.as_str()
-    } else {
-        session.id.as_str()
-    };
-    // Strip control chars at storage time so anything reading the raw
-    // bytes from the cache (JSON output, future MCP server, etc.) gets
-    // a clean string. Renderers also defensively re-sanitize.
-    raw.chars()
+    session
+        .display_name()
+        .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
 }

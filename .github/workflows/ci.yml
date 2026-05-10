@@ -48,8 +48,16 @@ jobs:
       - name: clippy (all features, deny warnings)
         run: cargo clippy --all-features --all-targets -- -D warnings
 
-      - name: build (release, all features)
-        run: cargo build --release --all-features
+      - name: feature matrix
+        run: |
+          set -eux
+          cargo check --no-default-features
+          cargo check --no-default-features --features tui
+          cargo check --no-default-features --features web
+          cargo check --no-default-features --features locale
+
+      - name: build (release, all features, all targets)
+        run: cargo build --release --all-features --all-targets
 
       - name: test
         run: cargo test --release --all-features

@@ -68,7 +68,7 @@ pub struct SessionEntry {
     pub line_count: u32,
     pub session_model_id: u16, // u16::MAX if unknown
     pub project_id: u16,       // u16::MAX if the provider has no project concept
-    pub _pad: u32,
+    pub(crate) _pad: u32,
 }
 
 // Cold half — only touched when rendering the `session` report. Lives
@@ -80,7 +80,7 @@ pub struct SessionExt {
     pub session_id_off: u32,
     pub display_name_len: u16,
     pub session_id_len: u16,
-    pub _pad: u32,
+    pub(crate) _pad: u32,
 }
 
 #[repr(C)]
@@ -120,7 +120,7 @@ pub struct PreAgg {
     pub cost_cache_read: f64,
     pub cost_cache_create: f64,
     pub line_count: u32,
-    pub _pad: u32,
+    pub(crate) _pad: u32,
 }
 
 impl PreAgg {

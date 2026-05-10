@@ -18,19 +18,38 @@ pub enum Cmd {
 }
 
 impl Cmd {
-    fn from_positional(s: &str) -> Option<Cmd> {
-        match s {
-            "daily" => Some(Cmd::Daily),
-            "monthly" => Some(Cmd::Monthly),
-            "session" => Some(Cmd::Session),
-            "blocks" => Some(Cmd::Blocks),
-            "statusline" => Some(Cmd::Statusline),
-            "tui" => Some(Cmd::Tui),
-            "web" => Some(Cmd::Web),
-            "refresh-prices" => Some(Cmd::RefreshPrices),
-            "help" => Some(Cmd::Help),
-            _ => None,
+    /// Single source of truth for the `enum Cmd` ⇄ subcommand-string
+    /// mapping. `from_positional` parses, `as_str` renders, and any other
+    /// site that needs either direction goes through these so a new
+    /// subcommand can be added in exactly one place.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Cmd::Daily => "daily",
+            Cmd::Monthly => "monthly",
+            Cmd::Session => "session",
+            Cmd::Blocks => "blocks",
+            Cmd::Statusline => "statusline",
+            Cmd::Tui => "tui",
+            Cmd::Web => "web",
+            Cmd::RefreshPrices => "refresh-prices",
+            Cmd::Help => "help",
         }
+    }
+
+    fn from_positional(s: &str) -> Option<Cmd> {
+        // Build the table from `as_str` so the two directions can't drift.
+        const ALL: [Cmd; 9] = [
+            Cmd::Daily,
+            Cmd::Monthly,
+            Cmd::Session,
+            Cmd::Blocks,
+            Cmd::Statusline,
+            Cmd::Tui,
+            Cmd::Web,
+            Cmd::RefreshPrices,
+            Cmd::Help,
+        ];
+        ALL.into_iter().find(|c| c.as_str() == s)
     }
 }
 
@@ -57,6 +76,11 @@ pub struct Options {
     /// `Some(_)` is rejected on non-web subcommands by `validate_flag_scopes`.
     pub port: Option<u16>,
     pub out_dir: Option<String>,
+    /// `web` only: skip the local HTTP server and the `open` browser
+    /// launch — just emit the static site to `--out` and exit. Used by
+    /// CI / scripts / the integration test that asserts CLI ⟷ web
+    /// uniformity without spawning a browser.
+    pub no_serve: bool,
     pub source: crate::source::SourceKind,
     /// Limit the displayed rows to the most recent N buckets. `None`
     /// shows all rows. Applied after sorting; totals reflect visible
@@ -168,6 +192,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
                 i += 2;
             }
             "--source" => {
+                use std::str::FromStr as _;
                 o.source = crate::source::SourceKind::from_str(next()?)?;
                 i += 2;
             }
@@ -179,6 +204,10 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             "--out" => {
                 o.out_dir = Some(next()?.to_string());
                 i += 2;
+            }
+            "--no-serve" => {
+                o.no_serve = true;
+                i += 1;
             }
             "--tail" => {
                 let n: u32 = next()?
@@ -224,6 +253,9 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
 
 // Subcommand groupings used by the scope checks below.
 const REPORT_CMDS: &[Cmd] = &[Cmd::Daily, Cmd::Monthly, Cmd::Session, Cmd::Blocks];
+// Subcommands that honor the global filter flags (--since/--until/--project).
+// `tui` and `web` deliberately ignore them today (Phase A); `not_honored_by_ui`
+// derives its rejection set from this list as the single source of truth.
 const FILTER_CMDS: &[Cmd] = &[
     Cmd::Daily,
     Cmd::Monthly,
@@ -274,35 +306,37 @@ fn validate_flag_scopes(o: &Options) -> Result<(), String> {
     if o.out_dir.is_some() && o.cmd != Cmd::Web {
         return Err("--out only applies to `web` (e.g. `ccaudit web --out ./site`)".to_string());
     }
+    if o.no_serve && o.cmd != Cmd::Web {
+        return Err("--no-serve only applies to `web`".to_string());
+    }
     if o.port.is_some() && o.cmd != Cmd::Web {
         return Err("--port only applies to `web` (e.g. `ccaudit web --port 8080`)".to_string());
     }
 
-    // Global-filter flags: in Phase A, `tui` and `web` do not honor these yet.
+    // Global-filter flags: only honored by FILTER_CMDS today (Phase A).
     // Rejecting with a clear message beats silently dropping them.
-    let not_honored_by_ui = |name: &str| -> Result<(), String> {
-        match o.cmd {
-            Cmd::Tui => Err(format!(
-                "{name} is not yet honored by `tui` — it launches the browser unfiltered"
-            )),
-            Cmd::Web => Err(format!(
-                "{name} is not yet honored by `web` — it generates the site unfiltered"
-            )),
-            _ => Ok(()),
+    let filter_flag = |name: &str| -> Result<(), String> {
+        if FILTER_CMDS.contains(&o.cmd) {
+            return Ok(());
         }
+        let (mode, why) = match o.cmd {
+            Cmd::Tui => ("tui", " — it launches the browser unfiltered"),
+            Cmd::Web => ("web", " — it generates the site unfiltered"),
+            _ => ("this subcommand", ""),
+        };
+        Err(format!("{name} is not yet honored by `{mode}`{why}"))
     };
     if o.since.is_some() {
-        not_honored_by_ui("--since")?;
+        filter_flag("--since")?;
     }
     if o.until.is_some() {
-        not_honored_by_ui("--until")?;
+        filter_flag("--until")?;
     }
     if o.project.is_some() {
-        not_honored_by_ui("--project")?;
+        filter_flag("--project")?;
     }
-    if o.locale.is_some() && !FILTER_CMDS.contains(&o.cmd) {
-        // `refresh-prices` has no use for --locale; still silent there today.
-        not_honored_by_ui("--locale")?;
+    if o.locale.is_some() {
+        filter_flag("--locale")?;
     }
 
     Ok(())
@@ -391,7 +425,7 @@ pub fn print_help() {
     eprintln!("  --project NAME      filter to a single project");
     eprintln!("  --timezone TZ       UTC, Local, or ±HH:MM (default UTC)");
     eprintln!("  --locale LOC        date locale (e.g. en_US, ja_JP)");
-    eprintln!("  --source NAME       log provider: claude-code (default)");
+    eprintln!("  --source NAME       log provider: claude-code (default), codex");
     eprintln!("  --help, -h          show help");
     eprintln!();
     eprintln!("Run `ccaudit <SUBCOMMAND> --help` for mode-specific flags.");
@@ -445,6 +479,7 @@ pub fn print_subcommand_help(cmd: Cmd) {
             eprintln!("FLAGS");
             eprintln!("  --port N            HTTP server port (default 3131)");
             eprintln!("  --out DIR           output directory (default: ~/.claude/ccaudit-web)");
+            eprintln!("  --no-serve          generate the static site, then exit (no browser)");
             eprintln!();
             eprintln!("EXAMPLES");
             eprintln!("  ccaudit web");
@@ -460,7 +495,7 @@ pub fn print_subcommand_help(cmd: Cmd) {
             eprintln!("  ccaudit refresh-prices [FLAGS]");
             eprintln!();
             eprintln!("FLAGS");
-            eprintln!("  --source NAME       log provider: claude-code (default)");
+            eprintln!("  --source NAME       log provider: claude-code (default), codex");
             eprintln!();
             eprintln!("EXAMPLES");
             eprintln!("  ccaudit refresh-prices");

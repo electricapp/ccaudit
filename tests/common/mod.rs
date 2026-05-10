@@ -57,6 +57,9 @@ impl Harness {
             .expect("spawn ccaudit")
     }
 
+    // Used by tests/cli.rs (CCAUDIT_LAZY); unused by tests/uniformity.rs,
+    // and each test binary compiles `mod common` from scratch.
+    #[allow(dead_code)]
     pub fn run_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         let bin = bin_path();
         let mut cmd = Command::new(bin);

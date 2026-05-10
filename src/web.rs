@@ -1,24 +1,22 @@
 use crate::cache::LoadedCache;
 use crate::parse::{self, MessageKind, Project};
-use crate::source::{Source, day_to_date};
+use crate::source::day_to_date;
 use crate::style;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
+// What the web app actually consumes per project: just the name
+// (display + filter key) and the session list. Per-project totals
+// (tokens, cost, msg_count, last_active) are recomputed in JS from
+// sessions at render time so date / model filters can shrink them
+// — shipping pre-aggregated copies would lie under any active filter.
 #[derive(Serialize)]
 struct IndexProject<'a> {
     name: &'a str,
-    total_tokens: u64,
-    total_input: u64,
-    total_output: u64,
-    total_cache_read: u64,
-    total_cache_create: u64,
-    msg_count: usize,
-    cost: f64,
-    last_active: Option<String>,
     sessions: Vec<IndexSession<'a>>,
 }
 
@@ -55,15 +53,16 @@ struct IndexSession<'a> {
     /// Count of `ToolUse` invocations by `tool_name`, aggregated across
     /// this session. Powers the dashboard pie chart's `by tool` mode.
     /// Small map — each session touches maybe 5–20 distinct tools.
-    tool_counts: HashMap<&'a str, u32>,
+    tool_counts: FxHashMap<String, u32>,
 }
 
-fn build_tool_counts(session: &parse::Session) -> HashMap<&str, u32> {
-    let mut map: HashMap<&str, u32> = HashMap::new();
-    for msg in &session.messages {
+fn build_tool_counts_from(messages: &[parse::Message]) -> FxHashMap<String, u32> {
+    let mut map: FxHashMap<String, u32> =
+        FxHashMap::with_capacity_and_hasher(16, rustc_hash::FxBuildHasher);
+    for msg in messages {
         if matches!(msg.kind, MessageKind::ToolUse) {
             if let Some(name) = msg.tool_name.as_deref() {
-                *map.entry(name).or_insert(0) += 1;
+                *map.entry(name.to_owned()).or_insert(0) += 1;
             }
         }
     }
@@ -107,10 +106,9 @@ fn build_css_tokens() -> String {
     s
 }
 
-fn build_hourly(session: &parse::Session) -> Vec<[u64; 5]> {
-    use std::collections::BTreeMap;
-    let mut map: BTreeMap<u64, (u64, u64, u64, u64)> = BTreeMap::new();
-    for msg in &session.messages {
+fn build_hourly_from(messages: &[parse::Message]) -> Vec<[u64; 5]> {
+    let mut map: FxHashMap<u64, (u64, u64, u64, u64)> = FxHashMap::default();
+    for msg in messages {
         let Some(ts) = msg.timestamp else { continue };
         let Some(tok) = msg.tokens.as_ref() else {
             continue;
@@ -122,9 +120,12 @@ fn build_hourly(session: &parse::Session) -> Vec<[u64; 5]> {
         entry.2 += tok.cache_read;
         entry.3 += tok.cache_create;
     }
-    map.into_iter()
+    let mut out: Vec<[u64; 5]> = map
+        .into_iter()
         .map(|(t, (i, o, cr, cw))| [t, i, o, cr, cw])
-        .collect()
+        .collect();
+    out.sort_unstable_by_key(|row| row[0]);
+    out
 }
 
 /// Compact daily rollup shipped alongside `index.json`. Derived from
@@ -137,9 +138,9 @@ fn build_hourly(session: &parse::Session) -> Vec<[u64; 5]> {
 /// `p` / `m` / `d` arrays so a year of history stays under ~100 KB.
 #[derive(Serialize)]
 struct DailyIndex<'a> {
-    p: Vec<&'a str>,    // project names (index space matches `rows[_][1]`)
-    m: Vec<&'a str>,    // model names — empty string for unknown
-    d: Vec<String>,     // day strings in YYYY-MM-DD form
+    p: &'a [String], // project names (index space matches `rows[_][1]`)
+    m: &'a [String], // model names — empty string for unknown
+    d: Vec<String>,  // day strings in YYYY-MM-DD form
     rows: Vec<DailyRow>,
 }
 
@@ -149,10 +150,7 @@ struct DailyIndex<'a> {
 #[derive(Serialize)]
 struct DailyRow(i32, i32, i32, u64, u64, u64, u64, f64);
 
-fn build_daily_index<'a, S: Source + ?Sized>(
-    cache: &'a LoadedCache,
-    source: &S,
-) -> DailyIndex<'a> {
+fn build_daily_index(cache: &LoadedCache) -> DailyIndex<'_> {
     // Preaggs are already cross-session-deduped and priced per-message
     // model at build time, keyed on (day, model_id, project_id). So
     // the "daily" rollup is just a projection: group by (day, project,
@@ -160,25 +158,8 @@ fn build_daily_index<'a, S: Source + ?Sized>(
     let mut day_idx: HashMap<i32, i32> = HashMap::new();
     let mut days: Vec<i32> = Vec::new();
 
-    // Skip rows whose model is filtered by this provider (Claude Code's
-    // `<synthetic>` compaction calls). The usage reports drop these via
-    // `source.skip_model`; matching that keeps the heatmap consistent
-    // with the CLI numbers instead of inflating cache-write dollars.
-    let keep_model = |mid: u16| -> bool {
-        if mid == u16::MAX {
-            return true;
-        }
-        cache
-            .models
-            .get(mid as usize)
-            .is_none_or(|m| !source.skip_model(m))
-    };
-
     let mut rows: Vec<DailyRow> = Vec::with_capacity(cache.preaggs().len());
     for p in cache.preaggs() {
-        if !keep_model(p.model_id) {
-            continue;
-        }
         let di = *day_idx.entry(p.day).or_insert_with(|| {
             let i = i32::try_from(days.len()).unwrap_or(i32::MAX);
             days.push(p.day);
@@ -217,8 +198,8 @@ fn build_daily_index<'a, S: Source + ?Sized>(
         .collect();
 
     DailyIndex {
-        p: cache.projects.iter().map(String::as_str).collect(),
-        m: cache.models.iter().map(String::as_str).collect(),
+        p: &cache.projects,
+        m: &cache.models,
         d,
         rows,
     }
@@ -227,12 +208,7 @@ fn build_daily_index<'a, S: Source + ?Sized>(
 // Prints build-stats lines ("search index: …KB", "wrote …") to stderr
 // so the user sees what the `ccaudit web` run produced.
 #[allow(clippy::print_stderr)]
-pub fn generate<S: Source + ?Sized>(
-    projects: &[Project],
-    cache: &LoadedCache,
-    source: &S,
-    out_dir: &Path,
-) -> std::io::Result<()> {
+pub fn generate(projects: &[Project], cache: &LoadedCache, out_dir: &Path) -> std::io::Result<()> {
     use rayon::prelude::*;
 
     let sessions_dir = out_dir.join("s");
@@ -250,16 +226,31 @@ pub fn generate<S: Source + ?Sized>(
         })
         .collect();
 
-    // Parallel: serialize + write session JSON files AND tokenize for search index
-    let per_session_words: Vec<HashSet<String>> = all_sessions
+    // Parallel: load each session's `.msgs` blob once, derive everything
+    // that needs message content (tokenized search words, hourly
+    // breakdown, tool-use histogram), stream the per-session JSON to
+    // disk, then drop the messages. The session-list path no longer
+    // keeps message content in memory, so this is the only place that
+    // touches `.msgs` during web generate.
+    struct PerSession {
+        words: FxHashSet<String>,
+        hourly: Vec<[u64; 5]>,
+        tool_counts: FxHashMap<String, u32>,
+    }
+    let per_session: Vec<PerSession> = all_sessions
         .par_iter()
         .map(|&(pi, si, session)| {
+            let messages: Vec<parse::Message> = parse::load_messages_for(&session.file_path)
+                .or_else(|| parse::parse_session(&session.file_path).map(|s| s.messages))
+                .unwrap_or_default();
             let filename = format!("{pi}_{si}.json");
-            if let Ok(json) = serde_json::to_string(&session.messages) {
-                let _ = fs::write(sessions_dir.join(&filename), json);
+            if let Ok(file) = fs::File::create(sessions_dir.join(&filename)) {
+                let mut w = BufWriter::new(file);
+                let _ = serde_json::to_writer(&mut w, &messages);
+                let _ = w.flush();
             }
-            let mut words: HashSet<String> = HashSet::new();
-            for msg in &session.messages {
+            let mut words: FxHashSet<String> = FxHashSet::default();
+            for msg in &messages {
                 match msg.kind {
                     MessageKind::User | MessageKind::Assistant | MessageKind::ToolUse => {
                         tokenize_into(&msg.content, &mut words);
@@ -267,22 +258,24 @@ pub fn generate<S: Source + ?Sized>(
                     _ => {}
                 }
             }
-            words
+            PerSession {
+                words,
+                hourly: build_hourly_from(&messages),
+                tool_counts: build_tool_counts_from(&messages),
+            }
         })
         .collect();
 
-    // Build index + search index sequentially (fast, just metadata)
+    // Build index sequentially. `per_session` is in flat (pi,si) order
+    // matching `all_sessions`, so we pop the front of an iterator as we
+    // re-walk the projects tree — moves hourly/tool_counts into the
+    // IndexSession instead of cloning.
+    let mut per_session_iter = per_session.into_iter();
+    let mut per_session_words: Vec<FxHashSet<String>> = Vec::with_capacity(all_sessions.len());
     let index: Vec<IndexProject> = projects
         .iter()
         .enumerate()
         .map(|(pi, project)| {
-            let total_input: u64 = project.sessions.iter().map(|s| s.total_input_tokens).sum();
-            let total_output: u64 = project.sessions.iter().map(|s| s.total_output_tokens).sum();
-            let total_cache_read: u64 = project.sessions.iter().map(|s| s.total_cache_read).sum();
-            let total_cache_create: u64 =
-                project.sessions.iter().map(|s| s.total_cache_create).sum();
-            let msg_count: usize = project.sessions.iter().map(|s| s.messages.len()).sum();
-
             let idx_sessions: Vec<IndexSession> = project
                 .sessions
                 .iter()
@@ -290,6 +283,12 @@ pub fn generate<S: Source + ?Sized>(
                 .map(|(si, session)| {
                     let filename = format!("{pi}_{si}.json");
                     let cost = session.cost;
+                    let ps = per_session_iter.next().unwrap_or(PerSession {
+                        words: FxHashSet::default(),
+                        hourly: Vec::new(),
+                        tool_counts: FxHashMap::default(),
+                    });
+                    per_session_words.push(ps.words);
                     IndexSession {
                         id: &session.id,
                         summary: session.summary.as_deref(),
@@ -302,39 +301,34 @@ pub fn generate<S: Source + ?Sized>(
                         ended_at: session.ended_at.map(|t| t.to_rfc3339()),
                         turn_count: session.turn_count,
                         model: session.model.as_deref(),
-                        msg_count: session.messages.len(),
+                        msg_count: session.msg_count as usize,
                         cost,
                         cost_input: session.cost_input,
                         cost_output: session.cost_output,
                         cost_cache_read: session.cost_cache_read,
                         cost_cache_create: session.cost_cache_create,
                         file: filename,
-                        hourly: build_hourly(session),
-                        tool_counts: build_tool_counts(session),
+                        hourly: ps.hourly,
+                        tool_counts: ps.tool_counts,
                     }
                 })
                 .collect();
 
-            let cost: f64 = idx_sessions.iter().map(|s| s.cost).sum();
             IndexProject {
                 name: &project.name,
-                total_tokens: project.total_tokens,
-                total_input,
-                total_output,
-                total_cache_read,
-                total_cache_create,
-                msg_count,
-                cost,
-                last_active: project.last_active.map(|t| t.to_rfc3339()),
                 sessions: idx_sessions,
             }
         })
         .collect();
 
     // per_session_words is ordered same as all_sessions (flat project→session iteration)
-    // Drain each HashSet so we move the strings into the posting-list
-    // map instead of cloning them.
-    let mut word_to_sessions: HashMap<String, Vec<usize>> = HashMap::new();
+    // Drain each set so we move the strings into the posting-list map
+    // instead of cloning them. Pre-size to the total set-element count
+    // (overshoots a bit since popular words appear in many sessions, but
+    // avoids the rehash cascade of growing from default capacity).
+    let total_word_slots: usize = per_session_words.iter().map(FxHashSet::len).sum();
+    let mut word_to_sessions: FxHashMap<String, Vec<usize>> =
+        FxHashMap::with_capacity_and_hasher(total_word_slots, rustc_hash::FxBuildHasher);
     for (flat_idx, words) in per_session_words.into_iter().enumerate() {
         for word in words {
             word_to_sessions.entry(word).or_default().push(flat_idx);
@@ -351,40 +345,57 @@ pub fn generate<S: Source + ?Sized>(
         projects: &'a [IndexProject<'a>],
         daily: DailyIndex<'a>,
     }
-    let daily = build_daily_index(cache, source);
+    let daily = build_daily_index(cache);
     let index_doc = Index {
         projects: &index,
         daily,
     };
-    let index_json = serde_json::to_string(&index_doc).map_err(std::io::Error::other)?;
-    fs::write(out_dir.join("index.json"), &index_json)?;
+    let index_path = out_dir.join("index.json");
+    let mut index_w = BufWriter::new(fs::File::create(&index_path)?);
+    serde_json::to_writer(&mut index_w, &index_doc).map_err(std::io::Error::other)?;
+    index_w.flush()?;
+    drop(index_w);
+    let index_size = fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
 
     #[derive(Serialize)]
     struct SearchIndex {
-        w: HashMap<String, Vec<usize>>,
+        w: FxHashMap<String, Vec<usize>>,
     }
-    let search_json = serde_json::to_string(&SearchIndex {
-        w: word_to_sessions,
-    })
+    let search_path = out_dir.join("search.json");
+    let mut search_w = BufWriter::new(fs::File::create(&search_path)?);
+    serde_json::to_writer(
+        &mut search_w,
+        &SearchIndex {
+            w: word_to_sessions,
+        },
+    )
     .map_err(std::io::Error::other)?;
-    fs::write(out_dir.join("search.json"), &search_json)?;
-    eprintln!("search index: {:.0}KB", search_json.len() as f64 / 1024.0);
+    search_w.flush()?;
+    drop(search_w);
+    let search_size = fs::metadata(&search_path).map(|m| m.len()).unwrap_or(0);
+    eprintln!("search index: {:.0}KB", search_size as f64 / 1024.0);
 
     let out_file = out_dir.join("index.html");
-    let mut f = fs::File::create(&out_file)?;
+    let mut f = BufWriter::new(fs::File::create(&out_file)?);
     f.write_all(b"<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<meta name=\"color-scheme\" content=\"dark\">\n<meta name=\"description\" content=\"Browse Claude Code session logs - projects, token usage, costs, and full message history.\">\n<meta property=\"og:title\" content=\"ccaudit\">\n<meta property=\"og:description\" content=\"Claude Code session log browser.\">\n<meta property=\"og:type\" content=\"website\">\n<title>ccaudit</title>\n<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%230d0d0f'/><text x='16' y='22' font-size='18' text-anchor='middle' fill='%236e9eff' font-family='monospace'>cc</text></svg>\">\n<style>")?;
     // Swap the `/* TOKENS */` placeholder with a :root block generated
     // from the shared design tokens. One source of truth (style.rs).
     // Spaces around `TOKENS` are required — prettier normalizes the
-    // marker to that form, so the literal here must match.
-    let css = CSS.replacen("/* TOKENS */", &build_css_tokens(), 1);
+    // marker to that form, so the literal here must match. The
+    // assert below catches a refactor that drops/renames the marker;
+    // without it the design-token block silently disappears.
+    debug_assert!(
+        CSS.contains(TOKEN_MARKER),
+        "src/web/style.css must contain `{TOKEN_MARKER}` so the build can splice in the design tokens",
+    );
+    let css = CSS.replacen(TOKEN_MARKER, &build_css_tokens(), 1);
     f.write_all(css.as_bytes())?;
     f.write_all(b"</style>\n</head>\n<body>\n<div id=\"narrow\" role=\"alert\"><strong>ccaudit is desktop-only</strong>The views are dense and table-heavy \xe2\x80\x94 they need a wider viewport than this device offers. Open ccaudit on a laptop or desktop browser.</div>\n<div id=\"app\">\n  <header>\n    <div class=\"bar\">\n      <button id=\"back\" onclick=\"goBack()\" class=\"hidden\" aria-label=\"back\">&larr;</button>\n      <nav id=\"crumbs\" class=\"crumbs\" aria-label=\"breadcrumb\">\n        <span class=\"crumb-lbl\">project:</span><a id=\"crumb-p\" class=\"crumb dim\" onclick=\"crumbClickP()\" role=\"button\" tabindex=\"0\">\xe2\x80\x94</a>\n        <span class=\"crumb-sep\" aria-hidden=\"true\">/</span>\n        <span class=\"crumb-lbl\">session:</span><a id=\"crumb-s\" class=\"crumb dim\" onclick=\"crumbClickS()\" role=\"button\" tabindex=\"0\">\xe2\x80\x94</a>\n      </nav>\n      <div class=\"filterset\" role=\"toolbar\" aria-label=\"filters\">\n        <input id=\"search\" type=\"search\" placeholder=\"/ search\" autocomplete=\"off\" spellcheck=\"false\" aria-label=\"search\">\n        <button class=\"pbtn reset\" onclick=\"resetAll()\" title=\"clear all filters / sort / scope (r)\" aria-label=\"reset filters\">reset</button>\n        <input id=\"dfrom\" type=\"date\" class=\"dateinp\" title=\"from date\" aria-label=\"from date\">\n        <input id=\"dto\" type=\"date\" class=\"dateinp\" title=\"to date\" aria-label=\"to date\">\n        <div class=\"presets\" role=\"group\" aria-label=\"date preset\">\n          <button class=\"pbtn\" data-days=\"7\" onclick=\"setDateRange(7)\">7d</button>\n          <button class=\"pbtn\" data-days=\"30\" onclick=\"setDateRange(30)\">30d</button>\n          <button class=\"pbtn\" data-days=\"90\" onclick=\"setDateRange(90)\">90d</button>\n          <button class=\"pbtn\" data-days=\"0\" onclick=\"setDateRange(null)\">all</button>\n        </div>\n        <div id=\"mfilt\" class=\"drop\" data-drop=\"model\" title=\"filter by model\"></div>\n      </div>\n    </div>\n  </header>\n  <main id=\"main\" role=\"main\"><div class=\"loading\" role=\"status\" aria-live=\"polite\">loading...</div></main>\n  <button id=\"btt\" onclick=\"document.getElementById('main').scrollTo({top:0,behavior:'smooth'})\" title=\"back to top\" aria-label=\"back to top\">\xe2\x86\x91</button>\n</div>\n<script>\n")?;
     f.write_all(UTIL.as_bytes())?;
     f.write_all(JS.as_bytes())?;
     f.write_all(b"\n</script>\n</body>\n</html>")?;
+    f.flush()?;
 
-    let index_size = index_json.len();
     let total_session_files: usize = projects.iter().map(|p| p.sessions.len()).sum();
     eprintln!(
         "wrote {} ({:.0}KB index + {} session files)",
@@ -395,7 +406,7 @@ pub fn generate<S: Source + ?Sized>(
     Ok(())
 }
 
-fn tokenize_into(text: &str, out: &mut HashSet<String>) {
+fn tokenize_into(text: &str, out: &mut FxHashSet<String>) {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -420,6 +431,7 @@ fn tokenize_into(text: &str, out: &mut HashSet<String>) {
 }
 
 const CSS: &str = include_str!("web/style.css");
+const TOKEN_MARKER: &str = "/* TOKENS */";
 
 // Pure helpers (no DOM, no state). Prepended to JS so app.js can treat
 // these functions as globals. Also loadable standalone for testing —

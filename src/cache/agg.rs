@@ -8,8 +8,9 @@
 
 use super::load::LoadedCache;
 use crate::source::{Source, day_to_date};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
+/// How an aggregation groups its rows.
 #[derive(Clone, Copy, Debug)]
 pub enum Bucket {
     Day,
@@ -18,6 +19,7 @@ pub enum Bucket {
     Block, // 5-hour billing windows aligned to unix epoch
 }
 
+/// Inclusive date / project / timezone filter applied during aggregation.
 #[derive(Clone, Debug, Default)]
 pub struct FilterOpts<'a> {
     pub since_day: Option<i32>, // inclusive
@@ -79,6 +81,106 @@ pub struct BucketUsage {
 /// against the same constant the aggregator buckets by.
 pub const BLOCK_SECS: i64 = 5 * 3600;
 
+/// Per-session token + cost totals.
+///
+/// Single source of truth — produced by the same dedup/skip-model/pricing
+/// pipeline that powers the CLI reports, so anything that displays
+/// "session X cost $Y" agrees with `ccaudit daily` to the cent.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct SessionTotals {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_create: u64,
+    pub cost: f64,
+    pub cost_input: f64,
+    pub cost_output: f64,
+    pub cost_cache_read: f64,
+    pub cost_cache_create: f64,
+    /// Unix ts of the last billable line. Canonical "last activity".
+    pub last_ts: i64,
+}
+
+/// Build per-session totals from the cache.
+///
+/// Walks lines once with the canonical cross-session msg-id dedup,
+/// skip-model filter, and per-model pricing. Returned map is keyed by
+/// `SessionEntry::path_hash` so callers can match by source-file path
+/// without paying for a string lookup.
+pub fn per_session_totals<S: Source + ?Sized>(
+    cache: &LoadedCache,
+    source: &S,
+) -> FxHashMap<u64, SessionTotals> {
+    let sessions_s = cache.sessions();
+    let lines_s = cache.lines();
+    let ts_s = cache.ts_unix();
+
+    // Cross-session dedup hashset shared across the whole walk so a
+    // checkpointed message_id appearing in multiple sessions only counts
+    // once (toward the earliest session, since sessions are stored
+    // chronologically at build time).
+    let mut seen: FxHashSet<u64> =
+        FxHashSet::with_capacity_and_hasher(lines_s.len(), FxBuildHasher);
+    let mut out: FxHashMap<u64, SessionTotals> =
+        FxHashMap::with_capacity_and_hasher(sessions_s.len(), FxBuildHasher);
+
+    for sess in sessions_s {
+        let lo = sess.line_start as usize;
+        let hi = lo + sess.line_count as usize;
+        let line_range = lo..hi;
+        let fallback_model_id = sess.session_model_id;
+        let mut totals = SessionTotals::default();
+
+        for (off, line) in lines_s.get(line_range).unwrap_or(&[]).iter().enumerate() {
+            if (line.flags & 1) != 0 && !seen.insert(line.msg_id_hash) {
+                continue;
+            }
+            let mid = if line.model_id == u16::MAX {
+                fallback_model_id
+            } else {
+                line.model_id
+            };
+            let model_name: Option<&str> = if mid == u16::MAX {
+                None
+            } else {
+                cache.models.get(mid as usize).map(String::as_str)
+            };
+            if model_name.is_some_and(|m| source.skip_model(m)) {
+                continue;
+            }
+            let [ci, co, ccw, ccr] = source.price_columns(
+                model_name,
+                u64::from(line.input),
+                u64::from(line.output),
+                u64::from(line.cache_create),
+                u64::from(line.cache_read),
+            );
+
+            totals.input += u64::from(line.input);
+            totals.output += u64::from(line.output);
+            totals.cache_read += u64::from(line.cache_read);
+            totals.cache_create += u64::from(line.cache_create);
+            totals.cost_input += ci;
+            totals.cost_output += co;
+            totals.cost_cache_read += ccr;
+            totals.cost_cache_create += ccw;
+            totals.cost += ci + co + ccw + ccr;
+            if let Some(&ts) = ts_s.get(lo + off) {
+                if ts > totals.last_ts {
+                    totals.last_ts = ts;
+                }
+            }
+        }
+
+        let _ = out.insert(sess.path_hash, totals);
+    }
+
+    out
+}
+
+/// Bucket + sum the cache into `BreakdownKey → BucketUsage`. Day/month
+/// rollups read pre-aggregated rows directly; session/block/non-UTC
+/// fall back to a per-line walk with cross-session dedup.
 pub fn aggregate<S: Source + ?Sized>(
     cache: &LoadedCache,
     bucket: Bucket,
@@ -108,16 +210,16 @@ pub fn aggregate<S: Source + ?Sized>(
     let lines_s = cache.lines();
     let ts_s = cache.ts_unix();
 
-    let mut seen: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::with_capacity_and_hasher(
+    let mut seen: FxHashSet<u64> = FxHashSet::with_capacity_and_hasher(
         lines_s.len().saturating_mul(2).max(1024),
-        rustc_hash::FxBuildHasher,
+        FxBuildHasher,
     );
     // Pre-size to a realistic ceiling rather than the line count — live
     // aggregate folds 50k lines into ~30–500 bucket rows. Starting at 64
     // covers the common case (daily/monthly) without rehashing; larger
     // result sets (blocks over months) still grow but only once.
     let mut out: FxHashMap<BreakdownKey, BucketUsage> =
-        FxHashMap::with_capacity_and_hasher(64, rustc_hash::FxBuildHasher);
+        FxHashMap::with_capacity_and_hasher(64, FxBuildHasher);
 
     // Sessions are stored chronologically at cache-build time so walking
     // in natural order is the same as sorting by `started_at`. Skipping
@@ -239,10 +341,8 @@ fn aggregate_from_preaggs(
     // Pre-size: a typical daily/monthly rollup has ~30–60 entries; cap
     // at a generous 128 to avoid over-allocating when queries return
     // few rows. The map will still grow if --breakdown produces more.
-    let mut out: FxHashMap<BreakdownKey, BucketUsage> = FxHashMap::with_capacity_and_hasher(
-        cache.preaggs().len().clamp(32, 128),
-        rustc_hash::FxBuildHasher,
-    );
+    let mut out: FxHashMap<BreakdownKey, BucketUsage> =
+        FxHashMap::with_capacity_and_hasher(cache.preaggs().len().clamp(32, 128), FxBuildHasher);
 
     for p in cache.preaggs() {
         if let Some(since) = opts.since_day {

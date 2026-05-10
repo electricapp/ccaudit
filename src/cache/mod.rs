@@ -7,5 +7,8 @@ mod build;
 mod load;
 mod schema;
 
-pub use agg::{BLOCK_SECS, BreakdownKey, Bucket, BucketKey, BucketUsage, FilterOpts, aggregate};
+pub use agg::{
+    BLOCK_SECS, BreakdownKey, Bucket, BucketKey, BucketUsage, FilterOpts, SessionTotals, aggregate,
+    per_session_totals,
+};
 pub use load::{LoadedCache, load};

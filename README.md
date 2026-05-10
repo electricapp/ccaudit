@@ -30,8 +30,6 @@ Inspired by:
 |                       | ccaudit                  | ccusage        | claude-code-log    | claude-session-dashboard |
 | --------------------- | ------------------------ | -------------- | ------------------ | ------------------------ |
 | Runtime               | Rust binary (~1.3 MB)    | Node.js        | Python             | Node.js + browser        |
-| Indexing time (10GB)  | <10 ms (warm), <1s (cold)| ~18s           | ~120 s             | on-demand per request    |
-| Equivalent throughput | >10GB/s (cold)           | 500MB/s        | ~80MB/s            | n/a                      |
 | CLI reports           | yes (daily/monthly/…)    | reference impl | —                  | —                        |
 | TUI browser           | yes (`ccaudit tui`)      | —              | —                  | —                        |
 | Web dashboard         | yes (`ccaudit web`)      | —              | HTML export        | yes (local server)       |
@@ -39,6 +37,169 @@ Inspired by:
 | Install               | binary / npm / cargo     | npm            | `pip install` + py | `npx` / `npm install -g` |
 
 `claude-session-dashboard` has one thing ccaudit doesn't: an **agent-delegation Gantt chart** for the sub-agent dispatch tree per session. Worth it if you run agentic workflows and want to see the delegation order.
+
+### Benchmarks
+
+Same dataset, same workload (`daily` token report). Single-shot wall time on Apple Silicon, against `~/.claude/projects/` = **3.0 GB / 822 JSONL files**.
+
+|                            | uncached | cold cache | warm cache |
+| -------------------------- | -------: | ---------: | ---------: |
+| **ccaudit**                | 0.25 s   | **0.07 s** | **0.08 s** |
+| ccusage (`bunx`)           | 9.5 s    |     8.9 s  |     9.5 s  |
+| claude-code-log (`uvx`)    | 83.0 s   |    52.2 s  |    36.9 s  |
+
+- **uncached** — app-level cache wiped, forcing a full re-parse from JSONL
+- **cold cache** — app cache present, OS page cache evicted (`sudo purge`)
+- **warm cache** — re-run immediately afterwards; mmap + page cache hot
+
+### Where the time goes
+
+Same input (`~/.claude/projects/`), same logical question ("daily token totals"). Here's what each tool does for each invocation:
+
+```
+ccaudit daily — warm cache (~70 ms)
+─────────────────────────────────────────────
+  mmap usage.db  (3 MB binary, already bucketed by day × model)
+       │
+       ▼
+  sum PreAgg cells
+       │
+       ▼
+  print table
+```
+
+```
+ccaudit daily — uncached (~250 ms, pays the cost ONCE per file lifetime)
+─────────────────────────────────────────────
+  walk ~/.claude/projects → 822 files
+       │
+       ▼
+  rayon-parallel parse JSONL  (1.2 M lines, typed serde)
+       │
+       ▼
+  bucket by (day × model)
+       │
+       ▼
+  ┌────────────────────────────┐
+  │ persist binary cache.db    │ ◄── pay once,
+  └────────┬───────────────────┘     all future runs are 70 ms
+           ▼
+  mmap + sum + print
+```
+
+```
+ccusage daily (~9 s, EVERY SINGLE RUN)
+─────────────────────────────────────────────
+  ┌────────────────────────────────────────────┐
+  │ ⏬ HTTP GET litellm/prices.json   (~1 MB)   │ ◄── network call,
+  └────────┬───────────────────────────────────┘     every run
+           ▼
+  parse pricing JSON (~1500 models)
+           │
+           ▼
+  walk ~/.claude/projects → 822 files
+           │
+           ▼
+  ┌────────────────────────────────────────┐
+  │ for each of 1.2 M lines:               │
+  │   ├── read line from disk              │
+  │   ├── JSON.parse(...)                  │ ◄── re-parse every run
+  │   ├── lookup model in pricing map      │
+  │   ├── tokens × cents                   │
+  │   └── push into per-day bucket         │
+  └────────┬───────────────────────────────┘
+           ▼
+       print table
+```
+
+```
+claude-code-log (~37 s warm / ~83 s uncached)
+─────────────────────────────────────────────
+  load Python pickle cache (if present)
+           │
+           ▼
+  walk ~/.claude/projects → 822 files
+           │
+           ▼
+  ┌────────────────────────────────────────────┐
+  │ for each .jsonl:                           │
+  │   ├── parse JSONL                          │
+  │   ├── build parentUuid → child DAG         │
+  │   ├── ⚠ orphan-node "promote to root"      │ ◄── hundreds
+  │   ├── ⚠ multi-root fallback                │     of these
+  │   └── ⚠ DAG incomplete → timestamp resort  │
+  └────────┬───────────────────────────────────┘
+           ▼
+  ┌────────────────────────────────────────────┐
+  │ for each session:                          │
+  │   └── jinja2 template → write .html file   │ ◄── thousands of
+  └────────┬───────────────────────────────────┘     output files
+           ▼
+  write combined_transcripts.html
+           │
+           ▼
+  update pickle cache
+```
+
+The redundancy in one row:
+
+| once per run | ccaudit (warm) | ccusage | claude-code-log |
+| --- | :---: | :---: | :---: |
+| stat 822 JSONL files                           | — | ✓ | ✓ |
+| parse 1.2 M JSONL lines                        | — | ✓ | ✓ |
+| build per-message parent→child DAG             | — | — | ✓ |
+| render thousands of HTML files                 | — | — | ✓ |
+| HTTP-fetch LiteLLM prices                      | — | ✓ | — |
+| look up model prices, multiply by tokens       | — | ✓ | — |
+| sum already-bucketed numbers + print           | ✓ | ✓ | — |
+
+ccaudit does the top six rows **once**, when it first sees a file, persists the result to a 3 MB binary cache, and every subsequent run is just the bottom row.
+
+### Cache layout
+
+ccaudit keeps two purpose-built caches under `~/.claude/ccaudit-cache/`. CLI reports, the TUI, and the web view each consume the one shaped for what they actually need:
+
+```
+~/.claude/ccaudit-cache/
+├── claude-code.db           ◄── aggregation cache (CLI reports)
+│                                bucketed by (day × model × project),
+│                                mmap'd, zero deserialization on read
+│
+├── codex.db                 ◄── same shape, per --source provider
+│
+├── <hash>.meta              ◄── per-session cache (TUI + web)
+└── <hash>.bin                   one pair per JSONL file —
+                                 full parsed Session struct, every
+                                 message, every tool call, bincoded
+                                 (validated by mtime + size + version)
+```
+
+**CLI** (`daily` / `monthly` / `session` / `blocks` / `statusline`) reads only `<source>.db` — no per-message data needed for token totals.
+
+**TUI** (`ccaudit tui`) reads only the per-session `.bin` files. On startup, `load_all_projects()` walks every JSONL; for each file it stat's `mtime + size`, hits the matching `.bin` if those match the meta, and bincode-deserializes straight into a `Session`. A miss triggers a reparse + cache rewrite for next time. Once everything is in memory, navigation, search, dashboard, scope filters — all in-memory, zero IO. Pressing `c` exec's `claude -r <id>` against the current session.
+
+**Web** (`ccaudit web`) reuses the same per-session cache for the parse step, then materializes the browser-side cache as static files under `~/.claude/ccaudit-web/`:
+
+```
+~/.claude/ccaudit-web/
+├── index.html
+├── app.js  /  style.css  /  util.js     ◄── single-file bundle (no build step)
+├── index.json                            ◄── one fetch:
+│                                              project + session metadata,
+│                                              hourly histograms, tool counts,
+│                                              + a daily rollup pulled straight
+│                                                from <source>.db so the heatmap
+│                                                can't drift from the CLI
+├── search.json                           ◄── word → session posting list
+└── s/
+    └── <pi>_<si>.json                    ◄── per-session message tree,
+                                              lazy-loaded by the browser
+                                              only when you open that session
+```
+
+The browser fetches `index.json` once and renders the dashboard / table from it. Opening a session is one HTTP GET for `<pi>_<si>.json`; repeat opens hit the browser's HTTP cache. The bundled HTTP server is a 10-line static file handler, no API.
+
+End result: writing a daily report, scrolling the TUI, and clicking through 200 sessions in the web view all share the same parsed-once-on-disk substrate. The only thing that ever re-parses a JSONL file is a real change to that file (mtime or size moves).
 
 ## Install
 
@@ -74,7 +235,9 @@ ccaudit                                        # daily report (default)
 ccaudit blocks --cost-limit 100                # 5-hour billing windows w/ progress bar
 ccaudit session --breakdown                    # per-session per-model cost
 ccaudit web --port 8080                        # static site + local server
+ccaudit web --no-serve --out ./site            # generate the static site, exit (CI / scripts)
 ccaudit tui                                    # interactive browser
+ccaudit --source codex daily                   # OpenAI Codex CLI logs (~/.codex/sessions)
 ```
 
 All subcommands accept `--json` for machine-readable output.
@@ -90,7 +253,16 @@ All subcommands accept `--json` for machine-readable output.
 - **Carbon footer** (`--carbon`) — energy / CO₂ / tree-year estimate for the reported window
 - **Deterministic filters** — `--since YYYYMMDD`, `--until`, `--project`, `--timezone`, `--locale`, `--source`
 - **mmap'd cache** — repeated runs on the same `~/.claude/projects/` read from a memory-mapped schema, zero deserialization
-- **Pluggable sources** — a `Source` trait (see `src/source/mod.rs`) abstracts log discovery, parsing, model pricing, and model normalization. Today only Claude Code is shipped; the trait is shaped to accept adapters for Codex, OpenCode, π / Pi, MCP servers, or any other agent that writes JSONL-shaped session logs. Pick a source with `--source NAME`.
+- **Pluggable sources** — a `Source` trait (see `src/source/mod.rs`) abstracts log discovery, parsing, model pricing, and model normalization. Today ships **Claude Code** (`--source claude-code`, default) and **OpenAI Codex CLI** (`--source codex`); the trait accepts adapters for OpenCode, π / Pi, MCP servers, or any other agent that writes JSONL-shaped session logs.
+- **Single source of truth** — CLI `daily`, web sessions table, and web heatmap all read from one `cache::per_session_totals` pipeline. A test (`tests/uniformity.rs`) asserts they agree to the cent on every run.
+
+## Optional features
+
+```bash
+cargo install ccaudit --features simd-json     # ~30% faster JSONL parse, +300 KB binary
+cargo install ccaudit --features locale        # locale-aware date formatting (chrono unstable-locales)
+cargo install ccaudit --features full          # tui + web + locale (default omits locale)
+```
 
 ## TUI keybindings
 
@@ -132,6 +304,23 @@ ccaudit help [SUB]      show help for ccaudit or for a subcommand
 ```
 
 Run `ccaudit <SUBCOMMAND> --help` for mode-specific flags.
+
+## Development
+
+```bash
+cargo test --release --all-features              # 41 tests across 5 suites
+cargo run --release --example bench              # synthetic-corpus bench
+BENCH_SIZE=large BENCH_RUNS=10 \
+  cargo run --release --example bench            # scaling stress
+BENCH_SAVE=baseline.json    cargo run --release --example bench
+BENCH_COMPARE=baseline.json cargo run --release --example bench  # diff vs baseline
+```
+
+The bench builds a deterministic JSONL fixture in a tempdir (no
+dependency on `~/.claude/projects/`) and times the macro paths
+(`parse cold`, `parse warm`, `cache rebuild`, `cache warm mmap`,
+`cache::aggregate day` & `session`, `web::generate`) plus a few inner
+loops (`parse_session`, `tokenize`, `Searcher::score`, `fnv1a`).
 
 ## License
 

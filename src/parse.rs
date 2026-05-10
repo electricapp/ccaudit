@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,35 +14,69 @@ pub struct Project {
     pub sessions: Vec<Session>,
     pub total_tokens: u64,
     pub last_active: Option<DateTime<Utc>>,
+    // Pre-aggregated row totals. Computed once in `load_all_projects`
+    // (sessions are immutable thereafter) so the TUI can render the
+    // projects list in O(1) per row instead of summing every session
+    // every redraw.
+    pub total_msgs: u64,
+    pub total_dur_ms: u64,
+    pub total_cost: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// Two storage tiers backing this struct:
+//   - `.bin`  — header (id, summary, first_user_msg, started_at,
+//               turn_count, model, msg_count): everything the projects
+//               list view needs. Tiny per session.
+//   - `.msgs` — the `messages` Vec only. Loaded on demand when the user
+//               opens a session (TUI) or when web `generate` walks for
+//               per-session JSON output.
+//
+// Token totals + per-column costs + ended_at are owned by the canonical
+// aggregation cache (`src/cache/`); `load_all_projects` populates them
+// after load via `cache::per_session_totals`. They live in this struct
+// only as runtime fields so downstream renderers can read them off
+// `&Session` without threading the cache through every call site.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
-    pub messages: Vec<Message>,
     pub summary: Option<String>,
     pub first_user_msg: Option<String>,
-    pub total_input_tokens: u64,
-    pub total_output_tokens: u64,
-    pub total_cache_read: u64,
-    pub total_cache_create: u64,
     pub started_at: Option<DateTime<Utc>>,
-    pub ended_at: Option<DateTime<Utc>>,
     pub turn_count: usize,
     pub model: Option<String>,
-    // Deduped cost, priced per-message model. Set during load_all_projects
-    // after cross-session dedup so it reflects true user spend for this
-    // session's unique messages. Models can change mid-session (e.g. /fast,
-    // compaction uses a different model), so we can't just price the
-    // session-level totals against a single `model` field.
+    /// Number of messages in the `.msgs` blob. Persisted so the
+    /// projects-list views can render counts without touching the blob.
+    pub msg_count: u32,
+
+    // ── Lazy / runtime-populated fields below: not in `.bin` ──
+    /// JSONL file this session was loaded from. Set by
+    /// `load_all_projects` and used by `ensure_messages_loaded` to find
+    /// the matching `.msgs` blob.
+    #[serde(skip)]
+    pub file_path: PathBuf,
+    /// Empty after a header-only load. Call `ensure_messages_loaded` (or
+    /// reparse) before iterating content.
+    #[serde(skip)]
+    pub messages: Vec<Message>,
+    #[serde(skip)]
+    pub total_input_tokens: u64,
+    #[serde(skip)]
+    pub total_output_tokens: u64,
+    #[serde(skip)]
+    pub total_cache_read: u64,
+    #[serde(skip)]
+    pub total_cache_create: u64,
+    #[serde(skip)]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(skip)]
     pub cost: f64,
-    // Per-token-type dollar costs. Sum to `cost`. Computed alongside
-    // `cost` in the same per-message loop so mid-session model switches
-    // stay accurate per column. Powers the cost-breakdown tooltip in
-    // the web view.
+    #[serde(skip)]
     pub cost_input: f64,
+    #[serde(skip)]
     pub cost_output: f64,
+    #[serde(skip)]
     pub cost_cache_read: f64,
+    #[serde(skip)]
     pub cost_cache_create: f64,
 }
 
@@ -75,11 +109,17 @@ pub struct TokenUsage {
     pub cache_create: u64,
 }
 
-// ── Cache ──
-
-// Per-session cache: each session is stored as an individual bincode file
-// in ~/.claude/ccaudit-cache/<hash>.bin with a companion .meta (mtime+size).
-// This avoids loading/deserializing a monolithic 28MB blob on every run.
+// ── Per-session binary cache (postcard) ──
+//
+// Three files per session under ~/.claude/ccaudit-cache/<hash>.*:
+//   .meta — fingerprint (version + JSONL mtime + JSONL size)
+//   .bin  — Session header (no messages, no totals)
+//   .msgs — Vec<Message>, loaded only when content is needed
+//
+// The split exists because cold TUI startup (and `web --no-serve`'s
+// projects-list render) only needs the header; reading the messages
+// blob for every session just to call `.messages.len()` was the hot
+// cost on warm runs.
 
 fn cache_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("ccaudit-cache"))
@@ -96,17 +136,12 @@ fn file_fingerprint(path: &Path) -> Option<(u64, u64)> {
 }
 
 fn cache_key(path: &Path) -> String {
-    // Simple hash of the full path for filename
-    let s = path.to_string_lossy();
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    format!("{h:016x}")
+    format!("{:016x}", crate::source::path_hash(path))
 }
 
-const CACHE_VERSION: u8 = 6; // bump when Message/Session struct changes
+// Bumped whenever Session header or Message struct changes shape, OR
+// when the on-disk encoding changes. v8 = postcard (was bincode 1.x).
+const CACHE_VERSION: u8 = 8;
 
 #[derive(Serialize, Deserialize)]
 struct CacheMeta {
@@ -115,24 +150,52 @@ struct CacheMeta {
     size: u64,
 }
 
-fn try_load_cached(path: &Path) -> Option<Session> {
+/// Header-only load: reads `.meta` for invalidation, then `.bin`.
+/// Messages stay empty; call `load_messages_into` to fill them.
+fn try_load_cached_header(path: &Path) -> Option<Session> {
     let dir = cache_dir()?;
     let key = cache_key(path);
     let (cur_mtime, cur_size) = file_fingerprint(path)?;
-
-    // Read meta
-    let meta_path = dir.join(format!("{key}.meta"));
-    let meta_bytes = fs::read(&meta_path).ok()?;
-    let meta: CacheMeta = bincode::deserialize(&meta_bytes).ok()?;
-
+    let meta_bytes = fs::read(dir.join(format!("{key}.meta"))).ok()?;
+    let meta: CacheMeta = postcard::from_bytes(&meta_bytes).ok()?;
     if meta.version != CACHE_VERSION || meta.mtime_secs != cur_mtime || meta.size != cur_size {
         return None;
     }
+    let data = fs::read(dir.join(format!("{key}.bin"))).ok()?;
+    postcard::from_bytes(&data).ok()
+}
 
-    // Read cached session
-    let data_path = dir.join(format!("{key}.bin"));
-    let data = fs::read(&data_path).ok()?;
-    bincode::deserialize(&data).ok()
+/// Lazy-load the messages blob for `path`. Returns None if the cache
+/// is missing or stale; caller falls back to `parse_session`.
+pub fn load_messages_for(path: &Path) -> Option<Vec<Message>> {
+    let dir = cache_dir()?;
+    let key = cache_key(path);
+    let (cur_mtime, cur_size) = file_fingerprint(path)?;
+    let meta_bytes = fs::read(dir.join(format!("{key}.meta"))).ok()?;
+    let meta: CacheMeta = postcard::from_bytes(&meta_bytes).ok()?;
+    if meta.version != CACHE_VERSION || meta.mtime_secs != cur_mtime || meta.size != cur_size {
+        return None;
+    }
+    let data = fs::read(dir.join(format!("{key}.msgs"))).ok()?;
+    postcard::from_bytes(&data).ok()
+}
+
+/// Convenience: load messages for `path` into `session.messages` if
+/// they're not already present. No-op if the cache is missing — callers
+/// that need a guarantee should re-parse the JSONL on `false`.
+pub fn ensure_messages_loaded(session: &mut Session, path: &Path) -> bool {
+    if !session.messages.is_empty() {
+        return true;
+    }
+    if let Some(msgs) = load_messages_for(path) {
+        session.messages = msgs;
+        return true;
+    }
+    if let Some(s) = parse_session(path) {
+        session.messages = s.messages;
+        return true;
+    }
+    false
 }
 
 fn save_to_cache(path: &Path, session: &Session) {
@@ -142,18 +205,37 @@ fn save_to_cache(path: &Path, session: &Session) {
     let Some(fp) = file_fingerprint(path) else {
         return;
     };
-
+    // Write header + messages first, then meta last — meta is the
+    // gate readers check, so a half-written cache reads as stale.
+    if let Ok(data) = postcard::to_allocvec(session) {
+        let _ = fs::write(dir.join(format!("{key}.bin")), data);
+    }
+    if let Ok(data) = postcard::to_allocvec(&session.messages) {
+        let _ = fs::write(dir.join(format!("{key}.msgs")), data);
+    }
     let meta = CacheMeta {
         version: CACHE_VERSION,
         mtime_secs: fp.0,
         size: fp.1,
     };
-    if let Ok(meta_bytes) = bincode::serialize(&meta) {
+    if let Ok(meta_bytes) = postcard::to_allocvec(&meta) {
         let _ = fs::write(dir.join(format!("{key}.meta")), meta_bytes);
     }
-    if let Ok(data) = bincode::serialize(session) {
-        let _ = fs::write(dir.join(format!("{key}.bin")), data);
-    }
+}
+
+// JSON parser switch. Default uses serde_json on the immutable mmap'd
+// slice; with `--features simd-json`, the slice is copied into a mutable
+// buffer that simd-json's SIMD-accelerated parser scribbles in place.
+// The copy is cheap relative to the parse cost on lines >100 bytes.
+#[cfg(not(feature = "simd-json"))]
+fn json_from_slice<T: for<'de> Deserialize<'de>>(line: &[u8]) -> Option<T> {
+    serde_json::from_slice(line).ok()
+}
+
+#[cfg(feature = "simd-json")]
+fn json_from_slice<T: for<'de> Deserialize<'de>>(line: &[u8]) -> Option<T> {
+    let mut buf = line.to_vec();
+    simd_json::serde::from_slice(&mut buf).ok()
 }
 
 // ── JSONL deserialization types ──
@@ -172,9 +254,48 @@ struct RawLine {
 #[derive(Deserialize)]
 struct RawMessage {
     id: Option<String>,
-    content: Option<serde_json::Value>,
+    // Claude Code's `content` is either a string (early user messages)
+    // or an array of typed blocks (`text` / `thinking` / `tool_use` /
+    // `tool_result`). Modeling that as `RawContent` lets serde do all
+    // the field plucking up-front instead of walking a Value at runtime.
+    content: Option<RawContent>,
     model: Option<String>,
     usage: Option<RawUsage>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawContent {
+    Text(String),
+    Blocks(Vec<RawBlock>),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RawBlock {
+    Text {
+        text: String,
+    },
+    Thinking {
+        thinking: String,
+    },
+    ToolUse {
+        name: String,
+        // Typed projection of the input fields we actually render. Anything
+        // outside this set is skipped at deserialize time, so we never
+        // allocate a `serde_json::Value` tree for the input.
+        #[serde(default)]
+        input: ToolInput,
+    },
+    ToolResult {
+        // Some content arrays nest content as a string; others as an
+        // array of `{type:"text", text:"..."}`. Capture either.
+        content: Option<RawContent>,
+    },
+    // Anything we don't model (image blocks today, future kinds) is
+    // dropped silently — same behavior as the previous `_ => {}` arm.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Deserialize)]
@@ -183,6 +304,15 @@ struct RawUsage {
     output_tokens: Option<u64>,
     cache_read_input_tokens: Option<u64>,
     cache_creation_input_tokens: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ToolInput {
+    command: Option<String>,
+    description: Option<String>,
+    file_path: Option<String>,
+    pattern: Option<String>,
 }
 
 // ── Parsing helpers ──
@@ -216,9 +346,11 @@ fn fast_parse_u32(b: &[u8]) -> Option<u32> {
     Some(n)
 }
 
-fn truncate_str(s: &str, max_bytes: usize) -> String {
+// Take ownership so the short-string path is a move, not a clone. The
+// only callers already have a `String` they're willing to give up.
+fn truncate_str(s: String, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
-        return s.to_string();
+        return s;
     }
     let mut end = max_bytes;
     while end > 0 && !s.is_char_boundary(end) {
@@ -227,72 +359,75 @@ fn truncate_str(s: &str, max_bytes: usize) -> String {
     format!("{}...", &s[..end])
 }
 
-#[allow(clippy::indexing_slicing)]
-fn extract_text_content(content: &serde_json::Value) -> Vec<(MessageKind, String, Option<String>)> {
-    if let Some(s) = content.as_str() {
-        return vec![(MessageKind::User, s.to_string(), None)];
-    }
-    let Some(arr) = content.as_array() else {
-        return vec![];
-    };
-    let mut results = Vec::with_capacity(arr.len());
-    for item in arr {
-        let block_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        match block_type {
-            "text" => {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    if !text.is_empty() {
-                        results.push((MessageKind::Assistant, text.to_string(), None));
+fn extract_text_content(content: RawContent) -> Vec<(MessageKind, String, Option<String>)> {
+    match content {
+        RawContent::Text(s) => vec![(MessageKind::User, s, None)],
+        RawContent::Blocks(blocks) => {
+            let mut out = Vec::with_capacity(blocks.len());
+            for b in blocks {
+                match b {
+                    RawBlock::Text { text } if !text.is_empty() => {
+                        out.push((MessageKind::Assistant, text, None));
                     }
-                }
-            }
-            "thinking" => {
-                if let Some(text) = item.get("thinking").and_then(|v| v.as_str()) {
-                    if !text.is_empty() {
-                        results.push((MessageKind::Thinking, text.to_string(), None));
+                    RawBlock::Thinking { thinking } if !thinking.is_empty() => {
+                        out.push((MessageKind::Thinking, thinking, None));
                     }
+                    RawBlock::ToolUse { name, input } => {
+                        let input_str = format_tool_input(&name, &input);
+                        out.push((MessageKind::ToolUse, input_str, Some(name)));
+                    }
+                    RawBlock::ToolResult {
+                        content: Some(RawContent::Text(text)),
+                    } if !text.is_empty() => {
+                        out.push((MessageKind::ToolResult, truncate_str(text, 500), None));
+                    }
+                    RawBlock::ToolResult {
+                        content: Some(RawContent::Blocks(inner)),
+                    } => {
+                        // Tool results occasionally nest `[{type:"text", text:"..."}]`
+                        // — pull the first text block, ignore the rest (matches the
+                        // pre-typed-deserialize behavior).
+                        for ib in inner {
+                            if let RawBlock::Text { text } = ib {
+                                if !text.is_empty() {
+                                    out.push((
+                                        MessageKind::ToolResult,
+                                        truncate_str(text, 500),
+                                        None,
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
-            "tool_use" => {
-                let name = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let input_str = item
-                    .get("input")
-                    .map(|v| format_tool_input(name, v))
-                    .unwrap_or_default();
-                results.push((MessageKind::ToolUse, input_str, Some(name.to_string())));
-            }
-            "tool_result" => {
-                let text = item.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                if !text.is_empty() {
-                    results.push((MessageKind::ToolResult, truncate_str(text, 500), None));
-                }
-            }
-            _ => {}
+            out
         }
     }
-    results
 }
 
-fn format_tool_input(tool: &str, input: &serde_json::Value) -> String {
-    let s = |key: &str| input.get(key).and_then(|v| v.as_str()).unwrap_or("");
+fn format_tool_input(tool: &str, input: &ToolInput) -> String {
+    let cmd = input.command.as_deref().unwrap_or("");
+    let path = input.file_path.as_deref().unwrap_or("");
+    let pat = input.pattern.as_deref().unwrap_or("");
+    let desc = input.description.as_deref();
     match tool {
-        "Bash" => match input.get("description").and_then(|v| v.as_str()) {
-            Some(d) => format!("$ {}\n  # {d}", s("command")),
-            None => format!("$ {}", s("command")),
+        "Bash" => match desc {
+            Some(d) => format!("$ {cmd}\n  # {d}"),
+            None => format!("$ {cmd}"),
         },
-        "Read" | "Write" | "Edit" => format!("{} {}", tool.to_lowercase(), s("file_path")),
-        "Glob" | "Grep" => format!("{} {}", tool.to_lowercase(), s("pattern")),
-        "Agent" => {
-            let desc = input
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("agent");
-            format!("agent: {desc}")
-        }
-        _ => truncate_str(&format!("{input}"), 200),
+        "Read" => format!("read {path}"),
+        "Write" => format!("write {path}"),
+        "Edit" => format!("edit {path}"),
+        "Glob" => format!("glob {pat}"),
+        "Grep" => format!("grep {pat}"),
+        "Agent" => format!("agent: {}", desc.unwrap_or("agent")),
+        // Unknown tools: show name only. The previous fallback re-serialized
+        // the input as JSON, which required keeping a full `serde_json::Value`
+        // around — pricey when 1/3 of all messages are tool_use lines.
+        _ => String::new(),
     }
 }
 
@@ -322,25 +457,32 @@ enum LineParsed {
 
 #[allow(clippy::indexing_slicing)]
 fn parse_one_line(line: &[u8]) -> Option<ParsedLine> {
-    // Quick reject: scan for any of our target type strings.
-    // The "type" field position varies (byte 1-200+), so we scan the whole line
-    // but only do a single memmem for the common prefix.
-    if memchr::memmem::find(line, b"\"type\":\"user\"").is_none()
-        && memchr::memmem::find(line, b"\"type\":\"assistant\"").is_none()
-        && memchr::memmem::find(line, b"\"type\":\"summary\"").is_none()
-        && memchr::memmem::find(line, b"\"type\":\"system\"").is_none()
-    {
+    // Quick reject before paying for full JSON parse. Each pattern is the
+    // full top-level type field, so nested `"type":"text"` blocks inside
+    // assistant content can't false-match. Finders are precompiled once
+    // per process so the per-line cost is just the SIMD scan itself.
+    use std::sync::OnceLock;
+    static FINDERS: OnceLock<[memchr::memmem::Finder<'static>; 4]> = OnceLock::new();
+    let finders = FINDERS.get_or_init(|| {
+        [
+            memchr::memmem::Finder::new(b"\"type\":\"user\""),
+            memchr::memmem::Finder::new(b"\"type\":\"assistant\""),
+            memchr::memmem::Finder::new(b"\"type\":\"summary\""),
+            memchr::memmem::Finder::new(b"\"type\":\"system\""),
+        ]
+    });
+    if !finders.iter().any(|f| f.find(line).is_some()) {
         return None;
     }
 
-    let raw: RawLine = serde_json::from_slice(line).ok()?;
+    let raw: RawLine = json_from_slice(line)?;
     let ts = raw.timestamp.as_deref().and_then(parse_timestamp);
     let msg_type = raw.msg_type.as_deref().unwrap_or("");
 
     match msg_type {
         "user" => {
-            let msg = raw.message.as_ref()?;
-            let content = msg.content.as_ref()?;
+            let msg = raw.message?;
+            let content = msg.content?;
             let parts = extract_text_content(content);
             Some(ParsedLine {
                 kind: LineParsed::User { parts },
@@ -348,8 +490,8 @@ fn parse_one_line(line: &[u8]) -> Option<ParsedLine> {
             })
         }
         "assistant" => {
-            let msg = raw.message.as_ref()?;
-            let content = msg.content.as_ref()?;
+            let msg = raw.message?;
+            let content = msg.content?;
             let parts = extract_text_content(content);
             let tokens = msg.usage.as_ref().map(|u| TokenUsage {
                 input: u.input_tokens.unwrap_or(0),
@@ -360,24 +502,21 @@ fn parse_one_line(line: &[u8]) -> Option<ParsedLine> {
             Some(ParsedLine {
                 kind: LineParsed::Assistant {
                     parts,
-                    model: msg.model.clone(),
+                    model: msg.model,
                     tokens,
-                    message_id: msg.id.clone(),
+                    message_id: msg.id,
                 },
                 timestamp: ts,
             })
         }
         "summary" => {
-            let msg = raw.message.as_ref()?;
-            let content = msg.content.as_ref()?;
-            let text = if let Some(s) = content.as_str() {
-                s.to_string()
-            } else if let Some(arr) = content.as_array() {
-                arr.iter()
-                    .find_map(|item| item.get("text").and_then(|v| v.as_str()))
-                    .map(String::from)?
-            } else {
-                return None;
+            let msg = raw.message?;
+            let text = match msg.content? {
+                RawContent::Text(s) => s,
+                RawContent::Blocks(blocks) => blocks.into_iter().find_map(|b| match b {
+                    RawBlock::Text { text } => Some(text),
+                    _ => None,
+                })?,
             };
             Some(ParsedLine {
                 kind: LineParsed::Summary(text),
@@ -439,7 +578,10 @@ pub fn parse_session(path: &Path) -> Option<Session> {
     };
 
     // Merge results sequentially (order matters for first_user_msg, model, etc.)
-    let mut messages = Vec::new();
+    // Pre-size to one message per recognized line — typical sessions emit ~1.3
+    // messages per line (some assistant lines fan out into text+tool blocks),
+    // but overshooting by 30% is cheaper than reallocating mid-loop.
+    let mut messages = Vec::with_capacity(parsed_lines.len());
     let mut summary: Option<String> = None;
     let mut first_user_msg: Option<String> = None;
     let mut total_input = 0u64;
@@ -455,7 +597,7 @@ pub fn parse_session(path: &Path) -> Option<Session> {
             LineParsed::User { parts } => {
                 for (kind, text, tool_name) in parts {
                     if kind == MessageKind::User && first_user_msg.is_none() {
-                        first_user_msg = Some(truncate_str(&text, 200));
+                        first_user_msg = Some(truncate_str(text.clone(), 200));
                     }
                     if kind == MessageKind::ToolResult && text.is_empty() {
                         continue;
@@ -532,11 +674,15 @@ pub fn parse_session(path: &Path) -> Option<Session> {
         .unwrap_or("unknown")
         .to_string();
 
+    let msg_count = u32::try_from(messages.len()).unwrap_or(u32::MAX);
+
     Some(Session {
         id,
+        file_path: path.to_path_buf(),
         messages,
         summary,
         first_user_msg,
+        msg_count,
         total_input_tokens: total_input,
         total_output_tokens: total_output,
         total_cache_read,
@@ -555,15 +701,19 @@ pub fn parse_session(path: &Path) -> Option<Session> {
 
 // ── Top-level loader (TUI/web/--json) ──
 //
-// Produces the full Project/Session/Message tree with cross-session
-// dedup applied so session.cost matches the usage-report numbers.
-// The usage reports themselves don't call this path — they use the
-// much faster `cache::load()` directly.
+// Builds the Project/Session tree with header-only sessions: per-row
+// metadata + canonical token/cost totals, no message content. Callers
+// that need messages (TUI session view, web per-session JSON gen) lazy-
+// load via `ensure_messages_loaded`.
+//
+// Cost/token figures come from `cache::per_session_totals` (the same
+// canonical pipeline `daily`/`session`/web-rollup use), so this path
+// agrees with the CLI usage reports to the cent.
 
-// Prints a one-line bincode-cache hit/miss summary to stderr so the user
-// can tell cold runs from warm ones.
+// Prints a one-line cache hit/miss summary to stderr so the user can
+// tell cold runs from warm ones.
 #[allow(clippy::print_stderr)]
-pub fn load_all_projects() -> Vec<Project> {
+pub fn load_all_projects<S: crate::source::Source + ?Sized>(source: &S) -> Vec<Project> {
     let projects_dir = match dirs::home_dir() {
         Some(h) => h.join(".claude").join("projects"),
         None => return vec![],
@@ -596,20 +746,48 @@ pub fn load_all_projects() -> Vec<Project> {
         return vec![];
     }
 
+    // Canonical aggregation cache — owns token/cost totals + last-active
+    // timestamps. Handles its own incremental rebuild from JSONL.
+    let cache = crate::cache::load(source);
+    let totals = crate::cache::per_session_totals(&cache, source);
+
     let cache_hits = AtomicUsize::new(0);
     let cache_misses = AtomicUsize::new(0);
 
-    let parsed: Vec<(PathBuf, Session)> = files
+    struct ParsedFile {
+        dir: PathBuf,
+        path_hash: u64,
+        session: Session,
+    }
+    let parsed: Vec<ParsedFile> = files
         .par_iter()
         .filter_map(|(dir, file)| {
-            if let Some(session) = try_load_cached(file) {
+            let path_hash = crate::source::path_hash(file);
+            // Header-only fast path — skips deserializing the messages
+            // blob, which is what made warm cold-starts expensive.
+            if let Some(mut session) = try_load_cached_header(file) {
+                session.file_path.clone_from(file);
                 let _ = cache_hits.fetch_add(1, Ordering::Relaxed);
-                return Some((dir.clone(), session));
+                return Some(ParsedFile {
+                    dir: dir.clone(),
+                    path_hash,
+                    session,
+                });
             }
             let _ = cache_misses.fetch_add(1, Ordering::Relaxed);
+            // Cache miss: full parse, then split-write so subsequent runs
+            // hit the header-only path above.
             let session = parse_session(file)?;
             save_to_cache(file, &session);
-            Some((dir.clone(), session))
+            // Keep header in memory but drop messages — consumers that need
+            // them will re-read from `.msgs`.
+            let mut header_only = session;
+            header_only.messages = Vec::new();
+            Some(ParsedFile {
+                dir: dir.clone(),
+                path_hash,
+                session: header_only,
+            })
         })
         .collect();
 
@@ -617,91 +795,29 @@ pub fn load_all_projects() -> Vec<Project> {
     let misses = cache_misses.load(Ordering::Relaxed);
     eprintln!("cache: {hits} hits, {misses} misses");
 
-    // Cross-session dedup. Claude Code checkpoints/resumes a session by
-    // copying prior assistant lines (same message_id) into a new JSONL
-    // file. Without dedup, those tokens get counted once per session
-    // they appear in — roughly doubling totals. Walk sessions in
-    // chronological order and rewrite each session's totals to exclude
-    // messages whose IDs were already seen earlier.
     let mut parsed = parsed;
-    parsed.sort_by_key(|(_, s)| s.started_at);
-    let mut seen_global: HashSet<String> = HashSet::new();
-    for (_, session) in &mut parsed {
-        let (
-            input_tokens,
-            output_tokens,
-            cache_write_tokens,
-            cache_read_tokens,
-            cost,
-            cost_input,
-            cost_output,
-            cost_cache_write,
-            cost_cache_read,
-        ) = {
-            let mut input_tokens = 0u64;
-            let mut output_tokens = 0u64;
-            let mut cache_write_tokens = 0u64;
-            let mut cache_read_tokens = 0u64;
-            let mut cost_input = 0.0_f64;
-            let mut cost_output = 0.0_f64;
-            let mut cost_cache_write = 0.0_f64;
-            let mut cost_cache_read = 0.0_f64;
-            let mut seen_intra: HashSet<&str> = HashSet::new();
-            let fallback_model = session.model.as_deref();
-            for msg in &session.messages {
-                let Some(tokens) = &msg.tokens else { continue };
-                if let Some(id) = msg.message_id.as_deref() {
-                    if !seen_intra.insert(id) {
-                        continue;
-                    }
-                    if !seen_global.insert(id.to_string()) {
-                        continue;
-                    }
-                }
-                input_tokens += tokens.input;
-                output_tokens += tokens.output;
-                cache_write_tokens += tokens.cache_create;
-                cache_read_tokens += tokens.cache_read;
-                // Price per-message model so mid-session model switches
-                // (e.g. /fast, compaction) are accounted for correctly.
-                // Split into the four column costs alongside the total
-                // so the web view can render a real breakdown tooltip
-                // without re-pricing on the JS side.
-                let model = msg.model.as_deref().or(fallback_model);
-                use crate::source::Source as _;
-                let p = crate::source::claude_code::ClaudeCode.price(model);
-                cost_input += (tokens.input as f64) * p.input / 1_000_000.0;
-                cost_output += (tokens.output as f64) * p.output / 1_000_000.0;
-                cost_cache_write += (tokens.cache_create as f64) * p.cache_write / 1_000_000.0;
-                cost_cache_read += (tokens.cache_read as f64) * p.cache_read / 1_000_000.0;
+    for p in &mut parsed {
+        if let Some(t) = totals.get(&p.path_hash) {
+            let session = &mut p.session;
+            session.total_input_tokens = t.input;
+            session.total_output_tokens = t.output;
+            session.total_cache_read = t.cache_read;
+            session.total_cache_create = t.cache_create;
+            session.cost = t.cost;
+            session.cost_input = t.cost_input;
+            session.cost_output = t.cost_output;
+            session.cost_cache_read = t.cost_cache_read;
+            session.cost_cache_create = t.cost_cache_create;
+            // ended_at = last billable line ts (canonical "last active").
+            if t.last_ts > 0 {
+                session.ended_at = DateTime::from_timestamp(t.last_ts, 0);
             }
-            let cost = cost_input + cost_output + cost_cache_write + cost_cache_read;
-            (
-                input_tokens,
-                output_tokens,
-                cache_write_tokens,
-                cache_read_tokens,
-                cost,
-                cost_input,
-                cost_output,
-                cost_cache_write,
-                cost_cache_read,
-            )
-        };
-        session.total_input_tokens = input_tokens;
-        session.total_output_tokens = output_tokens;
-        session.total_cache_create = cache_write_tokens;
-        session.total_cache_read = cache_read_tokens;
-        session.cost = cost;
-        session.cost_input = cost_input;
-        session.cost_output = cost_output;
-        session.cost_cache_create = cost_cache_write;
-        session.cost_cache_read = cost_cache_read;
+        }
     }
 
     let mut project_map: HashMap<PathBuf, Vec<Session>> = HashMap::new();
-    for (dir, session) in parsed {
-        project_map.entry(dir).or_default().push(session);
+    for p in parsed {
+        project_map.entry(p.dir).or_default().push(p.session);
     }
 
     let mut projects: Vec<Project> = project_map
@@ -714,17 +830,29 @@ pub fn load_all_projects() -> Vec<Project> {
                 .unwrap_or("unknown");
             let pretty_name = crate::source::claude_code::prettify_project_name(name);
 
-            let total_tokens: u64 = sessions
-                .iter()
-                .map(|s| s.total_input_tokens + s.total_output_tokens)
-                .sum();
+            // All four token columns — `Session::total_tokens()` uses the
+            // same sum, and every renderer (CLI, TUI, web JS) treats
+            // "total tokens" as input + output + cache read + cache create.
+            let total_tokens: u64 = sessions.iter().map(Session::total_tokens).sum();
             let last_active = sessions.iter().filter_map(|s| s.ended_at).max();
+            let total_msgs: u64 = sessions.iter().map(|s| u64::from(s.msg_count)).sum();
+            let total_dur_ms: u64 = sessions
+                .iter()
+                .filter_map(|s| match (s.started_at, s.ended_at) {
+                    (Some(a), Some(b)) if b > a => Some((b - a).num_milliseconds().max(0) as u64),
+                    _ => None,
+                })
+                .sum();
+            let total_cost: f64 = sessions.iter().map(|s| s.cost).sum();
 
             Project {
                 name: pretty_name,
                 sessions,
                 total_tokens,
                 last_active,
+                total_msgs,
+                total_dur_ms,
+                total_cost,
             }
         })
         .collect();
@@ -733,8 +861,11 @@ pub fn load_all_projects() -> Vec<Project> {
     projects
 }
 
-#[cfg(any(feature = "tui", feature = "web"))]
 impl Session {
+    /// Canonical display-name fallback chain: summary > first user
+    /// message > session id. Any caller that needs the user-visible
+    /// title for a session goes through this — keeps the TUI list,
+    /// the web sidebar, and the cache's stored `display_name` aligned.
     pub fn display_name(&self) -> &str {
         if let Some(ref s) = self.summary {
             s.as_str()
@@ -746,7 +877,10 @@ impl Session {
     }
 
     pub const fn total_tokens(&self) -> u64 {
-        self.total_input_tokens + self.total_output_tokens
+        self.total_input_tokens
+            + self.total_output_tokens
+            + self.total_cache_read
+            + self.total_cache_create
     }
 }
 

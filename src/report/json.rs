@@ -57,7 +57,6 @@ struct JsonRow {
 }
 
 // Writes the ccusage-compatible JSON document to stdout.
-#[allow(clippy::print_stdout)]
 pub fn print<S: Source + ?Sized>(
     cache: &LoadedCache,
     rollup: &FxHashMap<BreakdownKey, BucketUsage>,
@@ -136,11 +135,13 @@ pub fn print<S: Source + ?Sized>(
     }
     totals.total_tokens = totals.input + totals.output + totals.cache_create + totals.cache_read;
 
+    // `Cmd::as_str` is the single mapping shared with the CLI parser.
+    // Daily is also the implicit default if the JSON path is somehow
+    // reached for a non-report command (shouldn't happen — guarded
+    // upstream — but stay defensive).
     let cmd_str = match opts.cmd {
-        Cmd::Monthly => "monthly",
-        Cmd::Session => "session",
-        Cmd::Blocks => "blocks",
-        _ => "daily",
+        Cmd::Monthly | Cmd::Session | Cmd::Blocks => opts.cmd.as_str(),
+        _ => Cmd::Daily.as_str(),
     };
     let carbon = if opts.carbon {
         let c = super::carbon::compute(
@@ -166,7 +167,14 @@ pub fn print<S: Source + ?Sized>(
         rows,
         carbon,
     };
-    if let Ok(s) = serde_json::to_string_pretty(&report) {
-        println!("{s}");
+    // Stream straight to stdout via BufWriter — no intermediate String.
+    // Large reports (--breakdown over a year of logs) used to allocate a
+    // multi-MB string here just to push it back through println!.
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let mut w = std::io::BufWriter::new(stdout.lock());
+    if serde_json::to_writer_pretty(&mut w, &report).is_ok() {
+        let _ = w.write_all(b"\n");
+        let _ = w.flush();
     }
 }

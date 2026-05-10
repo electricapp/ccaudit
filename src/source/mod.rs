@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub mod claude_code;
+pub mod codex;
 pub mod prices;
 
 #[cfg(target_os = "macos")]
@@ -134,7 +135,29 @@ pub trait Source: Sync + Send {
         false
     }
 
-    /// Convenience: price tokens against this provider's rate table.
+    /// Price tokens against this provider's rate table, returning the
+    /// per-column dollar cost (`input`, `output`, `cache_write`, `cache_read`).
+    /// Single arithmetic source of truth — every cost-producing site
+    /// (cache build, per-session totals, JSON output) routes through
+    /// this method so floating-point ordering stays identical.
+    fn price_columns(
+        &self,
+        model: Option<&str>,
+        input: u64,
+        output: u64,
+        cache_write: u64,
+        cache_read: u64,
+    ) -> [f64; 4] {
+        let p = self.price(model);
+        [
+            (input as f64) * p.input / 1_000_000.0,
+            (output as f64) * p.output / 1_000_000.0,
+            (cache_write as f64) * p.cache_write / 1_000_000.0,
+            (cache_read as f64) * p.cache_read / 1_000_000.0,
+        ]
+    }
+
+    /// Sum-of-columns convenience for callers that don't need the split.
     fn compute_cost(
         &self,
         model: Option<&str>,
@@ -143,15 +166,8 @@ pub trait Source: Sync + Send {
         cache_write: u64,
         cache_read: u64,
     ) -> f64 {
-        // Fused multiply-add: each term adds to the running total in
-        // one rounded op. Clippy's `suboptimal_flops` was flagging the
-        // naïve sum; `mul_add` is the cleaner expression of the same.
-        let p = self.price(model);
-        let t = (input as f64).mul_add(p.input, 0.0);
-        let t = (output as f64).mul_add(p.output, t);
-        let t = (cache_write as f64).mul_add(p.cache_write, t);
-        let t = (cache_read as f64).mul_add(p.cache_read, t);
-        t / 1_000_000.0
+        let cols = self.price_columns(model, input, output, cache_write, cache_read);
+        cols.iter().sum()
     }
 }
 
@@ -168,10 +184,12 @@ pub fn default_cache_path(id: &str) -> Option<PathBuf> {
     })
 }
 
-/// Portable `logs_dir` walk: readdir the outer directory, then for each
-/// subdir readdir + stat every `*.jsonl`. ~1 stat syscall per file. Used
-/// as the default `scan_sources` implementation; providers with a faster
-/// platform-specific path (see `ClaudeCode`'s macOS bulk-scan) override.
+/// Portable `logs_dir` walk.
+///
+/// Readdir the outer directory, then for each subdir readdir + stat
+/// every `*.jsonl` (~1 stat syscall per file). Used as the default
+/// `scan_sources` implementation; providers with a faster platform-
+/// specific path (see `ClaudeCode`'s macOS bulk-scan) override.
 pub fn default_scan(dir: &Path) -> Vec<SourceFile> {
     let Ok(entries) = fs::read_dir(dir) else {
         return vec![];
@@ -216,28 +234,35 @@ pub fn default_scan(dir: &Path) -> Vec<SourceFile> {
 pub enum SourceKind {
     #[default]
     ClaudeCode,
-    // Future: Codex, OpenCode, Pi, Amp
+    Codex,
 }
 
-impl SourceKind {
-    pub fn from_str(s: &str) -> Result<Self, String> {
+impl std::str::FromStr for SourceKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "claude-code" | "claude" | "cc" => Ok(Self::ClaudeCode),
+            "codex" | "openai" | "cdx" => Ok(Self::Codex),
             other => Err(format!(
-                "unknown source {other:?}; known: claude-code (aliases: claude, cc)"
+                "unknown source {other:?}; known: claude-code (aliases: claude, cc), codex (aliases: openai, cdx)"
             )),
         }
     }
 }
 
+/// Resolve a `SourceKind` to its singleton `Source` impl.
 pub fn pick(kind: SourceKind) -> &'static dyn Source {
     match kind {
         SourceKind::ClaudeCode => &claude_code::ClaudeCode,
+        SourceKind::Codex => &codex::Codex,
     }
 }
 
 // ── Shared utilities (provider-agnostic) ──
 
+/// FNV-1a 64-bit hash. Used as the canonical msg-id and path key
+/// across the cache layer — collision risk negligible at our volumes,
+/// zero allocation per call.
 pub fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
@@ -247,18 +272,36 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
+/// FNV-1a hash of a path's UTF-8 representation. Stable across runs
+/// for the same path string; used to identify cached sessions.
 pub fn path_hash(p: &Path) -> u64 {
     fnv1a(p.to_string_lossy().as_bytes())
 }
 
+/// Days since 1970-01-01 UTC for the given timestamp.
 pub fn day_from_ts(ts: DateTime<Utc>) -> i32 {
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap_or_default();
     ts.date_naive().signed_duration_since(epoch).num_days() as i32
 }
 
+/// Inverse of `day_from_ts` — `NaiveDate` for a day-since-epoch index.
 pub fn day_to_date(days: i32) -> NaiveDate {
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap_or_default();
     epoch
         .checked_add_signed(chrono::Duration::days(i64::from(days)))
         .unwrap_or(epoch)
+}
+
+/// Drop the leading `Users/<name>/` from a tokenized path.
+///
+/// Both Claude Code (dash-separated dir name like `-Users-nick-code-foo`)
+/// and Codex (slash-separated `cwd` like `/Users/nick/code/foo`) share
+/// this display rule once each provider tokenizes its native shape.
+/// Returns `None` if the path doesn't match the `Users/<name>/<rest>`
+/// form so callers can fall back to the raw string.
+pub fn prettify_user_path(parts: &[&str]) -> Option<String> {
+    if parts.len() > 2 && parts.first().copied() == Some("Users") {
+        return parts.get(2..).map(|s| s.join("/"));
+    }
+    None
 }

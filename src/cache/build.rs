@@ -184,13 +184,15 @@ fn build_preaggs<S: Source + ?Sized>(
                 continue;
             }
             // Split cost by column so renders can show which token type
-            // is actually driving spend without re-pricing at query time.
-            let rates = source.price(model_name);
-            let ci = f64::from(line.input) * rates.input / 1_000_000.0;
-            let co = f64::from(line.output) * rates.output / 1_000_000.0;
-            let ccw = f64::from(line.cache_create) * rates.cache_write / 1_000_000.0;
-            let ccr = f64::from(line.cache_read) * rates.cache_read / 1_000_000.0;
-            let cost = ci + co + ccw + ccr;
+            // drove spend without re-pricing at query time. Single
+            // pricing primitive shared with per_session_totals + reports.
+            let [ci, co, ccw, ccr] = source.price_columns(
+                model_name,
+                u64::from(line.input),
+                u64::from(line.output),
+                u64::from(line.cache_create),
+                u64::from(line.cache_read),
+            );
 
             let key: u64 =
                 (u64::from(line.day as u32) << 32) | (u64::from(mid) << 16) | u64::from(project_id);
@@ -218,8 +220,6 @@ fn build_preaggs<S: Source + ?Sized>(
             entry.cost_cache_read += ccr;
             entry.cost_cache_create += ccw;
             entry.line_count += 1;
-            // Silence unused warning if we ever drop column-cost reuse.
-            let _ = cost;
         }
     }
 
