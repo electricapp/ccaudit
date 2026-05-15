@@ -8,6 +8,13 @@ on:
     paths-ignore:
       - '**/*.md'
 
+# Cancel in-progress runs on the same ref when a new push/PR update lands.
+# Branch protection only blocks merge on the *latest* required-check result,
+# so older runs racing to completion just burn minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 # Lock down default perms; each job adds only what it needs.
 permissions:
   contents: read
