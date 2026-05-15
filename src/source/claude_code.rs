@@ -8,7 +8,6 @@
 use super::{ParsedLine, ParsedSession, Pricing, Source, SourceFile, day_from_ts, fnv1a};
 use crate::parse::{self, Message, MessageKind, Session};
 use std::borrow::Cow;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 pub struct ClaudeCode;
@@ -261,6 +260,7 @@ fn to_parsed_session(path: &Path, src: &SourceFile, session: &Session) -> Parsed
 fn scan_with_bulk(dir: &Path) -> Option<Vec<SourceFile>> {
     use super::bulk_scan_darwin::scan as bulk_scan;
     use super::path_hash;
+    use std::fs;
 
     // Outer directory: we only need subdir names, so readdir + d_type is
     // already fine. Bulk-scanning the outer dir too would buy nothing.
