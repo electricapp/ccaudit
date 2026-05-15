@@ -56,6 +56,19 @@ use std::time::{Duration, Instant};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
+    // Silence the stderr build banners from web::generate / parse cache
+    // — the bench invokes them hundreds of times and the noise scrolls
+    // the actual results table off-screen. Leave alone if the caller
+    // already set it.
+    #[allow(unsafe_code)]
+    if std::env::var_os("CCAUDIT_QUIET").is_none() {
+        // Safety: single-threaded at this point in main(); no other
+        // threads are reading the environment yet.
+        unsafe {
+            std::env::set_var("CCAUDIT_QUIET", "1");
+        }
+    }
+
     let runs = env_usize("BENCH_RUNS", 7);
     let sizes = parse_sizes();
     let save_path = std::env::var("BENCH_SAVE").ok().map(PathBuf::from);

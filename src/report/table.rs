@@ -3,7 +3,7 @@
 use super::fmt::{
     COMPACT, LIMIT_CELL_WIDTH, NORMAL, RESET, Widths, YELLOW, apply_tail, format_cost,
     format_limit_cell, format_number, label_for, limit_color, normalize_model, sort_keys,
-    title_for, write_title,
+    title_for, write_cost, write_number, write_title,
 };
 use crate::cache::{BLOCK_SECS, BreakdownKey, Bucket, BucketKey, BucketUsage, LoadedCache};
 use crate::cli::Options;
@@ -137,6 +137,13 @@ pub fn print<S: Source + ?Sized>(
     let mut current_label: Option<String> = None;
     let mut first_group = true;
 
+    // Six scratch slots reused across rows: [in, out, cache_create,
+    // cache_read, total, cost]. Each cell formatter pushes into its
+    // slot, then write_row reads &str. Old code allocated six Strings
+    // per row; with the scratch, allocations only happen once each
+    // slot grows past its first row's width.
+    let mut scratch: [String; 6] = Default::default();
+
     for k in &keys {
         let Some(u) = rollup.get(k) else { continue };
         tot_in += u.input;
@@ -208,12 +215,18 @@ pub fn print<S: Source + ?Sized>(
         } else {
             (String::new(), None)
         };
-        let in_fmt = format_number(u.input);
-        let out_fmt = format_number(u.output);
-        let cache_create_fmt = format_number(u.cache_create);
-        let cache_read_fmt = format_number(u.cache_read);
-        let tot_fmt = format_number(u.input + u.output + u.cache_create + u.cache_read);
-        let cost_fmt = format_cost(u.cost);
+        for s in &mut scratch {
+            s.clear();
+        }
+        write_number(&mut scratch[0], u.input);
+        write_number(&mut scratch[1], u.output);
+        write_number(&mut scratch[2], u.cache_create);
+        write_number(&mut scratch[3], u.cache_read);
+        write_number(
+            &mut scratch[4],
+            u.input + u.output + u.cache_create + u.cache_read,
+        );
+        write_cost(&mut scratch[5], u.cost);
         write_row(
             &mut buf,
             w,
@@ -221,12 +234,12 @@ pub fn print<S: Source + ?Sized>(
                 label: &label_for_row,
                 extra: &first_second,
                 nums: [
-                    &in_fmt,
-                    &out_fmt,
-                    &cache_create_fmt,
-                    &cache_read_fmt,
-                    &tot_fmt,
-                    &cost_fmt,
+                    &scratch[0],
+                    &scratch[1],
+                    &scratch[2],
+                    &scratch[3],
+                    &scratch[4],
+                    &scratch[5],
                 ],
                 highlight,
                 tail: &last_act,

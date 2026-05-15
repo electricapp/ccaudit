@@ -40,21 +40,29 @@ fn handle_request(stream: &mut (impl Read + Write), dir: &Path) {
     };
     let request = String::from_utf8_lossy(&buf[..n]);
 
+    // Strip the query/fragment so paths like `/index.html?v=1` and
+    // `/foo#anchor` resolve to a file on disk.
     let path = request
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
+        .map(|p| p.split(['?', '#']).next().unwrap_or(p))
         .unwrap_or("/");
 
     let file_path = if path == "/" || path == "/index.html" {
         dir.join("index.html")
     } else {
+        // Decode `%xx` then verify the canonical path stays inside `dir`.
+        // `.contains("..")` alone misses URL-encoded variants (`%2e%2e`),
+        // backslash on Windows, and absolute `/etc/...` paths.
         let clean = path.trim_start_matches('/');
-        if clean.contains("..") {
+        let decoded = percent_decode(clean);
+        let candidate = dir.join(&decoded);
+        if !path_within(dir, &candidate) {
             respond(stream, 403, "text/plain", b"forbidden");
             return;
         }
-        dir.join(clean)
+        candidate
     };
 
     if file_path.is_file() {
@@ -81,6 +89,63 @@ fn handle_request(stream: &mut (impl Read + Write), dir: &Path) {
     } else {
         respond(stream, 404, "text/plain", b"not found");
     }
+}
+
+// Minimal %xx decoder — enough for the generated SPA's static files.
+// We only feed the result into `dir.join` and then `path_within` rejects
+// anything that escapes `dir`, so an incomplete `%xx` sequence is safe
+// (it just won't match a file).
+#[allow(clippy::indexing_slicing)] // i and i+2 are bounds-checked against bytes.len()
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// True iff `candidate` resolves to a path inside `dir`. Canonicalize
+// both sides (resolves `..` and symlinks); if `candidate` doesn't yet
+// exist, walk it lexically using the canonical `dir` as the prefix.
+fn path_within(dir: &Path, candidate: &Path) -> bool {
+    let Ok(canon_dir) = dir.canonicalize() else {
+        return false;
+    };
+    if let Ok(canon) = candidate.canonicalize() {
+        return canon.starts_with(&canon_dir);
+    }
+    // Path doesn't exist (404 case): compose with `canon_dir` and
+    // lexically resolve `..` segments. Any segment that pops above
+    // `canon_dir` is rejected.
+    use std::path::Component;
+    let rel = candidate.strip_prefix(dir).unwrap_or(candidate);
+    let mut depth: i32 = 0;
+    for c in rel.components() {
+        match c {
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
 }
 
 fn respond(stream: &mut impl Write, status: u16, content_type: &str, body: &[u8]) {

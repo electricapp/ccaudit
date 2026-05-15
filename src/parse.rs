@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -47,6 +47,12 @@ pub struct Session {
     /// Number of messages in the `.msgs` blob. Persisted so the
     /// projects-list views can render counts without touching the blob.
     pub msg_count: u32,
+    /// Working directory recorded in the JSONL (`cwd` field on user/assistant
+    /// lines). Authoritative source for the project's real filesystem path —
+    /// the parent directory's dash-encoded name (`-Users-me-code-foo-bar`)
+    /// is ambiguous when the real path contains hyphens.
+    #[serde(default)]
+    pub cwd: Option<String>,
 
     // ── Lazy / runtime-populated fields below: not in `.bin` ──
     /// JSONL file this session was loaded from. Set by
@@ -140,8 +146,8 @@ fn cache_key(path: &Path) -> String {
 }
 
 // Bumped whenever Session header or Message struct changes shape, OR
-// when the on-disk encoding changes. v8 = postcard (was bincode 1.x).
-const CACHE_VERSION: u8 = 8;
+// when the on-disk encoding changes.
+const CACHE_VERSION: u8 = 0;
 
 #[derive(Serialize, Deserialize)]
 struct CacheMeta {
@@ -163,6 +169,37 @@ fn try_load_cached_header(path: &Path) -> Option<Session> {
     }
     let data = fs::read(dir.join(format!("{key}.bin"))).ok()?;
     postcard::from_bytes(&data).ok()
+}
+
+/// Read both header and messages from the per-session cache.
+///
+/// Both come from the same fingerprint slot, so this returns `None` on
+/// any miss or mismatch. Used by providers (see
+/// `ClaudeCode::parse_session`) to skip the JSONL reparse when the
+/// cache is already fresh.
+pub fn try_load_cached_full(path: &Path) -> Option<Session> {
+    let dir = cache_dir()?;
+    let key = cache_key(path);
+    let (cur_mtime, cur_size) = file_fingerprint(path)?;
+    let meta_bytes = fs::read(dir.join(format!("{key}.meta"))).ok()?;
+    let meta: CacheMeta = postcard::from_bytes(&meta_bytes).ok()?;
+    if meta.version != CACHE_VERSION || meta.mtime_secs != cur_mtime || meta.size != cur_size {
+        return None;
+    }
+    let header_bytes = fs::read(dir.join(format!("{key}.bin"))).ok()?;
+    let mut session: Session = postcard::from_bytes(&header_bytes).ok()?;
+    let msgs_bytes = fs::read(dir.join(format!("{key}.msgs"))).ok()?;
+    session.messages = postcard::from_bytes(&msgs_bytes).ok()?;
+    Some(session)
+}
+
+/// Save a freshly-parsed session to the per-session cache.
+///
+/// Public so the source-trait implementations can persist what they
+/// just parsed, letting subsequent `load_all_projects` cache lookups
+/// skip the work.
+pub fn save_session_to_cache(path: &Path, session: &Session) {
+    save_to_cache(path, session);
 }
 
 /// Lazy-load the messages blob for `path`. Returns None if the cache
@@ -249,6 +286,10 @@ struct RawLine {
     message: Option<RawMessage>,
     #[serde(rename = "durationMs")]
     duration_ms: Option<u64>,
+    // Claude Code emits the launch-time `cwd` on every user/assistant line.
+    // We grab the first non-empty one to recover the unambiguous filesystem
+    // path (the parent dir's dash-encoded name loses real hyphens).
+    cwd: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -346,9 +387,10 @@ fn fast_parse_u32(b: &[u8]) -> Option<u32> {
     Some(n)
 }
 
-// Take ownership so the short-string path is a move, not a clone. The
-// only callers already have a `String` they're willing to give up.
-fn truncate_str(s: String, max_bytes: usize) -> String {
+// Take ownership so the short-string path is a move, not a clone. On the
+// truncation path, reuse the buffer (truncate + push_str) instead of
+// allocating a new String through `format!`.
+fn truncate_str(mut s: String, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s;
     }
@@ -356,7 +398,9 @@ fn truncate_str(s: String, max_bytes: usize) -> String {
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}...", &s[..end])
+    s.truncate(end);
+    s.push_str("...");
+    s
 }
 
 fn extract_text_content(content: RawContent) -> Vec<(MessageKind, String, Option<String>)> {
@@ -437,6 +481,7 @@ fn format_tool_input(tool: &str, input: &ToolInput) -> String {
 struct ParsedLine {
     kind: LineParsed,
     timestamp: Option<DateTime<Utc>>,
+    cwd: Option<String>,
 }
 
 enum LineParsed {
@@ -478,6 +523,7 @@ fn parse_one_line(line: &[u8]) -> Option<ParsedLine> {
     let raw: RawLine = json_from_slice(line)?;
     let ts = raw.timestamp.as_deref().and_then(parse_timestamp);
     let msg_type = raw.msg_type.as_deref().unwrap_or("");
+    let cwd = raw.cwd.filter(|s| !s.is_empty());
 
     match msg_type {
         "user" => {
@@ -487,6 +533,7 @@ fn parse_one_line(line: &[u8]) -> Option<ParsedLine> {
             Some(ParsedLine {
                 kind: LineParsed::User { parts },
                 timestamp: ts,
+                cwd,
             })
         }
         "assistant" => {
@@ -507,6 +554,7 @@ fn parse_one_line(line: &[u8]) -> Option<ParsedLine> {
                     message_id: msg.id,
                 },
                 timestamp: ts,
+                cwd,
             })
         }
         "summary" => {
@@ -521,6 +569,7 @@ fn parse_one_line(line: &[u8]) -> Option<ParsedLine> {
             Some(ParsedLine {
                 kind: LineParsed::Summary(text),
                 timestamp: ts,
+                cwd,
             })
         }
         "system" => {
@@ -528,6 +577,7 @@ fn parse_one_line(line: &[u8]) -> Option<ParsedLine> {
                 raw.duration_ms.map(|dur| ParsedLine {
                     kind: LineParsed::System { duration_ms: dur },
                     timestamp: ts,
+                    cwd,
                 })
             } else {
                 None
@@ -535,6 +585,144 @@ fn parse_one_line(line: &[u8]) -> Option<ParsedLine> {
         }
         _ => None,
     }
+}
+
+// Accumulator for the line-merge loop. Carved out so both the
+// sequential (fused) and parallel (collect-then-merge) paths in
+// `parse_session` share the same logic.
+struct SessionBuilder {
+    messages: Vec<Message>,
+    summary: Option<String>,
+    first_user_msg: Option<String>,
+    total_input: u64,
+    total_output: u64,
+    total_cache_read: u64,
+    total_cache_create: u64,
+    model: Option<String>,
+    turn_count: usize,
+    cwd: Option<String>,
+}
+
+impl SessionBuilder {
+    fn with_capacity(line_estimate: usize) -> Self {
+        Self {
+            // ~1.3 messages per line for typical Claude logs (assistant
+            // lines fan out into text+tool blocks); overshooting by 30%
+            // is cheaper than reallocating mid-loop.
+            messages: Vec::with_capacity(line_estimate * 13 / 10),
+            summary: None,
+            first_user_msg: None,
+            total_input: 0,
+            total_output: 0,
+            total_cache_read: 0,
+            total_cache_create: 0,
+            model: None,
+            turn_count: 0,
+            cwd: None,
+        }
+    }
+
+    fn push(&mut self, parsed: ParsedLine) {
+        let ts = parsed.timestamp;
+        if self.cwd.is_none() {
+            self.cwd = parsed.cwd;
+        }
+        match parsed.kind {
+            LineParsed::User { parts } => {
+                for (kind, text, tool_name) in parts {
+                    if kind == MessageKind::User && self.first_user_msg.is_none() {
+                        // Slice-truncate so a 50KB paste doesn't get
+                        // cloned just to throw away 49.8KB of it.
+                        self.first_user_msg = Some(truncated_copy(&text, 200));
+                    }
+                    if kind == MessageKind::ToolResult && text.is_empty() {
+                        continue;
+                    }
+                    self.messages.push(Message {
+                        timestamp: ts,
+                        kind,
+                        content: text,
+                        tokens: None,
+                        tool_name,
+                        model: None,
+                        message_id: None,
+                    });
+                }
+                self.turn_count += 1;
+            }
+            LineParsed::Assistant {
+                parts,
+                model: mut msg_model,
+                tokens,
+                mut message_id,
+            } => {
+                if self.model.is_none() {
+                    self.model.clone_from(&msg_model);
+                }
+                if let Some(ref t) = tokens {
+                    self.total_input += t.input;
+                    self.total_output += t.output;
+                    self.total_cache_read += t.cache_read;
+                    self.total_cache_create += t.cache_create;
+                }
+                // Peek-ahead trick: clone msg_model / message_id for
+                // every non-empty part except the last, where we move.
+                // For the typical single-part assistant line this lands
+                // on `is_last` immediately and skips all string clones.
+                let mut iter = parts
+                    .into_iter()
+                    .filter(|(_, t, _)| !t.is_empty())
+                    .peekable();
+                while let Some((kind, text, tool_name)) = iter.next() {
+                    let is_last = iter.peek().is_none();
+                    let (m, mid) = if is_last {
+                        (msg_model.take(), message_id.take())
+                    } else {
+                        (msg_model.clone(), message_id.clone())
+                    };
+                    self.messages.push(Message {
+                        timestamp: ts,
+                        kind,
+                        content: text,
+                        tokens,
+                        tool_name,
+                        model: m,
+                        message_id: mid,
+                    });
+                }
+            }
+            LineParsed::Summary(text) => {
+                self.summary = Some(text);
+            }
+            LineParsed::System { duration_ms } => {
+                self.messages.push(Message {
+                    timestamp: ts,
+                    kind: MessageKind::System,
+                    content: format!("Turn completed in {:.1}s", duration_ms as f64 / 1000.0),
+                    tokens: None,
+                    tool_name: None,
+                    model: None,
+                    message_id: None,
+                });
+            }
+        }
+    }
+}
+
+// Slice-truncate a String into a fresh, short owned copy. Avoids
+// cloning the whole input when we know the keeper portion is small.
+fn truncated_copy(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + 3);
+    out.push_str(&s[..end]);
+    out.push_str("...");
+    out
 }
 
 #[allow(clippy::indexing_slicing)]
@@ -548,9 +736,14 @@ pub fn parse_session(path: &Path) -> Option<Session> {
         return None;
     }
 
-    // Find line boundaries using SIMD-accelerated memchr
-    let line_ranges: Vec<(usize, usize)> = {
-        let mut ranges = Vec::new();
+    // ≤10MB: fused single-pass loop. memchr_iter yields line ends, we
+    // parse + merge inline. Skips the two intermediate Vecs
+    // (`line_ranges` + `Vec<Option<ParsedLine>>`) the parallel path
+    // needs. >10MB: collect line ranges, parse them in parallel, then
+    // merge sequentially since order matters for first_user_msg / model.
+    let mut b = SessionBuilder::with_capacity(data.len() / 600);
+    if data.len() > 10_000_000 {
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(data.len() / 600);
         let mut start = 0;
         for pos in memchr::memchr_iter(b'\n', data) {
             if pos > start {
@@ -561,105 +754,41 @@ pub fn parse_session(path: &Path) -> Option<Session> {
         if start < data.len() {
             ranges.push((start, data.len()));
         }
-        ranges
-    };
-
-    // Parse lines in parallel for large files (>10MB), sequential otherwise
-    let parsed_lines: Vec<Option<ParsedLine>> = if data.len() > 10_000_000 {
-        line_ranges
+        let parsed: Vec<Option<ParsedLine>> = ranges
             .par_iter()
             .map(|&(s, e)| parse_one_line(&data[s..e]))
-            .collect()
+            .collect();
+        for p in parsed.into_iter().flatten() {
+            b.push(p);
+        }
     } else {
-        line_ranges
-            .iter()
-            .map(|&(s, e)| parse_one_line(&data[s..e]))
-            .collect()
-    };
-
-    // Merge results sequentially (order matters for first_user_msg, model, etc.)
-    // Pre-size to one message per recognized line — typical sessions emit ~1.3
-    // messages per line (some assistant lines fan out into text+tool blocks),
-    // but overshooting by 30% is cheaper than reallocating mid-loop.
-    let mut messages = Vec::with_capacity(parsed_lines.len());
-    let mut summary: Option<String> = None;
-    let mut first_user_msg: Option<String> = None;
-    let mut total_input = 0u64;
-    let mut total_output = 0u64;
-    let mut total_cache_read = 0u64;
-    let mut total_cache_create = 0u64;
-    let mut model: Option<String> = None;
-    let mut turn_count = 0usize;
-
-    for parsed in parsed_lines.into_iter().flatten() {
-        let ts = parsed.timestamp;
-        match parsed.kind {
-            LineParsed::User { parts } => {
-                for (kind, text, tool_name) in parts {
-                    if kind == MessageKind::User && first_user_msg.is_none() {
-                        first_user_msg = Some(truncate_str(text.clone(), 200));
-                    }
-                    if kind == MessageKind::ToolResult && text.is_empty() {
-                        continue;
-                    }
-                    messages.push(Message {
-                        timestamp: ts,
-                        kind,
-                        content: text,
-                        tokens: None,
-                        tool_name,
-                        model: None,
-                        message_id: None,
-                    });
-                }
-                turn_count += 1;
-            }
-            LineParsed::Assistant {
-                parts,
-                model: msg_model,
-                tokens,
-                message_id,
-            } => {
-                if model.is_none() {
-                    model.clone_from(&msg_model);
-                }
-                if let Some(ref t) = tokens {
-                    total_input += t.input;
-                    total_output += t.output;
-                    total_cache_read += t.cache_read;
-                    total_cache_create += t.cache_create;
-                }
-                for (kind, text, tool_name) in parts {
-                    if text.is_empty() {
-                        continue;
-                    }
-                    messages.push(Message {
-                        timestamp: ts,
-                        kind,
-                        content: text,
-                        tokens,
-                        tool_name,
-                        model: msg_model.clone(),
-                        message_id: message_id.clone(),
-                    });
+        let mut start = 0;
+        for pos in memchr::memchr_iter(b'\n', data) {
+            if pos > start {
+                if let Some(p) = parse_one_line(&data[start..pos]) {
+                    b.push(p);
                 }
             }
-            LineParsed::Summary(text) => {
-                summary = Some(text);
-            }
-            LineParsed::System { duration_ms } => {
-                messages.push(Message {
-                    timestamp: ts,
-                    kind: MessageKind::System,
-                    content: format!("Turn completed in {:.1}s", duration_ms as f64 / 1000.0),
-                    tokens: None,
-                    tool_name: None,
-                    model: None,
-                    message_id: None,
-                });
+            start = pos + 1;
+        }
+        if start < data.len() {
+            if let Some(p) = parse_one_line(&data[start..]) {
+                b.push(p);
             }
         }
     }
+    let SessionBuilder {
+        messages,
+        summary,
+        first_user_msg,
+        total_input,
+        total_output,
+        total_cache_read,
+        total_cache_create,
+        model,
+        turn_count,
+        cwd,
+    } = b;
 
     if messages.is_empty() {
         return None;
@@ -683,6 +812,7 @@ pub fn parse_session(path: &Path) -> Option<Session> {
         summary,
         first_user_msg,
         msg_count,
+        cwd,
         total_input_tokens: total_input,
         total_output_tokens: total_output,
         total_cache_read,
@@ -710,8 +840,9 @@ pub fn parse_session(path: &Path) -> Option<Session> {
 // canonical pipeline `daily`/`session`/web-rollup use), so this path
 // agrees with the CLI usage reports to the cent.
 
-// Prints a one-line cache hit/miss summary to stderr so the user can
-// tell cold runs from warm ones.
+// With CCAUDIT_PROF set, prints a one-line cache hit/miss summary to
+// stderr so the user can tell cold runs from warm ones. Silent otherwise
+// to keep TUI/web invocations clean.
 #[allow(clippy::print_stderr)]
 pub fn load_all_projects<S: crate::source::Source + ?Sized>(source: &S) -> Vec<Project> {
     let projects_dir = match dirs::home_dir() {
@@ -791,9 +922,11 @@ pub fn load_all_projects<S: crate::source::Source + ?Sized>(source: &S) -> Vec<P
         })
         .collect();
 
-    let hits = cache_hits.load(Ordering::Relaxed);
-    let misses = cache_misses.load(Ordering::Relaxed);
-    eprintln!("cache: {hits} hits, {misses} misses");
+    if std::env::var_os("CCAUDIT_PROF").is_some() {
+        let hits = cache_hits.load(Ordering::Relaxed);
+        let misses = cache_misses.load(Ordering::Relaxed);
+        eprintln!("cache: {hits} hits, {misses} misses");
+    }
 
     let mut parsed = parsed;
     for p in &mut parsed {
@@ -815,7 +948,7 @@ pub fn load_all_projects<S: crate::source::Source + ?Sized>(source: &S) -> Vec<P
         }
     }
 
-    let mut project_map: HashMap<PathBuf, Vec<Session>> = HashMap::new();
+    let mut project_map: FxHashMap<PathBuf, Vec<Session>> = FxHashMap::default();
     for p in parsed {
         project_map.entry(p.dir).or_default().push(p.session);
     }
@@ -824,11 +957,17 @@ pub fn load_all_projects<S: crate::source::Source + ?Sized>(source: &S) -> Vec<P
         .into_iter()
         .map(|(dir, mut sessions)| {
             sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
-            let name = dir
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown");
-            let pretty_name = crate::source::claude_code::prettify_project_name(name);
+            // Prefer the unambiguous cwd recorded inside any session in this
+            // project dir — the dash-encoded dir name loses real hyphens.
+            let pretty_name = if let Some(c) = sessions.iter().find_map(|s| s.cwd.as_deref()) {
+                crate::source::prettify_cwd(c)
+            } else {
+                let name = dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown");
+                crate::source::claude_code::prettify_project_name(name)
+            };
 
             // All four token columns — `Session::total_tokens()` uses the
             // same sum, and every renderer (CLI, TUI, web JS) treats

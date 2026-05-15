@@ -11,7 +11,7 @@ use ratatui::widgets::{
     Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState,
 };
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::time::Duration;
 
 // Pre-allocated spaces slab; slice out any indent width up to 64 chars
@@ -58,7 +58,7 @@ pub struct App {
     quit: bool,
     // Dashboard aggregations computed once at App::new(). Projects are
     // immutable for the TUI's lifetime, so recomputing per-frame was
-    // pure waste (HashMap<String,_> allocating a fresh key per session
+    // pure waste (FxHashMap<String,_> allocating a fresh key per session
     // on every keystroke).
     dashboard: DashboardAgg,
 }
@@ -118,7 +118,8 @@ fn compute_dashboard(projects: &[Project]) -> DashboardAgg {
     let mut total_cache_r = 0u64;
     let mut by_project: Vec<ProjectAgg> = Vec::with_capacity(projects.len());
     // Per-model accumulator: (sessions, messages, tokens, cost, duration_ms, latest_started_at).
-    let mut by_model_map: HashMap<&str, (usize, usize, u64, f64, u64, String)> = HashMap::new();
+    let mut by_model_map: FxHashMap<&str, (usize, usize, u64, f64, u64, String)> =
+        FxHashMap::default();
     let mut top_sessions: Vec<TopSession> = Vec::new();
 
     for (pi, p) in projects.iter().enumerate() {

@@ -4,7 +4,6 @@ use crate::source::day_to_date;
 use crate::style;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
-use std::collections::HashMap;
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -155,7 +154,7 @@ fn build_daily_index(cache: &LoadedCache) -> DailyIndex<'_> {
     // model at build time, keyed on (day, model_id, project_id). So
     // the "daily" rollup is just a projection: group by (day, project,
     // model) and collect ordered indices for each string dimension.
-    let mut day_idx: HashMap<i32, i32> = HashMap::new();
+    let mut day_idx: FxHashMap<i32, i32> = FxHashMap::default();
     let mut days: Vec<i32> = Vec::new();
 
     let mut rows: Vec<DailyRow> = Vec::with_capacity(cache.preaggs().len());
@@ -206,10 +205,13 @@ fn build_daily_index(cache: &LoadedCache) -> DailyIndex<'_> {
 }
 
 // Prints build-stats lines ("search index: …KB", "wrote …") to stderr
-// so the user sees what the `ccaudit web` run produced.
+// so the user sees what the `ccaudit web` run produced. Suppressed when
+// `CCAUDIT_QUIET=1` (set by the bench harness and any caller that
+// invokes generate in a loop).
 #[allow(clippy::print_stderr)]
 pub fn generate(projects: &[Project], cache: &LoadedCache, out_dir: &Path) -> std::io::Result<()> {
     use rayon::prelude::*;
+    let quiet = std::env::var_os("CCAUDIT_QUIET").is_some();
 
     let sessions_dir = out_dir.join("s");
     fs::create_dir_all(&sessions_dir)?;
@@ -373,7 +375,9 @@ pub fn generate(projects: &[Project], cache: &LoadedCache, out_dir: &Path) -> st
     search_w.flush()?;
     drop(search_w);
     let search_size = fs::metadata(&search_path).map(|m| m.len()).unwrap_or(0);
-    eprintln!("search index: {:.0}KB", search_size as f64 / 1024.0);
+    if !quiet {
+        eprintln!("search index: {:.0}KB", search_size as f64 / 1024.0);
+    }
 
     let out_file = out_dir.join("index.html");
     let mut f = BufWriter::new(fs::File::create(&out_file)?);
@@ -396,13 +400,15 @@ pub fn generate(projects: &[Project], cache: &LoadedCache, out_dir: &Path) -> st
     f.write_all(b"\n</script>\n</body>\n</html>")?;
     f.flush()?;
 
-    let total_session_files: usize = projects.iter().map(|p| p.sessions.len()).sum();
-    eprintln!(
-        "wrote {} ({:.0}KB index + {} session files)",
-        out_file.display(),
-        index_size as f64 / 1024.0,
-        total_session_files
-    );
+    if !quiet {
+        let total_session_files: usize = projects.iter().map(|p| p.sessions.len()).sum();
+        eprintln!(
+            "wrote {} ({:.0}KB index + {} session files)",
+            out_file.display(),
+            index_size as f64 / 1024.0,
+            total_session_files
+        );
+    }
     Ok(())
 }
 

@@ -107,23 +107,35 @@ pub fn format_limit_cell(pct: f64) -> String {
 
 pub const THOUSANDS_SEP: char = '_';
 
-pub fn format_number(n: u64) -> String {
+/// Append a formatted number with thousands separators to `out`.
+///
+/// Reuses the buffer — call sites that render a stream of cells can
+/// keep a single `String` scratch alive across rows instead of
+/// allocating per cell.
+pub fn write_number(out: &mut String, n: u64) {
     // itoa is a few ns per conversion vs. ~50ns for the default Display
     // (uses format_args! machinery). Then we splice thousands separators.
     let mut itoa_buf = itoa::Buffer::new();
     let s = itoa_buf.format(n);
     let b = s.as_bytes();
-    let mut out = String::with_capacity(b.len() + b.len() / 3);
+    out.reserve(b.len() + b.len() / 3);
     for (i, &c) in b.iter().enumerate() {
         if i > 0 && (b.len() - i).is_multiple_of(3) {
             out.push(THOUSANDS_SEP);
         }
         out.push(c as char);
     }
+}
+
+pub fn format_number(n: u64) -> String {
+    let mut out = String::new();
+    write_number(&mut out, n);
     out
 }
 
-pub fn format_cost(c: f64) -> String {
+/// Append a cost string (`$X_YYY.ZZ`) to `out`. See `write_number` for
+/// the rationale on the `_into`-style API.
+pub fn write_cost(out: &mut String, c: f64) {
     // Fixed 2-decimal currency with thousands separators on the dollar
     // portion ($5706.77 → $5_706.77). Convert to cents to dodge fp
     // formatting drift. Negative-defensive though we don't expect them.
@@ -131,19 +143,28 @@ pub fn format_cost(c: f64) -> String {
     // priced at half a cent doesn't show as `$0.00` in the CLI but
     // `<$0.01` on the web — the two views must agree visibly.
     if c > 0.0 && c < 0.01 {
-        return "<$0.01".to_string();
+        out.push_str("<$0.01");
+        return;
     }
     let cents = (c * 100.0).round() as i64;
     let sign = if cents < 0 { "-$" } else { "$" };
     let abs = cents.unsigned_abs();
     let dollars = abs / 100;
     let frac = abs % 100;
-    let dollars_str = format_number(dollars);
+    out.push_str(sign);
+    write_number(out, dollars);
+    out.push('.');
     if frac < 10 {
-        format!("{sign}{dollars_str}.0{frac}")
-    } else {
-        format!("{sign}{dollars_str}.{frac}")
+        out.push('0');
     }
+    use std::fmt::Write as _;
+    let _ = write!(out, "{frac}");
+}
+
+pub fn format_cost(c: f64) -> String {
+    let mut out = String::new();
+    write_cost(&mut out, c);
+    out
 }
 
 // ── Date / datetime formatting (centralized for future locale work) ──

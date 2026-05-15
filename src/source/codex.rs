@@ -325,7 +325,7 @@ fn parse_codex_session(src: &SourceFile) -> Option<ParsedSession> {
         .map(sanitize)
         .unwrap_or_else(|| session_id.clone());
 
-    let project_name = cwd.as_deref().map(prettify_cwd);
+    let project_name = cwd.as_deref().map(super::prettify_cwd);
 
     Some(ParsedSession {
         path_hash: src.path_hash,
@@ -347,14 +347,6 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-// `/Users/foo/code/bar` → `code/bar`. Tokenizes the slash-separated cwd,
-// then delegates to the shared `prettify_user_path` helper that Claude
-// Code's dash-separated project names also use.
-fn prettify_cwd(cwd: &str) -> String {
-    let parts: Vec<&str> = cwd.trim_start_matches('/').split('/').collect();
-    super::prettify_user_path(&parts).unwrap_or_else(|| cwd.to_string())
-}
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -367,8 +359,18 @@ mod tests {
 
     #[test]
     fn prettify_cwd_strips_users_prefix() {
-        assert_eq!(prettify_cwd("/Users/nick/code/cclog"), "code/cclog");
-        assert_eq!(prettify_cwd("/opt/work/proj"), "/opt/work/proj");
+        assert_eq!(
+            super::super::prettify_cwd("/Users/me/code/cclog"),
+            "code/cclog"
+        );
+        assert_eq!(
+            super::super::prettify_cwd("/home/me/code/cclog"),
+            "code/cclog"
+        );
+        assert_eq!(
+            super::super::prettify_cwd("/opt/work/proj"),
+            "/opt/work/proj"
+        );
     }
 
     #[test]
@@ -377,7 +379,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ccaudit-codex-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("rollout-test.jsonl");
-        let body = r#"{"timestamp":"2026-04-21T22:07:55.744Z","type":"session_meta","payload":{"id":"abc-123","cwd":"/Users/nick/code/cclog"}}
+        let body = r#"{"timestamp":"2026-04-21T22:07:55.744Z","type":"session_meta","payload":{"id":"abc-123","cwd":"/Users/me/code/cclog"}}
 {"timestamp":"2026-04-21T22:07:55.745Z","type":"turn_context","payload":{"model":"gpt-5.4"}}
 {"timestamp":"2026-04-21T22:07:55.746Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello world"}]}}
 {"timestamp":"2026-04-21T22:08:02.245Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":500,"reasoning_output_tokens":100,"total_tokens":1500}}}}

@@ -292,16 +292,25 @@ pub fn day_to_date(days: i32) -> NaiveDate {
         .unwrap_or(epoch)
 }
 
-/// Drop the leading `Users/<name>/` from a tokenized path.
+/// Drop the leading `Users/<name>/` (macOS) or `home/<name>/` (Linux)
+/// from a tokenized path.
 ///
-/// Both Claude Code (dash-separated dir name like `-Users-nick-code-foo`)
-/// and Codex (slash-separated `cwd` like `/Users/nick/code/foo`) share
+/// Both Claude Code (dash-separated dir name like `-Users-me-code-foo`)
+/// and Codex (slash-separated `cwd` like `/Users/me/code/foo`) share
 /// this display rule once each provider tokenizes its native shape.
-/// Returns `None` if the path doesn't match the `Users/<name>/<rest>`
+/// Returns `None` if the path doesn't match the `<home-root>/<name>/<rest>`
 /// form so callers can fall back to the raw string.
 pub fn prettify_user_path(parts: &[&str]) -> Option<String> {
-    if parts.len() > 2 && parts.first().copied() == Some("Users") {
+    let head = parts.first().copied()?;
+    if parts.len() > 2 && (head == "Users" || head == "home") {
         return parts.get(2..).map(|s| s.join("/"));
     }
     None
+}
+
+/// Strip a leading `/`, split on `/`, and run [`prettify_user_path`].
+/// Falls back to the raw `cwd` string if it isn't shaped like a home dir.
+pub fn prettify_cwd(cwd: &str) -> String {
+    let parts: Vec<&str> = cwd.trim_start_matches('/').split('/').collect();
+    prettify_user_path(&parts).unwrap_or_else(|| cwd.to_string())
 }

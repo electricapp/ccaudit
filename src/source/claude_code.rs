@@ -47,7 +47,20 @@ impl Source for ClaudeCode {
     }
 
     fn parse_session(&self, src: &SourceFile) -> Option<ParsedSession> {
+        // Cache-first: if a fresh per-session cache exists, skip the
+        // JSONL parse entirely. Critical for `cache::load` invocations
+        // where only the `.db` was wiped (e.g. after `refresh-prices`):
+        // 300 .msgs reads beat 300 JSONL re-parses by a factor of ~10.
+        if let Some(session) = parse::try_load_cached_full(&src.path) {
+            return Some(to_parsed_session(&src.path, src, &session));
+        }
         let session = parse::parse_session(&src.path)?;
+        // Persist so the matching `try_load_cached_header` in
+        // `load_all_projects`'s par_iter (which runs right after
+        // `cache::load`) finds a hot cache and skips its own parse,
+        // killing the cold-path double-parse that used to happen on
+        // every file.
+        parse::save_session_to_cache(&src.path, &session);
         Some(to_parsed_session(&src.path, src, &session))
     }
 
@@ -141,15 +154,23 @@ const HAIKU: Pricing = Pricing {
 
 // ── Claude Code-specific project name prettifier ──
 
-// Logs live in `~/.claude/projects/-Users-<username>-<rest>/`. Tokenize
-// on dashes, then hand off to the shared `prettify_user_path` helper so
-// Claude and Codex agree on the display shape for the same path.
+// Logs live in `~/.claude/projects/-Users-<username>-<rest>/`. The dir
+// name is dash-encoded and lossy when the real path contains hyphens
+// (e.g. `-Users-me-code-foo-bar` could be `code/foo/bar` or
+// `code/foo-bar`). Prefer the unambiguous `cwd` from the JSONL body
+// when available; fall back to splitting the dir name on dashes.
 pub fn prettify_project_name(raw: &str) -> String {
     let parts: Vec<&str> = raw.split('-').filter(|s| !s.is_empty()).collect();
     super::prettify_user_path(&parts).unwrap_or_else(|| raw.to_string())
 }
 
-fn project_name_for(path: &Path) -> Option<String> {
+fn project_name_for(path: &Path, cwd: Option<&str>) -> Option<String> {
+    if let Some(c) = cwd {
+        let pretty = super::prettify_cwd(c);
+        if !pretty.is_empty() {
+            return Some(pretty);
+        }
+    }
     path.parent()
         .and_then(|p| p.file_name())
         .and_then(|s| s.to_str())
@@ -224,7 +245,7 @@ fn to_parsed_session(path: &Path, src: &SourceFile, session: &Session) -> Parsed
         session_model: session.model.clone(),
         display_name: display_name_of(session),
         session_id: session_id_for(path),
-        project_name: project_name_for(path),
+        project_name: project_name_for(path, session.cwd.as_deref()),
         lines,
         ts_unix,
     }
