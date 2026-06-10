@@ -91,9 +91,9 @@
   suite('esc — html escape', () => {
     it('empty → empty', () => eq(esc(''), ''));
     it('plain text passes through', () => eq(esc('hello world'), 'hello world'));
-    it('escapes <, >, &', () => eq(esc('<script>&"'), '&lt;script&gt;&amp;"'));
-    it("quotes are NOT escaped (attribute escape is the caller's job)", () =>
-      eq(esc('"foo"'), '"foo"'));
+    it('escapes <, >, &', () => eq(esc('<script>&'), '&lt;script&gt;&amp;'));
+    it('escapes both quote styles (attribute-safe)', () =>
+      eq(esc(`"foo" 'bar'`), '&quot;foo&quot; &#39;bar&#39;'));
   });
 
   // ── durMs ──
