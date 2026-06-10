@@ -2,11 +2,13 @@
 // run materializes a deterministic JSONL fixture in a tempdir, points
 // `HOME` at it, and exercises the actual user-facing code paths.
 //
+// This is a `[[bench]]` target (harness = false) at benches/bench.rs.
+//
 // Usage:
-//   cargo run --release --example bench
-//   BENCH_SIZE=large cargo run --release --example bench
-//   BENCH_SAVE=baseline.json cargo run --release --example bench
-//   BENCH_COMPARE=baseline.json cargo run --release --example bench
+//   cargo bench
+//   BENCH_SIZE=large cargo bench
+//   BENCH_SAVE=baseline.json cargo bench
+//   BENCH_COMPARE=baseline.json cargo bench
 //
 // Output is structured: each measurement gets a `{name, samples}` record
 // so before/after diffs can be computed mechanically.
@@ -25,7 +27,7 @@
 //
 //   Micro paths (drill into hot inner loops):
 //     parse_session (1 big file)
-//     tokenize_into (~10 KB text)
+//     split_whitespace (~10 KB text — stdlib proxy, see note below)
 //     Searcher::score (1000 candidates × 5 queries)
 //     fnv1a (10 KB)
 //
@@ -45,7 +47,14 @@
     unsafe_code
 )]
 
-use ccaudit::{cache, parse, search, source, web};
+use ccaudit::{cache, parse, source};
+// Gated benches: `web::generate` needs the `web` feature, `search::Searcher`
+// needs `tui`. Gating the imports + their bench blocks keeps the bench
+// target compiling (and clippy-clean) under every feature combination.
+#[cfg(feature = "tui")]
+use ccaudit::search;
+#[cfg(feature = "web")]
+use ccaudit::web;
 use rustc_hash::FxHashSet;
 use std::fs;
 use std::io::{BufWriter, Write};
@@ -60,7 +69,6 @@ fn main() {
     // — the bench invokes them hundreds of times and the noise scrolls
     // the actual results table off-screen. Leave alone if the caller
     // already set it.
-    #[allow(unsafe_code)]
     if std::env::var_os("CCAUDIT_QUIET").is_none() {
         // Safety: single-threaded at this point in main(); no other
         // threads are reading the environment yet.
@@ -384,14 +392,17 @@ fn run_macro(
     });
     record(out, &fmt_name(group, "agg session (live)"), s);
 
-    // web::generate full pipeline
-    let parsed = parse::load_all_projects(src);
-    let web_out = cache_dir.parent().unwrap().join("web-out");
-    let s = time(runs, || {
-        let _ = fs::remove_dir_all(&web_out);
-        web::generate(&parsed, &cached, &web_out).unwrap();
-    });
-    record(out, &fmt_name(group, "web::generate"), s);
+    // web::generate full pipeline (only built with the `web` feature).
+    #[cfg(feature = "web")]
+    {
+        let parsed = parse::load_all_projects(src);
+        let web_out = cache_dir.parent().unwrap().join("web-out");
+        let s = time(runs, || {
+            let _ = fs::remove_dir_all(&web_out);
+            web::generate(&parsed, &cached, &web_out).unwrap();
+        });
+        record(out, &fmt_name(group, "web::generate"), s);
+    }
 }
 
 fn fmt_name(group: &str, name: &str) -> String {
@@ -410,7 +421,13 @@ fn run_micro(runs: usize, _scratch: &Path, out: &mut Vec<Measurement>) {
     });
     record_with_throughput(out, "micro/parse_session (2000 msgs)", s, big_bytes, 2000);
 
-    // 2) tokenize_into on a ~10 KB text.
+    // 2) Whitespace splitting on a ~10 KB text. NOTE: this measures the
+    // stdlib (`str::split_ascii_whitespace` + collect into a set), NOT
+    // ccaudit's own tokenizer. The real `tokenize_into` is private to the
+    // search module and not re-exported, so this stands in only as a
+    // rough stdlib proxy for the per-token cost — not a measurement of
+    // project code. Labelled accordingly so the results table can't imply
+    // otherwise.
     let mut text = String::with_capacity(15_000);
     for i in 0..1500 {
         use std::fmt::Write as _;
@@ -419,36 +436,36 @@ fn run_micro(runs: usize, _scratch: &Path, out: &mut Vec<Measurement>) {
     let text_bytes = text.len() as u64;
     let s = time(runs, || {
         let mut set: FxHashSet<String> = FxHashSet::default();
-        // Use a public proxy: build_tool_counts isn't tokenize, so we
-        // exercise the search index path indirectly via web::generate's
-        // tokenizer through a private helper. Since tokenize_into isn't
-        // pub, use a representative substitute: split + collect.
         for tok in text.split_ascii_whitespace() {
             let _ = set.insert(tok.to_string());
         }
     });
-    record_with_throughput(out, "micro/tokenize 10KB", s, text_bytes, 1500);
+    record_with_throughput(out, "micro/split_whitespace 10KB", s, text_bytes, 1500);
 
-    // 3) Searcher::score over 1000 candidates × 5 queries.
-    let candidates: Vec<String> = (0..1000)
-        .map(|i| format!("project_{i:04}_alpha_beta"))
-        .collect();
-    let queries = ["proj", "alpha", "beta_0042", "xyz", "p_007"];
-    let s = time(runs, || {
-        let mut sc = search::Searcher::new();
-        for q in queries {
-            for c in &candidates {
-                let _ = sc.score(q, c);
+    // 3) Searcher::score over 1000 candidates × 5 queries (only built with
+    // the `tui` feature, which gates the search module).
+    #[cfg(feature = "tui")]
+    {
+        let candidates: Vec<String> = (0..1000)
+            .map(|i| format!("project_{i:04}_alpha_beta"))
+            .collect();
+        let queries = ["proj", "alpha", "beta_0042", "xyz", "p_007"];
+        let s = time(runs, || {
+            let mut sc = search::Searcher::new();
+            for q in queries {
+                for c in &candidates {
+                    let _ = sc.score(q, c);
+                }
             }
-        }
-    });
-    record_with_throughput(
-        out,
-        "micro/search 1000n×5q",
-        s,
-        0,
-        (candidates.len() * queries.len()) as u64,
-    );
+        });
+        record_with_throughput(
+            out,
+            "micro/search 1000n×5q",
+            s,
+            0,
+            (candidates.len() * queries.len()) as u64,
+        );
+    }
 
     // 4) fnv1a on a 10 KB buffer.
     let blob = vec![0xa5u8; 10 * 1024];

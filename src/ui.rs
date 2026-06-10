@@ -2,7 +2,8 @@ use crate::parse::{self, MessageKind, Project};
 use crate::report::fmt::{format_cost, format_datetime, format_datetime_short, format_number};
 use crate::search::Searcher;
 use crate::style;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use chrono::{DateTime, Utc};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -108,6 +109,12 @@ struct TopSession {
     started_at: String,
 }
 
+// Per-model accumulator: (sessions, messages, tokens, cost, duration_ms,
+// latest_started_at). The last start is a timestamp, not a pre-formatted
+// string, so "last active" sorts chronologically across year boundaries
+// (a `%m/%d %H:%M` string compared lexicographically put 12/30 after 01/15).
+type ModelAccum = (usize, usize, u64, f64, u64, Option<DateTime<Utc>>);
+
 fn compute_dashboard(projects: &[Project]) -> DashboardAgg {
     let mut total_sessions = 0usize;
     let mut total_msgs = 0usize;
@@ -117,9 +124,7 @@ fn compute_dashboard(projects: &[Project]) -> DashboardAgg {
     let mut total_cache_w = 0u64;
     let mut total_cache_r = 0u64;
     let mut by_project: Vec<ProjectAgg> = Vec::with_capacity(projects.len());
-    // Per-model accumulator: (sessions, messages, tokens, cost, duration_ms, latest_started_at).
-    let mut by_model_map: FxHashMap<&str, (usize, usize, u64, f64, u64, String)> =
-        FxHashMap::default();
+    let mut by_model_map: FxHashMap<&str, ModelAccum> = FxHashMap::default();
     let mut top_sessions: Vec<TopSession> = Vec::new();
 
     for (pi, p) in projects.iter().enumerate() {
@@ -127,7 +132,7 @@ fn compute_dashboard(projects: &[Project]) -> DashboardAgg {
         let mut pm = 0usize;
         let mut ptok = 0u64;
         let mut pdur = 0u64;
-        let mut plast = String::new();
+        let mut plast: Option<DateTime<Utc>> = None;
         for (si, s) in p.sessions.iter().enumerate() {
             let cost = s.cost;
             let sdur = match (s.started_at, s.ended_at) {
@@ -150,8 +155,11 @@ fn compute_dashboard(projects: &[Project]) -> DashboardAgg {
             pm += s.msg_count as usize;
             ptok += stok;
             pdur += sdur;
-            if s.started_at.is_some() && started > plast {
-                plast.clone_from(&started);
+            // Compare chronologically, keep the most recent start.
+            if let Some(ts) = s.started_at {
+                if plast.is_none_or(|cur| ts > cur) {
+                    plast = Some(ts);
+                }
             }
 
             // Borrow-keyed HashMap: model names are a tiny closed set
@@ -159,14 +167,16 @@ fn compute_dashboard(projects: &[Project]) -> DashboardAgg {
             let model = s.model.as_deref().unwrap_or("unknown");
             let entry = by_model_map
                 .entry(model)
-                .or_insert_with(|| (0, 0, 0, 0.0, 0, String::new()));
+                .or_insert_with(|| (0, 0, 0, 0.0, 0, None));
             entry.0 += 1;
             entry.1 += s.msg_count as usize;
             entry.2 += stok;
             entry.3 += cost;
             entry.4 += sdur;
-            if s.started_at.is_some() && started > entry.5 {
-                entry.5.clone_from(&started);
+            if let Some(ts) = s.started_at {
+                if entry.5.is_none_or(|cur| ts > cur) {
+                    entry.5 = Some(ts);
+                }
             }
 
             top_sessions.push(TopSession {
@@ -186,7 +196,7 @@ fn compute_dashboard(projects: &[Project]) -> DashboardAgg {
             tokens: ptok,
             cost: pc,
             duration_ms: pdur,
-            last_active: plast,
+            last_active: plast.map(format_datetime_short).unwrap_or_default(),
         });
     }
 
@@ -211,7 +221,7 @@ fn compute_dashboard(projects: &[Project]) -> DashboardAgg {
             tokens: tok,
             cost,
             duration_ms: dur,
-            last_active: last,
+            last_active: last.map(format_datetime_short).unwrap_or_default(),
         })
         .collect();
     by_model.sort_by(|a, b| {
@@ -270,11 +280,20 @@ impl App {
         &mut self,
         terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     ) -> std::io::Result<()> {
+        // Draw once up front, then redraw only after an event was
+        // actually received and handled. Nothing in this UI is
+        // time-based, so blocking on input until something happens
+        // avoids the old ~20fps idle rebuild+redraw of the whole session.
+        let _ = terminal.draw(|f| self.render(f))?;
         while !self.quit {
-            let _ = terminal.draw(|f| self.render(f))?;
-            if event::poll(Duration::from_millis(50))? {
+            if event::poll(Duration::from_millis(250))? {
                 if let Event::Key(key) = event::read()? {
-                    self.handle_key(key);
+                    // Windows reports both Press and Release; act on
+                    // Press only so each keystroke fires once.
+                    if key.kind == KeyEventKind::Press {
+                        self.handle_key(key);
+                        let _ = terminal.draw(|f| self.render(f))?;
+                    }
                 }
             }
         }
@@ -283,6 +302,12 @@ impl App {
 
     fn handle_key(&mut self, key: event::KeyEvent) {
         if self.searching {
+            // Ctrl+C quits even while typing a search query, rather than
+            // inserting a literal 'c'.
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.quit = true;
+                return;
+            }
             match key.code {
                 KeyCode::Esc => {
                     self.searching = false;
@@ -350,7 +375,10 @@ impl App {
                     self.dash_scroll = 0;
                 }
             }
-            KeyCode::Char('/') => {
+            // Only the list-layout views (Projects, Sessions) render a
+            // search input box; entering search mode elsewhere would
+            // silently swallow keystrokes with no visible field.
+            KeyCode::Char('/') if matches!(self.view, View::Projects | View::Sessions) => {
                 self.searching = true;
                 self.search_query.clear();
             }
@@ -938,15 +966,15 @@ impl App {
             }
         }
 
-        let total_lines = lines.len() as u16;
+        let total_lines = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         self.message_max_scroll = total_lines.saturating_sub(area.height);
 
         let title = session.display_name();
-        let truncated_title = if title.len() > 60 {
-            format!(" {}... ", &title[..57])
-        } else {
-            format!(" {title} ")
-        };
+        // Boundary-safe truncation — `title` is arbitrary user text, so
+        // slicing raw bytes (`&title[..57]`) panicked when byte 57 fell
+        // mid-codepoint. `truncate_line` truncates on a char boundary and
+        // appends "..." itself when over the cap.
+        let truncated_title = format!(" {} ", truncate_line(title, 60));
 
         let paragraph = Paragraph::new(lines)
             .block(

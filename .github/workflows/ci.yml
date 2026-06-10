@@ -55,13 +55,17 @@ jobs:
       - name: clippy (all features, deny warnings)
         run: cargo clippy --all-features --all-targets -- -D warnings
 
-      - name: feature matrix
+      # Lint every feature combination across ALL targets (lib + tests +
+      # benches), not just `cargo check` on the lib — so a feature-gating
+      # mistake in a bench or test is caught here instead of only under
+      # --all-features above.
+      - name: feature matrix (clippy, all targets, deny warnings)
         run: |
           set -eux
-          cargo check --no-default-features
-          cargo check --no-default-features --features tui
-          cargo check --no-default-features --features web
-          cargo check --no-default-features --features locale
+          cargo clippy --all-targets --no-default-features -- -D warnings
+          cargo clippy --all-targets --no-default-features --features tui -- -D warnings
+          cargo clippy --all-targets --no-default-features --features web -- -D warnings
+          cargo clippy --all-targets --no-default-features --features locale -- -D warnings
 
       - name: build (release, all features, all targets)
         run: cargo build --release --all-features --all-targets

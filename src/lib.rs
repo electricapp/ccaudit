@@ -1,6 +1,6 @@
 // Library facade for ccaudit. The binary (`src/main.rs`) and the
-// `examples/bench.rs` benchmark both consume the modules through this
-// crate so internal paths stay one source of truth.
+// `benches/bench.rs` benchmark (run via `cargo bench`) both consume the
+// modules through this crate so internal paths stay one source of truth.
 //
 // Nothing here adds or hides API surface — `pub mod` mirrors what the
 // binary previously declared via `mod ...;`. `#[allow(...)]` annotations

@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
+use std::time::Duration;
 use std::{fs, thread};
 
 // Prints the "serving at http://…" banner to stderr before blocking on accept.
@@ -23,6 +24,9 @@ pub fn serve(dir: &Path, port: u16) -> std::io::Result<()> {
     let dir = dir.to_path_buf();
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
+        // Cap how long a connection can sit before sending its request line,
+        // so a client that connects and stays silent can't pin a thread.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let dir = dir.clone();
         let _ = thread::spawn(move || {
             handle_request(&mut stream, &dir);
@@ -40,12 +44,20 @@ fn handle_request(stream: &mut (impl Read + Write), dir: &Path) {
     };
     let request = String::from_utf8_lossy(&buf[..n]);
 
+    let request_line = request.lines().next().unwrap_or("");
+    // HEAD must return the same status line + headers (incl. Content-Length)
+    // as GET but with an empty body; parse the method so `respond` can drop
+    // the body. Anything that isn't HEAD is treated as GET.
+    let is_head = request_line
+        .split_whitespace()
+        .next()
+        .is_some_and(|m| m.eq_ignore_ascii_case("HEAD"));
+
     // Strip the query/fragment so paths like `/index.html?v=1` and
     // `/foo#anchor` resolve to a file on disk.
-    let path = request
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
         .map(|p| p.split(['?', '#']).next().unwrap_or(p))
         .unwrap_or("/");
 
@@ -59,7 +71,7 @@ fn handle_request(stream: &mut (impl Read + Write), dir: &Path) {
         let decoded = percent_decode(clean);
         let candidate = dir.join(&decoded);
         if !path_within(dir, &candidate) {
-            respond(stream, 403, "text/plain", b"forbidden");
+            respond(stream, 403, "text/plain", b"forbidden", is_head);
             return;
         }
         candidate
@@ -74,8 +86,8 @@ fn handle_request(stream: &mut (impl Read + Write), dir: &Path) {
             _ => "application/octet-stream",
         };
         match fs::read(&file_path) {
-            Ok(body) => respond(stream, 200, ct, &body),
-            Err(_) => respond(stream, 500, "text/plain", b"read error"),
+            Ok(body) => respond(stream, 200, ct, &body, is_head),
+            Err(_) => respond(stream, 500, "text/plain", b"read error", is_head),
         }
     } else if !path.contains('.') {
         // SPA fallback: any extension-less path that isn't a real file
@@ -83,11 +95,11 @@ fn handle_request(stream: &mut (impl Read + Write), dir: &Path) {
         // index.html so the JS router can take over and parse the path.
         let index = dir.join("index.html");
         match fs::read(&index) {
-            Ok(body) => respond(stream, 200, "text/html; charset=utf-8", &body),
-            Err(_) => respond(stream, 404, "text/plain", b"not found"),
+            Ok(body) => respond(stream, 200, "text/html; charset=utf-8", &body, is_head),
+            Err(_) => respond(stream, 404, "text/plain", b"not found", is_head),
         }
     } else {
-        respond(stream, 404, "text/plain", b"not found");
+        respond(stream, 404, "text/plain", b"not found", is_head);
     }
 }
 
@@ -148,18 +160,22 @@ fn path_within(dir: &Path, candidate: &Path) -> bool {
     true
 }
 
-fn respond(stream: &mut impl Write, status: u16, content_type: &str, body: &[u8]) {
+fn respond(stream: &mut impl Write, status: u16, content_type: &str, body: &[u8], is_head: bool) {
     let reason = match status {
         200 => "OK",
         403 => "Forbidden",
         404 => "Not Found",
         _ => "Error",
     };
+    // HEAD keeps the identical Content-Length header (computed from the
+    // body that GET would have sent) but writes no body.
     let header = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(header.as_bytes());
-    let _ = stream.write_all(body);
+    if !is_head {
+        let _ = stream.write_all(body);
+    }
     let _ = stream.flush();
 }

@@ -2777,14 +2777,20 @@ document.addEventListener('mouseover', (e) => {
   const tip = $('#htip');
   if (!tip) return;
   const parts = el.getAttribute('data-tip').split('|');
-  tip.innerHTML =
-    '<div class="tip-date">' +
-    parts[0] +
-    '</div>' +
-    parts
-      .slice(1)
-      .map((p) => '<div>' + p + '</div>')
-      .join('');
+  // Build with DOM nodes + textContent (never innerHTML): getAttribute
+  // entity-decodes, so any build-time esc() is already undone here. Using
+  // textContent makes HTML injection from project/tool/model names
+  // impossible while keeping the one-field-per-line layout.
+  tip.replaceChildren();
+  const date = document.createElement('div');
+  date.className = 'tip-date';
+  date.textContent = parts[0];
+  tip.appendChild(date);
+  parts.slice(1).forEach((p) => {
+    const row = document.createElement('div');
+    row.textContent = p;
+    tip.appendChild(row);
+  });
   tip.style.display = 'block';
   const r = el.getBoundingClientRect();
   tip.style.left = r.left + 'px';

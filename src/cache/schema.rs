@@ -10,9 +10,9 @@
 // Suffix signals unit + type, which lets a reader distinguish
 // `started_at` (typed) from `started_ts` (integer seconds) at a glance.
 //
-// A single file (`usage.db`) with fixed-size record sections + string
-// pools. We mmap it and cast bytes directly to typed slices, so no
-// deserialization happens on the hot path.
+// One file per provider (`claude-code.db`, `codex.db`) with fixed-size
+// record sections + string pools. We mmap it and cast bytes directly to
+// typed slices, so no deserialization happens on the hot path.
 //
 // File layout (all multi-byte integers little-endian):
 //   Header                   (32 B)

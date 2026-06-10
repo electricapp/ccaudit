@@ -57,12 +57,43 @@ pub const COMPACT: Widths = Widths {
 };
 
 // ── ANSI ──
+//
+// Color is a runtime decision (TTY + NO_COLOR + --no-color), computed
+// once in `main` and stored here. Each accessor returns the escape
+// sequence when color is on and `""` when off, so call sites bind a
+// local (e.g. `let YELLOW = yellow();`) and their format strings stay
+// byte-identical whether or not color is enabled. Defaults to OFF so a
+// caller that forgets to initialize never leaks escapes into a pipe.
 
-pub const YELLOW: &str = "\x1b[33m";
-pub const GREEN: &str = "\x1b[32m";
-pub const RED: &str = "\x1b[31m";
-pub const DIM: &str = "\x1b[2m";
-pub const RESET: &str = "\x1b[0m";
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static COLOR: AtomicBool = AtomicBool::new(false);
+
+/// Set once at startup from `main`'s TTY/env/flag decision.
+pub fn set_color(on: bool) {
+    COLOR.store(on, Ordering::Relaxed);
+}
+
+/// Whether ANSI color is currently enabled.
+pub fn color_enabled() -> bool {
+    COLOR.load(Ordering::Relaxed)
+}
+
+pub fn yellow() -> &'static str {
+    if color_enabled() { "\x1b[33m" } else { "" }
+}
+pub fn green() -> &'static str {
+    if color_enabled() { "\x1b[32m" } else { "" }
+}
+pub fn red() -> &'static str {
+    if color_enabled() { "\x1b[31m" } else { "" }
+}
+pub fn dim() -> &'static str {
+    if color_enabled() { "\x1b[2m" } else { "" }
+}
+pub fn reset() -> &'static str {
+    if color_enabled() { "\x1b[0m" } else { "" }
+}
 
 // ── Cost-limit progress bar ──
 
@@ -72,14 +103,15 @@ pub const LIMIT_BAR_WIDTH: usize = 8;
 pub const LIMIT_CELL_WIDTH: usize = 15;
 
 /// Color for the limit bar: green <60%, yellow 60–80%, red ≥80%.
-/// Thresholds mirror ccmonitor (Safe / Caution / Danger).
-pub const fn limit_color(pct: f64) -> &'static str {
+/// Thresholds mirror ccmonitor (Safe / Caution / Danger). Returns `""`
+/// when color is disabled (see the `ANSI` accessors above).
+pub fn limit_color(pct: f64) -> &'static str {
     if pct >= 80.0 {
-        RED
+        red()
     } else if pct >= 60.0 {
-        YELLOW
+        yellow()
     } else {
-        GREEN
+        green()
     }
 }
 
@@ -200,6 +232,7 @@ pub fn format_datetime_short(dt: chrono::DateTime<chrono::Utc>) -> String {
 
 pub fn title_for<S: Source + ?Sized>(cmd: Cmd, opts: &Options, source: &S) -> String {
     let scope = match cmd {
+        Cmd::Weekly => "Weekly",
         Cmd::Monthly => "Monthly",
         Cmd::Session => "Session",
         Cmd::Blocks => "5-Hour Blocks",
@@ -216,6 +249,12 @@ pub fn title_for<S: Source + ?Sized>(cmd: Cmd, opts: &Options, source: &S) -> St
 pub fn label_for(bucket: Bucket, key: BucketKey, cache: &LoadedCache, opts: &Options) -> String {
     match bucket {
         Bucket::Day => format_date(day_to_date(key.as_i64() as i32), opts),
+        Bucket::Week => {
+            // Label a week by its Monday — same date renderer as Day so
+            // `--locale` is honored uniformly.
+            let start = crate::cache::week_start_day(key.as_i64());
+            format_date(day_to_date(start), opts)
+        }
         Bucket::Month => format_month(key),
         Bucket::Session => {
             // Session bucketing keys by project_id (matches ccusage).
@@ -344,6 +383,39 @@ pub fn apply_tail(keys: Vec<BreakdownKey>, tail: Option<u32>, bucket: Bucket) ->
         }
     }
     out
+}
+
+/// Reorder already-tail-trimmed keys for *display* per an explicit
+/// `--order`.
+///
+/// Kept separate from [`sort_keys`] + [`apply_tail`] so the "keep the N
+/// most-recent rows" semantics are computed against the natural recency
+/// order first; only the final presentation flips. `None` leaves the
+/// per-bucket default (time ascending, sessions most-recent-first)
+/// untouched.
+pub fn reorder<S: std::hash::BuildHasher>(
+    keys: &mut [BreakdownKey],
+    rollup: &std::collections::HashMap<BreakdownKey, BucketUsage, S>,
+    bucket: Bucket,
+    order: Option<crate::cli::Order>,
+) {
+    use crate::cli::Order;
+    let Some(order) = order else { return };
+    // Sessions order by recency (last_ts); time buckets by their key.
+    match bucket {
+        Bucket::Session => keys.sort_by(|a, b| {
+            let ta = rollup.get(a).map_or(0, |u| u.last_ts);
+            let tb = rollup.get(b).map_or(0, |u| u.last_ts);
+            match order {
+                Order::Asc => ta.cmp(&tb),
+                Order::Desc => tb.cmp(&ta),
+            }
+        }),
+        _ => keys.sort_by(|a, b| match order {
+            Order::Asc => a.0.cmp(&b.0),
+            Order::Desc => b.0.cmp(&a.0),
+        }),
+    }
 }
 
 // ── Model display (delegates to the provider) ──

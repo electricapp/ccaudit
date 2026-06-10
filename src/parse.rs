@@ -360,9 +360,13 @@ struct ToolInput {
 
 #[allow(clippy::indexing_slicing)] // indices are bounds-checked by b.len() >= 20
 fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
-    // Fast path for "2026-03-30T14:10:41.157Z" format (fixed layout)
+    // Fast path for "2026-03-30T14:10:41.157Z" format (fixed layout).
+    // Gated on a trailing 'Z' so a timestamp carrying a numeric offset
+    // ("…+02:00") is NOT misread as UTC — it falls through to chrono's
+    // full parser, which honors the offset. Claude Code / Codex always
+    // emit the Z form, so the fast path still covers every real line.
     let b = s.as_bytes();
-    if b.len() >= 20 && b[4] == b'-' && b[7] == b'-' && b[10] == b'T' {
+    if b.len() >= 20 && b[4] == b'-' && b[7] == b'-' && b[10] == b'T' && b.last() == Some(&b'Z') {
         let year = i32::try_from(fast_parse_u32(&b[0..4])?).ok()?;
         let month = fast_parse_u32(&b[5..7])?;
         let day = fast_parse_u32(&b[8..10])?;

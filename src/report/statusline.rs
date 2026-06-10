@@ -1,19 +1,18 @@
 // One-line status bar output: today's cost + total tokens + active
 // 5-hour block cost.
 
-use super::fmt::{DIM, RESET, YELLOW, format_cost, format_number};
+use super::fmt::{format_cost, format_number};
 use crate::cache::{BLOCK_SECS, Bucket, FilterOpts, LoadedCache, aggregate};
 use crate::cli::Options;
-use crate::source::{Source, day_to_date};
-use chrono::NaiveDate;
+use crate::source::Source;
 
 // Writes the one-line status bar summary to stdout.
 #[allow(clippy::print_stdout)]
 pub fn print<S: Source + ?Sized>(cache: &LoadedCache, opts: &Options, source: &S) {
-    let today = day_to_date(current_day(opts.tz_offset_secs));
+    let today = current_day(opts.tz_offset_secs);
     let filter = FilterOpts {
-        since_day: Some(to_days(today)),
-        until_day: Some(to_days(today)),
+        since_day: Some(today),
+        until_day: Some(today),
         project: opts.project.as_deref(),
         tz_offset_secs: opts.tz_offset_secs,
     };
@@ -33,8 +32,10 @@ pub fn print<S: Source + ?Sized>(cache: &LoadedCache, opts: &Options, source: &S
     }
     let total = input + output + cc + cr;
 
-    // Active 5h-block cost (local clock).
+    // Active 5h-block cost (local clock). Honors --project so the block
+    // figure is scoped the same way the today figure above is.
     let block_filter = FilterOpts {
+        project: opts.project.as_deref(),
         tz_offset_secs: opts.tz_offset_secs,
         ..Default::default()
     };
@@ -52,8 +53,9 @@ pub fn print<S: Source + ?Sized>(cache: &LoadedCache, opts: &Options, source: &S
         })
         .unwrap_or(0.0);
 
+    let (dim, reset, yellow) = (super::fmt::dim(), super::fmt::reset(), super::fmt::yellow());
     println!(
-        "{DIM}today{RESET} {} tok {YELLOW}{}{RESET} · {DIM}5h{RESET} {YELLOW}{}{RESET}",
+        "{dim}today{reset} {} tok {yellow}{}{reset} · {dim}5h{reset} {yellow}{}{reset}",
         format_number(total),
         format_cost(cost),
         format_cost(active_cost),
@@ -63,9 +65,4 @@ pub fn print<S: Source + ?Sized>(cache: &LoadedCache, opts: &Options, source: &S
 fn current_day(tz_offset: i32) -> i32 {
     let now = chrono::Utc::now().timestamp() + i64::from(tz_offset);
     (now.div_euclid(86_400)) as i32
-}
-
-fn to_days(d: NaiveDate) -> i32 {
-    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap_or_default();
-    d.signed_duration_since(epoch).num_days() as i32
 }

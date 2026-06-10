@@ -213,7 +213,17 @@ pub fn generate(projects: &[Project], cache: &LoadedCache, out_dir: &Path) -> st
     use rayon::prelude::*;
     let quiet = std::env::var_os("CCAUDIT_QUIET").is_some();
 
+    // Start the per-session output dir clean: sessions/projects can
+    // renumber between generates, so stale `{pi}_{si}.json` files from a
+    // previous run would otherwise linger (and stay referenced by nothing,
+    // or worse, by a now-different session). Remove just the `s/` subdir —
+    // index.html and friends in out_dir must survive — then recreate it.
     let sessions_dir = out_dir.join("s");
+    match fs::remove_dir_all(&sessions_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     fs::create_dir_all(&sessions_dir)?;
 
     // Collect all (pi, si, session) tuples for parallel processing
@@ -239,18 +249,20 @@ pub fn generate(projects: &[Project], cache: &LoadedCache, out_dir: &Path) -> st
         hourly: Vec<[u64; 5]>,
         tool_counts: FxHashMap<String, u32>,
     }
-    let per_session: Vec<PerSession> = all_sessions
+    // Each session returns a Result so a per-session JSON write failure
+    // surfaces as an io::Error instead of being silently swallowed while
+    // index.json still references the (missing/partial) file.
+    let per_session: Vec<std::io::Result<PerSession>> = all_sessions
         .par_iter()
         .map(|&(pi, si, session)| {
             let messages: Vec<parse::Message> = parse::load_messages_for(&session.file_path)
                 .or_else(|| parse::parse_session(&session.file_path).map(|s| s.messages))
                 .unwrap_or_default();
             let filename = format!("{pi}_{si}.json");
-            if let Ok(file) = fs::File::create(sessions_dir.join(&filename)) {
-                let mut w = BufWriter::new(file);
-                let _ = serde_json::to_writer(&mut w, &messages);
-                let _ = w.flush();
-            }
+            let file = fs::File::create(sessions_dir.join(&filename))?;
+            let mut w = BufWriter::new(file);
+            serde_json::to_writer(&mut w, &messages).map_err(std::io::Error::other)?;
+            w.flush()?;
             let mut words: FxHashSet<String> = FxHashSet::default();
             for msg in &messages {
                 match msg.kind {
@@ -260,13 +272,17 @@ pub fn generate(projects: &[Project], cache: &LoadedCache, out_dir: &Path) -> st
                     _ => {}
                 }
             }
-            PerSession {
+            Ok(PerSession {
                 words,
                 hourly: build_hourly_from(&messages),
                 tool_counts: build_tool_counts_from(&messages),
-            }
+            })
         })
         .collect();
+    // Propagate the first per-session error after the parallel section.
+    let per_session: Vec<PerSession> = per_session
+        .into_iter()
+        .collect::<std::io::Result<Vec<_>>>()?;
 
     // Build index sequentially. `per_session` is in flat (pi,si) order
     // matching `all_sessions`, so we pop the front of an iterator as we
@@ -388,7 +404,7 @@ pub fn generate(projects: &[Project], cache: &LoadedCache, out_dir: &Path) -> st
     // marker to that form, so the literal here must match. The
     // assert below catches a refactor that drops/renames the marker;
     // without it the design-token block silently disappears.
-    debug_assert!(
+    assert!(
         CSS.contains(TOKEN_MARKER),
         "src/web/style.css must contain `{TOKEN_MARKER}` so the build can splice in the design tokens",
     );

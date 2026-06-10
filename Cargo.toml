@@ -53,9 +53,15 @@ unicode-width = { version = "0.2", optional = true }
 # --- Optional (--features simd-json) ---
 simd-json = { version = "0.17", optional = true, default-features = false, features = ["serde_impl"] }
 
+[build-dependencies]
+# Only for formatting the UTC build timestamp in build.rs; chrono is
+# already a runtime dep so this adds no new crate to the graph.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
 [dev-dependencies]
+# serde_json is already a normal dependency (visible to tests + benches),
+# so it isn't repeated here. tempfile is test/bench-only.
 tempfile = "3"
-serde_json = "1"
 
 # Hand-rolled bench (own main, no libtest harness) so `cargo bench` runs it.
 [[bench]]
@@ -100,8 +106,8 @@ get_unwrap = "deny"
 # `clippy::cargo` catches things like wildcard deps + negative feature
 # names. `multiple_crate_versions` is opted out because it fires on
 # transitive dep graphs — we can't dedupe versions pulled in by indirect
-# dependencies (e.g. ratatui + bincode bringing in two `syn` majors)
-# without patching upstream.
+# dependencies (transitive crates routinely pull in two majors of a
+# shared dep like `syn` or `windows-sys`) without patching upstream.
 multiple_crate_versions = "allow"
 cast_possible_truncation = "allow"
 cast_precision_loss = "allow"
@@ -115,13 +121,9 @@ use_self = "allow"
 too_many_lines = "allow"
 if_not_else = "allow"
 collapsible_if = "allow"
-collapsible_else_if = "allow"
-redundant_closure_for_method_calls = "allow"
-unnested_or_patterns = "allow"
 items_after_statements = "allow"
 map_unwrap_or = "allow"
 struct_field_names = "allow"
-needless_raw_string_hashes = "allow"
 
 [profile.release]
 # `3` over `z`: this binary is CPU-bound on the cache aggregation /

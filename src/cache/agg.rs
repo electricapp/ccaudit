@@ -1,10 +1,10 @@
 // Aggregation: cache + filter + bucket → FxHashMap<BreakdownKey, BucketUsage>.
 //
 // Two paths:
-//   • UTC day/month → summed directly from pre-aggregated rows. No
+//   • UTC day/week/month → summed directly from pre-aggregated rows. No
 //     per-line walk, no dedup hashset, zero provider calls.
 //   • Everything else (session, block, non-UTC) → walks per-line data
-//     with cross-session dedup, calling `source.price` per row.
+//     with cross-session dedup, pricing each row via `source.price_columns`.
 
 use super::load::LoadedCache;
 use crate::source::{Source, day_to_date};
@@ -14,9 +14,74 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 #[derive(Clone, Copy, Debug)]
 pub enum Bucket {
     Day,
+    Week, // Monday-anchored calendar weeks
     Month,
     Session,
     Block, // 5-hour billing windows aligned to unix epoch
+}
+
+/// Monday-anchored week index for a day-since-epoch. 1970-01-01 was a
+/// Thursday (day 0); `+3` shifts the week boundary so that each bucket
+/// runs Monday→Sunday. The matching label start-day is `index*7 - 3`.
+pub const fn week_index(day: i32) -> i64 {
+    ((day as i64) + 3).div_euclid(7)
+}
+
+/// Inverse of [`week_index`]: the day-since-epoch of that week's Monday.
+pub const fn week_start_day(index: i64) -> i32 {
+    (index * 7 - 3) as i32
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod week_tests {
+    use super::*;
+    use crate::source::day_to_date;
+
+    // day-since-epoch for a few known dates (UTC):
+    //   1970-01-01 = day 0 (Thursday)
+    //   2026-06-01 = Monday; 2026-06-07 = Sunday (same week)
+    fn day_of(y: i32, m: u32, d: u32) -> i32 {
+        use chrono::NaiveDate;
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .signed_duration_since(epoch)
+            .num_days() as i32
+    }
+
+    #[test]
+    fn week_groups_monday_through_sunday() {
+        let mon = day_of(2026, 6, 1);
+        let sun = day_of(2026, 6, 7);
+        let next_mon = day_of(2026, 6, 8);
+        assert_eq!(week_index(mon), week_index(sun), "Mon..Sun share a week");
+        assert_ne!(
+            week_index(sun),
+            week_index(next_mon),
+            "next Mon is a new week"
+        );
+    }
+
+    #[test]
+    fn week_start_day_is_the_monday() {
+        for &(y, m, d) in &[(2026, 6, 1), (2026, 6, 4), (2026, 6, 7)] {
+            let idx = week_index(day_of(y, m, d));
+            let start = day_to_date(week_start_day(idx));
+            use chrono::Datelike;
+            assert_eq!(
+                start.weekday(),
+                chrono::Weekday::Mon,
+                "week start for {y}-{m}-{d} must be a Monday, got {start}"
+            );
+        }
+    }
+
+    #[test]
+    fn week_index_round_trips_through_start() {
+        let idx = week_index(day_of(2026, 6, 3));
+        assert_eq!(week_index(week_start_day(idx)), idx);
+    }
 }
 
 /// Inclusive date / project / timezone filter applied during aggregation.
@@ -70,6 +135,14 @@ pub struct BucketUsage {
     pub cache_read: u64,
     pub cache_create: u64,
     pub cost: f64,
+    // Per-column dollar costs, carried alongside the total so renderers
+    // can show the column split ("Total Prices" row) summed over exactly
+    // the same rows that produced `cost` — honoring tz/filter/--tail
+    // trimming instead of re-deriving from the unfiltered preagg table.
+    pub cost_input: f64,
+    pub cost_output: f64,
+    pub cost_cache_create: f64,
+    pub cost_cache_read: f64,
     pub models: U64Bitset,
     pub projects: U64Bitset,
     pub line_count: u32,
@@ -124,6 +197,9 @@ pub fn per_session_totals<S: Source + ?Sized>(
     let mut out: FxHashMap<u64, SessionTotals> =
         FxHashMap::with_capacity_and_hasher(sessions_s.len(), FxBuildHasher);
 
+    // One rate lookup per distinct model, reused for every line.
+    let rates = crate::source::ModelRates::build(source, &cache.models);
+
     for sess in sessions_s {
         let lo = sess.line_start as usize;
         let hi = lo + sess.line_count as usize;
@@ -140,16 +216,11 @@ pub fn per_session_totals<S: Source + ?Sized>(
             } else {
                 line.model_id
             };
-            let model_name: Option<&str> = if mid == u16::MAX {
-                None
-            } else {
-                cache.models.get(mid as usize).map(String::as_str)
-            };
-            if model_name.is_some_and(|m| source.skip_model(m)) {
+            if rates.skip(mid) {
                 continue;
             }
-            let [ci, co, ccw, ccr] = source.price_columns(
-                model_name,
+            let [ci, co, ccw, ccr] = rates.columns(
+                mid,
                 u64::from(line.input),
                 u64::from(line.output),
                 u64::from(line.cache_create),
@@ -194,7 +265,7 @@ pub fn aggregate<S: Source + ?Sized>(
     // `last_ts` precision — preaggs only store per-day granularity
     // so the "most recent" sort can't distinguish two sessions on the
     // same day. Block bucketing also needs per-line ts.
-    if opts.tz_offset_secs == 0 && matches!(bucket, Bucket::Day | Bucket::Month) {
+    if opts.tz_offset_secs == 0 && matches!(bucket, Bucket::Day | Bucket::Week | Bucket::Month) {
         return aggregate_from_preaggs(cache, bucket, opts, breakdown);
     }
 
@@ -210,16 +281,19 @@ pub fn aggregate<S: Source + ?Sized>(
     let lines_s = cache.lines();
     let ts_s = cache.ts_unix();
 
-    let mut seen: FxHashSet<u64> = FxHashSet::with_capacity_and_hasher(
-        lines_s.len().saturating_mul(2).max(1024),
-        FxBuildHasher,
-    );
+    // At most one insert per line, and `with_capacity(n)` reserves enough
+    // for `n` inserts without rehashing — so size at the line count, not 2×.
+    let mut seen: FxHashSet<u64> =
+        FxHashSet::with_capacity_and_hasher(lines_s.len().max(1024), FxBuildHasher);
     // Pre-size to a realistic ceiling rather than the line count — live
     // aggregate folds 50k lines into ~30–500 bucket rows. Starting at 64
     // covers the common case (daily/monthly) without rehashing; larger
     // result sets (blocks over months) still grow but only once.
     let mut out: FxHashMap<BreakdownKey, BucketUsage> =
         FxHashMap::with_capacity_and_hasher(64, FxBuildHasher);
+
+    // One rate lookup per distinct model, reused for every line.
+    let rates = crate::source::ModelRates::build(source, &cache.models);
 
     // Sessions are stored chronologically at cache-build time so walking
     // in natural order is the same as sorting by `started_at`. Skipping
@@ -238,6 +312,15 @@ pub fn aggregate<S: Source + ?Sized>(
             .iter()
             .enumerate()
         {
+            // Cross-session dedup FIRST, before the date filter — claim
+            // each message at its earliest occurrence regardless of the
+            // window. This matches the build-time preagg dedup (which runs
+            // before any filtering); filtering first would let a message
+            // whose earliest copy falls outside --since/--until reappear
+            // and be counted on a later in-window duplicate.
+            if (line.flags & 1) != 0 && !seen.insert(line.msg_id_hash) {
+                continue;
+            }
             let line_global_idx = sess.line_start as usize + local_i;
             let ts_unix = ts_s.get(line_global_idx).copied().unwrap_or(0);
             // Effective day respects --timezone so --since/--until and
@@ -259,25 +342,16 @@ pub fn aggregate<S: Source + ?Sized>(
                     continue;
                 }
             }
-            // Cross-session dedup
-            if (line.flags & 1) != 0 && !seen.insert(line.msg_id_hash) {
-                continue;
-            }
             let mid = if line.model_id != u16::MAX {
                 line.model_id
             } else {
                 fallback_model_id
             };
-            let model_name: Option<&str> = if mid == u16::MAX {
-                None
-            } else {
-                cache.models.get(mid as usize).map(String::as_str)
-            };
-            if model_name.is_some_and(|m| source.skip_model(m)) {
+            if rates.skip(mid) {
                 continue;
             }
-            let cost = source.compute_cost(
-                model_name,
+            let [ci, co, ccw, ccr] = rates.columns(
+                mid,
                 u64::from(line.input),
                 u64::from(line.output),
                 u64::from(line.cache_create),
@@ -286,6 +360,7 @@ pub fn aggregate<S: Source + ?Sized>(
 
             let key = match bucket {
                 Bucket::Day => BucketKey(i64::from(effective_day)),
+                Bucket::Week => BucketKey(week_index(effective_day)),
                 Bucket::Month => {
                     let d = day_to_date(effective_day);
                     use chrono::Datelike;
@@ -314,7 +389,11 @@ pub fn aggregate<S: Source + ?Sized>(
             entry.output += u64::from(line.output);
             entry.cache_read += u64::from(line.cache_read);
             entry.cache_create += u64::from(line.cache_create);
-            entry.cost += cost;
+            entry.cost_input += ci;
+            entry.cost_output += co;
+            entry.cost_cache_create += ccw;
+            entry.cost_cache_read += ccr;
+            entry.cost += ci + co + ccw + ccr;
             entry.line_count += 1;
             entry.last_ts = entry.last_ts.max(ts_unix);
         }
@@ -361,6 +440,7 @@ fn aggregate_from_preaggs(
 
         let key = match bucket {
             Bucket::Day => BucketKey(i64::from(p.day)),
+            Bucket::Week => BucketKey(week_index(p.day)),
             Bucket::Month => {
                 let d = day_to_date(p.day);
                 use chrono::Datelike;
@@ -368,9 +448,9 @@ fn aggregate_from_preaggs(
             }
             Bucket::Session => BucketKey(i64::from(p.project_id)),
             // The fast-path guard in `aggregate` only dispatches here for
-            // Day/Month (see the `matches!(bucket, Bucket::Day | Bucket::Month)`
-            // check). Block bucketing needs sub-day `ts_unix` precision the
-            // preaggs don't carry, so it lives on the slow path.
+            // Day/Week/Month (see its `matches!` check). Session and Block
+            // bucketing need sub-day `ts_unix` precision the preaggs don't
+            // carry, so they live on the slow path.
             #[allow(clippy::unreachable)]
             Bucket::Block => unreachable!("blocks need per-line ts; not on fast path"),
         };
@@ -382,6 +462,10 @@ fn aggregate_from_preaggs(
         entry.output += u64::from(p.output);
         entry.cache_read += u64::from(p.cache_read);
         entry.cache_create += u64::from(p.cache_create);
+        entry.cost_input += p.cost_input;
+        entry.cost_output += p.cost_output;
+        entry.cost_cache_create += p.cost_cache_create;
+        entry.cost_cache_read += p.cost_cache_read;
         entry.cost += p.total_cost();
         entry.line_count += p.line_count;
         // Track the latest day this bucket saw activity. Day-granularity

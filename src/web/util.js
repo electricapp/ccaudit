@@ -49,13 +49,19 @@ function fd(iso) {
   return mo + '&nbsp;' + dayPad + '&nbsp;' + hh + ':' + mm;
 }
 
-// Minimal HTML escape. Not a bullet-proof XSS shield — just enough to
-// let us interpolate untrusted strings into innerHTML without breaking
-// the tree. We never interpolate into attributes, so attribute escaping
-// is handled by the caller quoting properly.
+// Minimal HTML escape. Covers element-content contexts (innerHTML) AND
+// double-/single-quoted attribute contexts: callers interpolate into
+// attributes like data-model="' + esc(...) + '" and data-tip="' + esc(...),
+// so a quote in a model/tool/project name must not break out. Escaping
+// quotes is harmless in element-content contexts too.
 function esc(s) {
   if (!s) return '';
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // Human duration from ms: "42s", "5m 12s", "2h 10m", "3d 4h".

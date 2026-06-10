@@ -1,9 +1,9 @@
 // Box-drawing table renderer for daily/monthly/session/blocks.
 
 use super::fmt::{
-    COMPACT, LIMIT_CELL_WIDTH, NORMAL, RESET, Widths, YELLOW, apply_tail, format_cost,
-    format_limit_cell, format_number, label_for, limit_color, normalize_model, sort_keys,
-    title_for, write_cost, write_number, write_title,
+    COMPACT, LIMIT_CELL_WIDTH, NORMAL, Widths, apply_tail, format_cost, format_limit_cell,
+    format_number, label_for, limit_color, normalize_model, sort_keys, title_for, write_cost,
+    write_number, write_title,
 };
 use crate::cache::{BLOCK_SECS, BreakdownKey, Bucket, BucketKey, BucketUsage, LoadedCache};
 use crate::cli::Options;
@@ -22,7 +22,7 @@ pub fn print<S: Source + ?Sized>(
     // Override label width per bucket; session also gets a trailing
     // "Last Activity" column to mirror ccusage.
     let label_w = match bucket {
-        Bucket::Day => base.label.max(10),
+        Bucket::Day | Bucket::Week => base.label.max(10),
         Bucket::Month => base.label.max(7),
         // Session labels are now the ccusage-style stem (e.g.
         // "code-ccaudit"), comfortably under 22 chars.
@@ -42,10 +42,18 @@ pub fn print<S: Source + ?Sized>(
     } else {
         0
     };
-    // Limit column: only on `blocks` + --cost-limit. Width fits
-    // "XXX.X% ████████" (LIMIT_CELL_WIDTH).
+    // Limit header embeds the dollar cap so the reader doesn't have to
+    // remember the --cost-limit arg they passed.
+    let limit_hdr = opts
+        .cost_limit
+        .map(|c| format!("Limit ({})", format_cost(c)))
+        .unwrap_or_default();
+    // Limit column: only on `blocks` + --cost-limit. Width fits both the
+    // data cell ("XXX.X% ████████" = LIMIT_CELL_WIDTH) and the header, so
+    // a large cap like `--cost-limit 1000` doesn't push the header past
+    // the box border.
     let limit_w = if matches!(bucket, Bucket::Block) && opts.cost_limit.is_some() {
-        LIMIT_CELL_WIDTH
+        LIMIT_CELL_WIDTH.max(limit_hdr.chars().count())
     } else {
         0
     };
@@ -60,7 +68,8 @@ pub fn print<S: Source + ?Sized>(
 
     write_title(&mut buf, &title_for(opts.cmd, opts, source));
 
-    let keys = apply_tail(sort_keys(rollup, bucket), opts.tail, bucket);
+    let mut keys = apply_tail(sort_keys(rollup, bucket), opts.tail, bucket);
+    super::fmt::reorder(&mut keys, rollup, bucket, opts.order);
 
     // --breakdown splits one bucket into many rows (one per model); we
     // want the limit % to reflect the *bucket's* total cost, not a
@@ -84,6 +93,7 @@ pub fn print<S: Source + ?Sized>(
 
     let header_label = match bucket {
         Bucket::Day => "Date",
+        Bucket::Week => "Week",
         Bucket::Month => "Month",
         Bucket::Session => "Session",
         Bucket::Block => "Block Start",
@@ -98,12 +108,6 @@ pub fn print<S: Source + ?Sized>(
     let bot_hline = build_hline(w, '└', '┴', '┘');
 
     buf.push_str(&top_hline);
-    // Limit header embeds the dollar cap so the reader doesn't have to
-    // remember the --cost-limit arg they passed.
-    let limit_hdr = opts
-        .cost_limit
-        .map(|c| format!("Limit ({})", format_cost(c)))
-        .unwrap_or_default();
     write_row(
         &mut buf,
         w,
@@ -131,6 +135,13 @@ pub fn print<S: Source + ?Sized>(
     let mut tot_cache_w = 0u64;
     let mut tot_cache_r = 0u64;
     let mut tot_cost = 0.0f64;
+    // Per-column dollar totals, summed over the exact rows rendered below
+    // so the "Total Prices" row always reconciles with "Total" — including
+    // under --tail, blocks --active/--recent, and non-UTC timezones.
+    let mut tot_cost_in = 0.0f64;
+    let mut tot_cost_out = 0.0f64;
+    let mut tot_cost_cache_w = 0.0f64;
+    let mut tot_cost_cache_r = 0.0f64;
 
     // --breakdown emits the same BucketKey once per model; group them
     // under the outer label so the date/session prints once.
@@ -151,6 +162,10 @@ pub fn print<S: Source + ?Sized>(
         tot_cache_w += u.cache_create;
         tot_cache_r += u.cache_read;
         tot_cost += u.cost;
+        tot_cost_in += u.cost_input;
+        tot_cost_out += u.cost_output;
+        tot_cost_cache_w += u.cost_cache_create;
+        tot_cost_cache_r += u.cost_cache_read;
 
         let bucket_label = label_for(bucket, k.0, cache, opts);
         let is_new_group = current_label.as_deref() != Some(bucket_label.as_str());
@@ -285,27 +300,21 @@ pub fn print<S: Source + ?Sized>(
     // Per-column dollar cost. We already know token counts per column;
     // this row shows the dollars attributable to each column so you can
     // see which token type is actually driving spend (usually cache-
-    // create for heavy contexts, output for agentic loops). Summed
-    // across columns they equal the Total Cost row above.
-    let filter = crate::cache::FilterOpts {
-        since_day: opts.since,
-        until_day: opts.until,
-        project: opts.project.as_deref(),
-        tz_offset_secs: opts.tz_offset_secs,
-    };
-    let _ = source; // no longer used at render time (per-column costs baked into preaggs)
-    let costs = column_costs(cache, &filter);
+    // create for heavy contexts, output for agentic loops). These are
+    // summed over the same rows as "Total" above, so the four columns add
+    // up to the Total Cost row exactly.
+    let total_prices = tot_cost_in + tot_cost_out + tot_cost_cache_w + tot_cost_cache_r;
     buf.push_str(&mid_hline);
     write_rates_row(
         &mut buf,
         w,
         "Total Prices",
         [
-            &format_cost(costs.input),
-            &format_cost(costs.output),
-            &format_cost(costs.cache_create),
-            &format_cost(costs.cache_read),
-            &format_cost(costs.total),
+            &format_cost(tot_cost_in),
+            &format_cost(tot_cost_out),
+            &format_cost(tot_cost_cache_w),
+            &format_cost(tot_cost_cache_r),
+            &format_cost(total_prices),
             "", // cost column intentionally left blank (it's in the row above)
         ],
     );
@@ -325,57 +334,74 @@ pub fn print<S: Source + ?Sized>(
     let _ = lock.write_all(buf.as_bytes());
 }
 
-// ── Per-column cost breakdown ──
+/// Plain, machine-readable rendering for `--plain`: one tab-separated
+/// record per row, raw integers (no thousands separators), raw cost
+/// (no `$`), no box-drawing, no color — so `grep`/`awk`/`cut` work
+/// without fighting the pretty table. A single leading `#` header line
+/// names the columns; everything after is data. This is clig.dev's
+/// "provide a --plain for scripts" guideline.
+pub fn print_plain<S: Source + ?Sized>(
+    cache: &LoadedCache,
+    rollup: &FxHashMap<BreakdownKey, BucketUsage>,
+    opts: &Options,
+    bucket: Bucket,
+    source: &S,
+) {
+    use std::fmt::Write as _;
+    let mut keys = apply_tail(sort_keys(rollup, bucket), opts.tail, bucket);
+    super::fmt::reorder(&mut keys, rollup, bucket, opts.order);
 
-struct ColumnCosts {
-    input: f64,        // dollars for all input tokens
-    output: f64,       // dollars for all output tokens
-    cache_create: f64, // dollars for all cache-write tokens
-    cache_read: f64,   // dollars for all cache-read tokens
-    total: f64,        // sum of the above; equals the Total Cost row
-}
-
-fn column_costs(cache: &LoadedCache, filter: &crate::cache::FilterOpts) -> ColumnCosts {
-    // Per-column costs are baked into each preagg at build time — this
-    // just sums them with the same filter as the aggregator above.
-    // Zero price lookups, no prices.json parse on the hot path.
-    let project_id = filter.project.and_then(|name| {
-        cache
-            .projects
-            .iter()
-            .position(|p| p == name)
-            .map(|i| i as u16)
-    });
-
-    let mut c = ColumnCosts {
-        input: 0.0,
-        output: 0.0,
-        cache_create: 0.0,
-        cache_read: 0.0,
-        total: 0.0,
+    let first_col = match bucket {
+        Bucket::Day => "date",
+        Bucket::Week => "week",
+        Bucket::Month => "month",
+        Bucket::Session => "session",
+        Bucket::Block => "block_start",
     };
+    let second_col = if opts.instances { "projects" } else { "models" };
 
-    for p in cache.preaggs() {
-        if let Some(s) = filter.since_day {
-            if p.day < s {
-                continue;
-            }
-        }
-        if let Some(u) = filter.until_day {
-            if p.day > u {
-                continue;
-            }
-        }
-        if project_id.is_some() && Some(p.project_id) != project_id {
-            continue;
-        }
-        c.input += p.cost_input;
-        c.output += p.cost_output;
-        c.cache_create += p.cost_cache_create;
-        c.cache_read += p.cost_cache_read;
+    let mut buf = String::with_capacity(8_192);
+    let _ = writeln!(
+        buf,
+        "#{first_col}\t{second_col}\tinput\toutput\tcache_create\tcache_read\ttotal\tcost_usd"
+    );
+
+    for k in &keys {
+        let Some(u) = rollup.get(k) else { continue };
+        let label = label_for(bucket, k.0, cache, opts);
+        // Second column: a comma-joined set (no leading "- ", no
+        // wrapping) so the whole record stays on one line.
+        let second: String = if opts.instances {
+            u.projects
+                .iter()
+                .filter_map(|pid| cache.projects.get(pid as usize).map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(",")
+        } else if opts.breakdown && k.1 != u16::MAX {
+            cache
+                .models
+                .get(k.1 as usize)
+                .map(|m| normalize_model(source, m).into_owned())
+                .unwrap_or_default()
+        } else {
+            u.models
+                .iter()
+                .filter_map(|mid| cache.models.get(mid as usize))
+                .map(|m| normalize_model(source, m).into_owned())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let total = u.input + u.output + u.cache_create + u.cache_read;
+        let _ = writeln!(
+            buf,
+            "{label}\t{second}\t{}\t{}\t{}\t{}\t{}\t{:.4}",
+            u.input, u.output, u.cache_create, u.cache_read, total, u.cost,
+        );
     }
-    c.total = c.input + c.output + c.cache_create + c.cache_read;
-    c
+
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let _ = lock.write_all(buf.as_bytes());
 }
 
 // Format last-activity cell as a date string from a unix-seconds value,
@@ -467,18 +493,33 @@ struct Row<'a> {
     limit_color: Option<&'static str>,
 }
 
+// Truncate a variable-width cell (label / model / date) to `w` display
+// columns with a trailing ellipsis, so an over-long session name or
+// localized date can't overrun the column and break box alignment.
+// Returns `Borrowed` (no allocation) for the common in-width case.
+fn fit_cell(s: &str, w: usize) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if w == 0 || s.chars().count() <= w {
+        return Cow::Borrowed(s);
+    }
+    let mut out: String = s.chars().take(w.saturating_sub(1)).collect();
+    out.push('…');
+    Cow::Owned(out)
+}
+
 fn write_row(buf: &mut String, w: &Widths, r: &Row<'_>) {
     use std::fmt::Write as _;
+    let reset = super::fmt::reset();
     let (pre, post) = if r.highlight {
-        (YELLOW, RESET)
+        (super::fmt::yellow(), reset)
     } else {
         ("", "")
     };
+    let label = fit_cell(r.label, w.label);
+    let extra = fit_cell(r.extra, w.models);
     let _ = write!(
         buf,
         "│ {pre}{label:<w_label$}{post} │ {pre}{extra:<w_models$}{post}",
-        label = r.label,
-        extra = r.extra,
         w_label = w.label,
         w_models = w.models,
     );
@@ -486,16 +527,12 @@ fn write_row(buf: &mut String, w: &Widths, r: &Row<'_>) {
         let _ = write!(buf, " │ {pre}{v:>w$}{post}", w = *cw);
     }
     if w.last_activity > 0 {
-        let _ = write!(
-            buf,
-            " │ {pre}{tail:<w$}{post}",
-            tail = r.tail,
-            w = w.last_activity,
-        );
+        let tail = fit_cell(r.tail, w.last_activity);
+        let _ = write!(buf, " │ {pre}{tail:<w$}{post}", w = w.last_activity);
     }
     if w.limit > 0 {
         let (lpre, lpost) = match r.limit_color {
-            Some(c) => (c, RESET),
+            Some(c) => (c, reset),
             None => (pre, post),
         };
         let _ = write!(
@@ -510,15 +547,16 @@ fn write_row(buf: &mut String, w: &Widths, r: &Row<'_>) {
 
 fn write_total(buf: &mut String, w: &Widths, label: &str, nums: [&str; 6]) {
     use std::fmt::Write as _;
+    let (yellow, reset) = (super::fmt::yellow(), super::fmt::reset());
     let _ = write!(
         buf,
-        "│ {YELLOW}{label:<w_label$}{RESET} │ {blank:<w_models$}",
+        "│ {yellow}{label:<w_label$}{reset} │ {blank:<w_models$}",
         w_label = w.label,
         w_models = w.models,
         blank = "",
     );
     for (v, cw) in nums.iter().zip(num_widths(w).iter()) {
-        let _ = write!(buf, " │ {YELLOW}{v:>w$}{RESET}", w = *cw);
+        let _ = write!(buf, " │ {yellow}{v:>w$}{reset}", w = *cw);
     }
     if w.last_activity > 0 {
         let _ = write!(buf, " │ {blank:<w$}", w = w.last_activity, blank = "");
@@ -532,17 +570,17 @@ fn write_total(buf: &mut String, w: &Widths, label: &str, nums: [&str; 6]) {
 // Dim counterpart to write_total, used for the "Total Prices" row so
 // it reads as supplementary context instead of a second primary total.
 fn write_rates_row(buf: &mut String, w: &Widths, label: &str, nums: [&str; 6]) {
-    use super::fmt::DIM;
     use std::fmt::Write as _;
+    let (dim, reset) = (super::fmt::dim(), super::fmt::reset());
     let _ = write!(
         buf,
-        "│ {DIM}{label:<w_label$}{RESET} │ {blank:<w_models$}",
+        "│ {dim}{label:<w_label$}{reset} │ {blank:<w_models$}",
         w_label = w.label,
         w_models = w.models,
         blank = "",
     );
     for (v, cw) in nums.iter().zip(num_widths(w).iter()) {
-        let _ = write!(buf, " │ {DIM}{v:>w$}{RESET}", w = *cw);
+        let _ = write!(buf, " │ {dim}{v:>w$}{reset}", w = *cw);
     }
     if w.last_activity > 0 {
         let _ = write!(buf, " │ {blank:<w$}", w = w.last_activity, blank = "");

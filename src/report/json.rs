@@ -1,6 +1,6 @@
 // JSON output mirroring what ccusage emits with --json.
 
-use super::fmt::{apply_tail, label_for, sort_keys};
+use super::fmt::{apply_tail, label_for, reorder, sort_keys};
 use crate::cache::{BLOCK_SECS, BreakdownKey, Bucket, BucketKey, BucketUsage, LoadedCache};
 use crate::cli::{Cmd, Options};
 use crate::source::Source;
@@ -64,7 +64,8 @@ pub fn print<S: Source + ?Sized>(
     bucket: Bucket,
     _source: &S,
 ) {
-    let keys = apply_tail(sort_keys(rollup, bucket), opts.tail, bucket);
+    let mut keys = apply_tail(sort_keys(rollup, bucket), opts.tail, bucket);
+    reorder(&mut keys, rollup, bucket, opts.order);
     let now = chrono::Utc::now().timestamp();
 
     // Bucket-total costs for --cost-limit pct (see table.rs for the
@@ -140,7 +141,7 @@ pub fn print<S: Source + ?Sized>(
     // reached for a non-report command (shouldn't happen — guarded
     // upstream — but stay defensive).
     let cmd_str = match opts.cmd {
-        Cmd::Monthly | Cmd::Session | Cmd::Blocks => opts.cmd.as_str(),
+        Cmd::Weekly | Cmd::Monthly | Cmd::Session | Cmd::Blocks => opts.cmd.as_str(),
         _ => Cmd::Daily.as_str(),
     };
     let carbon = if opts.carbon {

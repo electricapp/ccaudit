@@ -26,9 +26,6 @@ const ATTR_FILE_DATALENGTH: u32 = 0x0000_0200;
 // Vnode object types
 const VREG: u32 = 1;
 
-// Flags
-const FSOPT_PACK_INVAL_ATTRS: u64 = 0x0000_0008;
-
 // O_RDONLY; libc is already pulled in transitively by chrono/rayon but
 // we'd rather not depend on it explicitly. Raw constants keep the FFI
 // surface self-contained.
@@ -114,15 +111,12 @@ pub fn scan(dir: &Path) -> Option<Vec<BulkEntry>> {
 
     loop {
         let alist_ptr: *const Attrlist = &raw const alist;
-        let n = unsafe {
-            getattrlistbulk(
-                fd,
-                alist_ptr,
-                buf.as_mut_ptr(),
-                buf.len(),
-                FSOPT_PACK_INVAL_ATTRS,
-            )
-        };
+        // options = 0 (no FSOPT_PACK_INVAL_ATTRS): the kernel packs ONLY
+        // the attrs it actually returned, which is exactly what
+        // `parse_entry` assumes when it advances the cursor only for
+        // RETURNED_ATTRS-flagged fields. Packing invalid attrs zero-filled
+        // would desync that conditional walk.
+        let n = unsafe { getattrlistbulk(fd, alist_ptr, buf.as_mut_ptr(), buf.len(), 0) };
         if n == 0 {
             break; // end of directory
         }
@@ -233,13 +227,20 @@ fn parse_entry(buf: &[u8], start: usize) -> Option<ParsedEntry> {
 
     // Name lives at `name_ref_pos + attr_dataoffset`. `attr_length`
     // includes the trailing NUL. `name_ref_pos` is bounded by `buf.len()`
-    // (≤ 32K) so the isize cast is fine on any 32/64-bit target.
-    let name_abs =
-        (name_ref_pos.cast_signed()).checked_add(nref.attr_dataoffset as isize)? as usize;
-    if nref.attr_length == 0 {
+    // (≤ 32K) so the isize cast is fine on any 32/64-bit target. A negative
+    // resolved offset (corrupt kernel data) is rejected rather than wrapped.
+    let name_abs_signed = name_ref_pos
+        .cast_signed()
+        .checked_add(nref.attr_dataoffset as isize)?;
+    if name_abs_signed < 0 || nref.attr_length == 0 {
         return None;
     }
-    let end = name_abs + nref.attr_length as usize - 1; // drop trailing NUL
+    let name_abs = name_abs_signed as usize;
+    // Checked end so a corrupt attr_length can't overflow (debug panic) —
+    // out-of-range simply falls back to the portable scan via `None`.
+    let end = name_abs
+        .checked_add(nref.attr_length as usize)?
+        .checked_sub(1)?; // drop trailing NUL
     let name_bytes = buf.get(name_abs..end)?;
     let name = std::str::from_utf8(name_bytes).ok()?.to_string();
 

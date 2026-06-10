@@ -53,7 +53,8 @@ impl Source for Codex {
             }
         }
         // Hardcoded fallback (April 2026 OpenAI list prices). Refresh via
-        // `ccaudit refresh-prices --source codex` to pick up LiteLLM rates.
+        // `ccaudit refresh-prices` to pick up LiteLLM rates (prices.json is
+        // shared across providers).
         match model.unwrap_or("") {
             m if m.contains("mini") => &GPT5_MINI,
             m if m.contains("nano") => &GPT5_NANO,
@@ -265,6 +266,12 @@ fn parse_codex_session(src: &SourceFile) -> Option<ParsedSession> {
                     if session_model.is_none() {
                         session_model = Some(m.clone());
                     }
+                    // On a model switch, clear the consecutive-dup guard so
+                    // an identical token triple under a *different* model
+                    // isn't wrongly skipped.
+                    if current_model.as_deref() != Some(m.as_str()) {
+                        last_token_hash = None;
+                    }
                     current_model = Some(m);
                 }
             }
@@ -291,6 +298,15 @@ fn parse_codex_session(src: &SourceFile) -> Option<ParsedSession> {
                 let total_input = u.input_tokens.max(0) as u64;
                 let uncached = total_input.saturating_sub(cached);
                 let output = u.output_tokens.max(0) as u64;
+                // Local consecutive-dup guard ONLY: Codex re-emits an
+                // identical `last_token_usage` on rate-limit-only updates
+                // (upstream #14489), so skip a triple that exactly repeats
+                // the previous one under the same model. We deliberately
+                // emit `msg_id_hash: None` rather than hashing the triple
+                // into a global message id — Codex has no real message ids,
+                // and two genuinely distinct calls (other sessions, or
+                // non-consecutive in this one) can share a token triple;
+                // using it as a global dedup key silently undercounts them.
                 let mut buf = [0u8; 24];
                 buf[0..8].copy_from_slice(&uncached.to_le_bytes());
                 buf[8..16].copy_from_slice(&cached.to_le_bytes());
@@ -302,7 +318,7 @@ fn parse_codex_session(src: &SourceFile) -> Option<ParsedSession> {
                 last_token_hash = Some(h);
                 lines.push(ParsedLine {
                     day: day_from_ts(line.timestamp),
-                    msg_id_hash: Some(h),
+                    msg_id_hash: None,
                     model: current_model.clone(),
                     input: uncached.min(u64::from(u32::MAX)) as u32,
                     output: output.min(u64::from(u32::MAX)) as u32,
@@ -322,10 +338,19 @@ fn parse_codex_session(src: &SourceFile) -> Option<ParsedSession> {
 
     let display_name = first_user_msg
         .as_deref()
-        .map(sanitize)
+        .map(super::sanitize_control)
         .unwrap_or_else(|| session_id.clone());
 
     let project_name = cwd.as_deref().map(super::prettify_cwd);
+
+    // Fall back to the first billable line's timestamp when the
+    // `session_meta` line is missing/truncated, so the cache doesn't sort
+    // this session to `i64::MIN` (the chronological front) at build time.
+    let started_at = started_at.or_else(|| {
+        ts_unix
+            .first()
+            .and_then(|&t| DateTime::from_timestamp(t, 0))
+    });
 
     Some(ParsedSession {
         path_hash: src.path_hash,
@@ -339,12 +364,6 @@ fn parse_codex_session(src: &SourceFile) -> Option<ParsedSession> {
         lines,
         ts_unix,
     })
-}
-
-fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
 }
 
 #[cfg(test)]

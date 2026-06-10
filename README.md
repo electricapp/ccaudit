@@ -59,7 +59,7 @@ Same input (`~/.claude/projects/`), same logical question ("daily token totals")
 ```
 ccaudit daily — warm cache (~70 ms)
 ─────────────────────────────────────────────
-  mmap usage.db  (3 MB binary, already bucketed by day × model)
+  mmap claude-code.db / codex.db  (3 MB binary, already bucketed by day × model)
        │
        ▼
   sum PreAgg cells
@@ -170,13 +170,13 @@ ccaudit keeps two purpose-built caches under `~/.claude/ccaudit-cache/`. CLI rep
 ├── <hash>.meta              ◄── per-session cache (TUI + web)
 └── <hash>.bin                   one pair per JSONL file —
                                  full parsed Session struct, every
-                                 message, every tool call, bincoded
+                                 message, every tool call, postcard-encoded
                                  (validated by mtime + size + version)
 ```
 
 **CLI** (`daily` / `monthly` / `session` / `blocks` / `statusline`) reads only `<source>.db` — no per-message data needed for token totals.
 
-**TUI** (`ccaudit tui`) reads only the per-session `.bin` files. On startup, `load_all_projects()` walks every JSONL; for each file it stat's `mtime + size`, hits the matching `.bin` if those match the meta, and bincode-deserializes straight into a `Session`. A miss triggers a reparse + cache rewrite for next time. Once everything is in memory, navigation, search, dashboard, scope filters — all in-memory, zero IO. Pressing `c` exec's `claude -r <id>` against the current session.
+**TUI** (`ccaudit tui`) reads only the per-session `.bin` files. On startup, `load_all_projects()` walks every JSONL; for each file it stat's `mtime + size`, hits the matching `.bin` if those match the meta, and postcard-deserializes straight into a `Session`. A miss triggers a reparse + cache rewrite for next time. Once everything is in memory, navigation, search, dashboard, scope filters — all in-memory, zero IO. Pressing `c` exec's `claude -r <id>` against the current session.
 
 **Web** (`ccaudit web`) reuses the same per-session cache for the parse step, then materializes the browser-side cache as static files under `~/.claude/ccaudit-web/`:
 
@@ -232,19 +232,21 @@ time, the Python/JS shims just locate and `exec` the binary.
 
 ```bash
 ccaudit                                        # daily report (default)
+ccaudit weekly --breakdown                     # weekly totals, split per model
 ccaudit blocks --cost-limit 100                # 5-hour billing windows w/ progress bar
 ccaudit session --breakdown                    # per-session per-model cost
+ccaudit daily --plain | awk -F'\t' '{print $1, $NF}'   # scriptable, tab-separated
 ccaudit web --port 8080                        # static site + local server
 ccaudit web --no-serve --out ./site            # generate the static site, exit (CI / scripts)
 ccaudit tui                                    # interactive browser
-ccaudit --source codex daily                   # OpenAI Codex CLI logs (~/.codex/sessions)
+ccaudit daily --source codex                   # OpenAI Codex CLI logs (~/.codex/sessions)
 ```
 
-All subcommands accept `--json` for machine-readable output.
+Report subcommands accept `--json` (structured) or `--plain` (tab-separated) for machine-readable output. See [Scripting & ccusage parity](#scripting--ccusage-parity).
 
 ## Features
 
-- **Daily / monthly / session / blocks** reports, plus a compact `statusline` for shell prompts
+- **Daily / weekly / monthly / session / blocks** reports, plus a compact `statusline` for shell prompts
 - **TUI browser** — keyboard-driven navigation, fuzzy search, message viewer, dashboard (`d`), resume (`c`)
 - **Web dashboard** — tables with sortable columns, pie/histogram/heatmap charts, full message viewer, URL routing (`/p/{slug}/s/{uuid}`)
 - **Scope-aware**: press `d` from any view and the dashboard reflects just that project or session
@@ -293,6 +295,7 @@ cargo install ccaudit --features full          # tui + web + locale (default omi
 
 ```
 ccaudit daily           daily token usage + cost          (default)
+ccaudit weekly          aggregate by week (Mon-anchored)
 ccaudit monthly         aggregate by month
 ccaudit session         aggregate by conversation session
 ccaudit blocks          5-hour billing windows, with active detection
@@ -300,27 +303,48 @@ ccaudit statusline      compact one-line summary (for terminal status bars)
 ccaudit tui             interactive TUI browser
 ccaudit web             generate static site + serve
 ccaudit refresh-prices  fetch latest model prices from LiteLLM
+ccaudit completion SH   print a shell completion script (bash/zsh/fish)
+ccaudit version         print the version (also --version / -V)
 ccaudit help [SUB]      show help for ccaudit or for a subcommand
 ```
 
-Run `ccaudit <SUBCOMMAND> --help` for mode-specific flags.
+Run `ccaudit <COMMAND> --help` for command-specific flags.
+
+## Scripting & ccusage parity
+
+ccaudit aims for rough usability parity with [ccusage](https://github.com/ryoppippi/ccusage), so the muscle memory carries over:
+
+```bash
+ccaudit daily --json | jq .totals.cost_usd     # structured output for jq
+ccaudit daily --plain | awk -F'\t' '{print $1, $NF}'   # tab-separated for awk/cut/grep
+ccaudit monthly --order desc                    # newest first (default: oldest first)
+ccaudit blocks --active                         # only the live 5-hour window
+ccaudit blocks --recent                         # only blocks from the last 3 days
+ccaudit blocks --live                           # refresh the active block until Ctrl-C
+ccaudit completion zsh > ~/.zfunc/_ccaudit      # shell completions
+```
+
+- `--json` / `--plain` make output machine-readable; `--plain` is tab-separated with raw integers and no box-drawing or color.
+- `--order asc|desc`, `--offline`, and `--mode auto|calculate|display` are accepted for ccusage compatibility. ccaudit prices from its local cache on every run (update it online with `refresh-prices`), so `--offline` is already the default and `--mode display` falls back to calculated costs.
+- **Color** follows the [`NO_COLOR`](https://no-color.org) convention: ANSI color is emitted only when stdout is a terminal, and is disabled by `--no-color`, `NO_COLOR`, `CCAUDIT_NO_COLOR`, or `TERM=dumb` (force it back on with `FORCE_COLOR`). Piped output is always clean.
+- Mistyped a command or flag? ccaudit suggests the closest match (`ccaudit dialy` → *did you mean `ccaudit daily`?*).
 
 ## Development
 
 ```bash
-cargo test --release --all-features              # 41 tests across 5 suites
-cargo run --release --example bench              # synthetic-corpus bench
+cargo test --release --all-features              # 68 tests across 5 suites
+cargo bench                                      # synthetic-corpus bench
 BENCH_SIZE=large BENCH_RUNS=10 \
-  cargo run --release --example bench            # scaling stress
-BENCH_SAVE=baseline.json    cargo run --release --example bench
-BENCH_COMPARE=baseline.json cargo run --release --example bench  # diff vs baseline
+  cargo bench                                    # scaling stress
+BENCH_SAVE=baseline.json    cargo bench
+BENCH_COMPARE=baseline.json cargo bench          # diff vs baseline
 ```
 
 The bench builds a deterministic JSONL fixture in a tempdir (no
 dependency on `~/.claude/projects/`) and times the macro paths
 (`parse cold`, `parse warm`, `cache rebuild`, `cache warm mmap`,
 `cache::aggregate day` & `session`, `web::generate`) plus a few inner
-loops (`parse_session`, `tokenize`, `Searcher::score`, `fnv1a`).
+loops (`parse_session`, `split_whitespace`, `Searcher::score`, `fnv1a`).
 
 ## License
 

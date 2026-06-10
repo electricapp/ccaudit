@@ -189,11 +189,7 @@ fn session_id_for(path: &Path) -> String {
 // rule. Sanitize control chars here so the cache stores a clean string —
 // renderers can still defensively re-escape.
 fn display_name_of(session: &Session) -> String {
-    session
-        .display_name()
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
+    super::sanitize_control(session.display_name())
 }
 
 // Turn the Claude-shaped Session (which the TUI/web data model uses)
@@ -270,21 +266,23 @@ fn scan_with_bulk(dir: &Path) -> Option<Vec<SourceFile>> {
 
     let mut out: Vec<SourceFile> = Vec::with_capacity(256);
     for e in entries.flatten() {
-        let Ok(ft) = e.file_type() else { continue };
-        if !ft.is_dir() {
+        let subdir = e.path();
+        // `is_dir()` follows symlinks, matching default_scan's
+        // `fs::read_dir` — so a symlinked project dir is scanned the same
+        // way whether or not CCAUDIT_BULK_SCAN is set.
+        if !subdir.is_dir() {
             continue;
         }
-        let subdir = e.path();
         // One syscall for all entries in this subdir.
         let items = bulk_scan(&subdir)?;
         for item in items {
             if !item.is_regular_file {
                 continue;
             }
-            if !Path::new(&item.name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
-            {
+            // Exact, case-sensitive ".jsonl" — identical to default_scan,
+            // so the bulk path can't include `FOO.JSONL` that the portable
+            // path would skip (or vice-versa).
+            if Path::new(&item.name).extension().and_then(|x| x.to_str()) != Some("jsonl") {
                 continue;
             }
             let p = subdir.join(&item.name);

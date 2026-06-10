@@ -7,10 +7,12 @@
 //
 // Providers (e.g. ClaudeCode) consult `lookup()` first at price() time;
 // a miss falls back to their hardcoded rate table. Since preaggs are
-// priced at cache-build time, `refresh-prices` also deletes `usage.db`
-// to force a rebuild with fresh rates.
+// priced at cache-build time, `refresh-prices` also deletes every
+// provider usage cache (claude-code.db, codex.db) to force a rebuild with
+// fresh rates — prices.json is shared, so a stale rate would otherwise
+// linger in whichever provider wasn't rebuilt.
 
-use super::{Pricing, Source};
+use super::{Pricing, SourceKind};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -118,10 +120,24 @@ pub fn get() -> Option<&'static PricesLookup> {
     LOADED.get_or_init(load).as_ref()
 }
 
+// A missing file is the normal "no refresh yet" case → silent None. A
+// file that exists but won't parse is genuine corruption: warn (to
+// stderr, so stdout pipes stay clean) rather than silently reverting
+// every cost to the built-in fallback table with no explanation.
+#[allow(clippy::print_stderr)]
 fn load() -> Option<PricesLookup> {
     let path = cache_path()?;
     let bytes = std::fs::read(&path).ok()?;
-    parse(&bytes).ok()
+    match parse(&bytes) {
+        Ok(lk) => Some(lk),
+        Err(e) => {
+            eprintln!(
+                "warning: ignoring corrupt prices cache at {} ({e}); using built-in rates. Run `ccaudit refresh-prices` to repair.",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 fn parse(bytes: &[u8]) -> Result<PricesLookup, String> {
@@ -171,7 +187,7 @@ pub struct RefreshResult {
     pub invalidated_usage_db: bool,
 }
 
-pub fn refresh(source: &dyn Source) -> Result<RefreshResult, String> {
+pub fn refresh() -> Result<RefreshResult, String> {
     let out_path = cache_path().ok_or("HOME not set")?;
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
@@ -187,14 +203,17 @@ pub fn refresh(source: &dyn Source) -> Result<RefreshResult, String> {
     std::fs::write(&tmp, body.as_bytes()).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, &out_path).map_err(|e| format!("rename {}: {e}", out_path.display()))?;
 
-    // Invalidate the active source's usage cache so the next `ccaudit`
-    // run rebuilds preaggs with the new prices. Without this the
-    // rollup numbers would still reflect the prices used at the last
-    // build time.
-    let invalidated = source
-        .cache_path()
-        .map(|p| std::fs::remove_file(&p).is_ok())
-        .unwrap_or(false);
+    // prices.json is shared across providers, so invalidate EVERY provider
+    // usage cache — not just one — otherwise the providers we didn't
+    // rebuild keep reporting costs computed at their last build time.
+    let mut invalidated = false;
+    for kind in [SourceKind::ClaudeCode, SourceKind::Codex] {
+        if let Some(p) = super::pick(kind).cache_path() {
+            if std::fs::remove_file(&p).is_ok() {
+                invalidated = true;
+            }
+        }
+    }
 
     Ok(RefreshResult {
         model_count,

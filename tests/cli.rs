@@ -592,16 +592,92 @@ fn help_exits_cleanly() {
     let h = Harness::new();
     let out = h.run(&["--help"]);
     require_success(&out, "--help");
-    // Help prints to stderr (like most CLIs); check both streams.
-    let combined = format!("{}{}", read_stdout(&out), read_stderr(&out));
+    // Requested help is the command's primary output → it goes to
+    // stdout (clig.dev), so `ccaudit help | less` works.
+    let stdout = read_stdout(&out);
+    assert!(
+        !stdout.is_empty(),
+        "requested --help must print to stdout, got empty stdout"
+    );
+    let combined = format!("{}{}", stdout, read_stderr(&out));
     assert!(combined.contains("daily"));
+    assert!(combined.contains("weekly"));
     assert!(combined.contains("monthly"));
     assert!(combined.contains("statusline"));
     // The new shape advertises tui/web as real subcommands and a hint to
     // ask each one for its own help.
     assert!(combined.contains("tui"));
     assert!(combined.contains("web"));
-    assert!(combined.contains("Run `ccaudit <SUBCOMMAND> --help`"));
+    assert!(combined.contains("ccaudit <command> --help"));
+}
+
+#[test]
+fn version_prints_to_stdout() {
+    let h = Harness::new();
+    for arg in ["--version", "-V", "version"] {
+        let out = h.run(&[arg]);
+        require_success(&out, arg);
+        let stdout = read_stdout(&out);
+        assert!(
+            stdout.starts_with("ccaudit "),
+            "{arg} should print `ccaudit <ver>` to stdout, got: {stdout:?}"
+        );
+    }
+}
+
+#[test]
+fn piped_output_has_no_ansi_escapes() {
+    // The headline composability guarantee: when stdout is not a TTY
+    // (which it never is under a piped Command), no ANSI escapes leak
+    // into the stream, so `> file` / `| grep` get clean text.
+    let h = Harness::new();
+    setup_single_project(&h);
+    for args in [
+        vec!["daily"],
+        vec!["blocks"],
+        vec!["statusline"],
+        vec!["session"],
+    ] {
+        let out = h.run(&args);
+        require_success(&out, &format!("{args:?}"));
+        let stdout = read_stdout(&out);
+        assert!(
+            !stdout.contains('\u{1b}'),
+            "{args:?} leaked an ANSI escape into a non-TTY pipe:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn plain_is_tab_separated_without_box_drawing() {
+    let h = Harness::new();
+    setup_single_project(&h);
+    let out = h.run(&["daily", "--plain"]);
+    require_success(&out, "daily --plain");
+    let stdout = read_stdout(&out);
+    let first = stdout.lines().next().unwrap_or_default();
+    assert!(
+        first.starts_with('#'),
+        "header should start with #: {first:?}"
+    );
+    assert!(
+        first.contains('\t'),
+        "columns should be tab-separated: {first:?}"
+    );
+    assert!(
+        !stdout.contains('│') && !stdout.contains('┌'),
+        "--plain must not draw a box:\n{stdout}"
+    );
+}
+
+#[test]
+fn weekly_json_reports_weekly_command() {
+    let h = Harness::new();
+    setup_single_project(&h);
+    let out = h.run(&["weekly", "--json"]);
+    require_success(&out, "weekly --json");
+    let v: Value = serde_json::from_str(&read_stdout(&out)).unwrap();
+    assert_eq!(v["command"], "weekly");
 }
 
 #[test]

@@ -150,13 +150,19 @@ fn build_preaggs<S: Source + ?Sized>(
     // so walking them in natural order is enough — no sort needed. The
     // cross-session dedup below still picks the earliest occurrence of
     // each `msg_id` because we visit sessions oldest-first.
+    // At most one insert per line, and `with_capacity(n)` reserves enough
+    // for `n` inserts without rehashing — so size at the line count, not 2×.
     let mut seen: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::with_capacity_and_hasher(
-        lines.len().saturating_mul(2).max(1024),
+        lines.len().max(1024),
         rustc_hash::FxBuildHasher,
     );
 
     // Key = (day, model_id, project_id) packed into u64 for FxHashMap.
     let mut bucket: FxHashMap<u64, PreAgg> = FxHashMap::default();
+
+    // Resolve each model's rate + skip flag once (one LiteLLM lookup per
+    // distinct model) rather than rebuilding candidate lists per line.
+    let rates = crate::source::ModelRates::build(source, models);
 
     for sess in sessions {
         let line_range =
@@ -174,20 +180,14 @@ fn build_preaggs<S: Source + ?Sized>(
             } else {
                 fallback_model_id
             };
-
-            let model_name: Option<&str> = if mid == u16::MAX {
-                None
-            } else {
-                models.get(mid as usize).map(String::as_str)
-            };
-            if model_name.is_some_and(|m| source.skip_model(m)) {
+            if rates.skip(mid) {
                 continue;
             }
             // Split cost by column so renders can show which token type
             // drove spend without re-pricing at query time. Single
             // pricing primitive shared with per_session_totals + reports.
-            let [ci, co, ccw, ccr] = source.price_columns(
-                model_name,
+            let [ci, co, ccw, ccr] = rates.columns(
+                mid,
                 u64::from(line.input),
                 u64::from(line.output),
                 u64::from(line.cache_create),

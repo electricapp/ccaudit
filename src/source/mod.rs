@@ -65,11 +65,27 @@ pub struct SourceFile {
 // Per-million-token prices. A provider returns one of these for each
 // model it knows about; unknown models fall back to the provider's
 // default (typically Sonnet-tier).
+#[derive(Clone, Copy)]
 pub struct Pricing {
     pub input: f64,
     pub output: f64,
     pub cache_write: f64,
     pub cache_read: f64,
+}
+
+impl Pricing {
+    /// Per-column dollar cost for a token quad. The single arithmetic
+    /// primitive — `price_columns` and the memoized `ModelRates` both
+    /// route through it so float-summation ordering stays identical
+    /// across cache build, totals, and report output.
+    pub fn columns(&self, input: u64, output: u64, cache_write: u64, cache_read: u64) -> [f64; 4] {
+        [
+            (input as f64) * self.input / 1_000_000.0,
+            (output as f64) * self.output / 1_000_000.0,
+            (cache_write as f64) * self.cache_write / 1_000_000.0,
+            (cache_read as f64) * self.cache_read / 1_000_000.0,
+        ]
+    }
 }
 
 // ── Source trait ──
@@ -114,8 +130,14 @@ pub trait Source: Sync + Send {
 
     /// Parse one session into canonical form. Takes the full `SourceFile`
     /// (not just its path) so providers can carry extra identity
-    /// (rowid, archive index) through the scan → parse pipeline. Returns
-    /// None if the session is empty or malformed.
+    /// (rowid, archive index) through the scan → parse pipeline.
+    ///
+    /// Returns `None` only when the file can't be read or parsed at all. A
+    /// readable session with zero billable lines should still return
+    /// `Some` (an empty `ParsedSession`): the incremental cache validates
+    /// by matching its session count to the scanned-file count, so a
+    /// `None` for a file that keeps being scanned would force a full
+    /// rebuild on every run.
     fn parse_session(&self, src: &SourceFile) -> Option<ParsedSession>;
 
     /// Pricing for a given model. `None` means "unknown model" — the
@@ -148,13 +170,8 @@ pub trait Source: Sync + Send {
         cache_write: u64,
         cache_read: u64,
     ) -> [f64; 4] {
-        let p = self.price(model);
-        [
-            (input as f64) * p.input / 1_000_000.0,
-            (output as f64) * p.output / 1_000_000.0,
-            (cache_write as f64) * p.cache_write / 1_000_000.0,
-            (cache_read as f64) * p.cache_read / 1_000_000.0,
-        ]
+        self.price(model)
+            .columns(input, output, cache_write, cache_read)
     }
 
     /// Sum-of-columns convenience for callers that don't need the split.
@@ -168,6 +185,56 @@ pub trait Source: Sync + Send {
     ) -> f64 {
         let cols = self.price_columns(model, input, output, cache_write, cache_read);
         cols.iter().sum()
+    }
+}
+
+// ── Per-model rate memoization ──
+
+/// Per-model rate cache, indexed by the cache's `model_id`.
+///
+/// Resolves each interned model's pricing + skip flag exactly once. The
+/// `LiteLLM` lookup (candidate-list allocation + boundary substring scan
+/// over ~20k keys) is the expensive part of pricing and is identical for
+/// every line of a given model, so the per-line aggregation loops resolve
+/// through this table — one lookup per distinct model, not one per line.
+pub struct ModelRates {
+    pricing: Vec<Pricing>,
+    skip: Vec<bool>,
+    unknown: Pricing,
+}
+
+impl ModelRates {
+    pub fn build<S: Source + ?Sized>(source: &S, models: &[String]) -> Self {
+        Self {
+            pricing: models.iter().map(|m| *source.price(Some(m))).collect(),
+            skip: models.iter().map(|m| source.skip_model(m)).collect(),
+            unknown: *source.price(None),
+        }
+    }
+
+    /// `mid == u16::MAX` means "no model" — never skipped (matches the
+    /// `model_name.is_some_and(skip_model)` shape it replaces).
+    pub fn skip(&self, mid: u16) -> bool {
+        mid != u16::MAX && self.skip.get(mid as usize).copied().unwrap_or(false)
+    }
+
+    /// Per-column cost for `mid`'s rate. `u16::MAX` (or an out-of-range
+    /// id) falls back to the provider's unknown-model pricing — identical
+    /// to `price_columns(None, …)`.
+    pub fn columns(
+        &self,
+        mid: u16,
+        input: u64,
+        output: u64,
+        cache_write: u64,
+        cache_read: u64,
+    ) -> [f64; 4] {
+        let p = if mid == u16::MAX {
+            &self.unknown
+        } else {
+            self.pricing.get(mid as usize).unwrap_or(&self.unknown)
+        };
+        p.columns(input, output, cache_write, cache_read)
     }
 }
 
@@ -313,4 +380,15 @@ pub fn prettify_user_path(parts: &[&str]) -> Option<String> {
 pub fn prettify_cwd(cwd: &str) -> String {
     let parts: Vec<&str> = cwd.trim_start_matches('/').split('/').collect();
     prettify_user_path(&parts).unwrap_or_else(|| cwd.to_string())
+}
+
+/// Replace control characters with spaces.
+///
+/// Shared by the providers so a session display name stored in the cache
+/// is clean regardless of which provider produced it (renderers can still
+/// defensively re-escape).
+pub fn sanitize_control(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
