@@ -252,3 +252,39 @@ fn parse_entry(buf: &[u8], start: usize) -> Option<ParsedEntry> {
         size,
     })
 }
+
+// Behavioral smoke test for the FFI. The whole module is macOS-gated, so
+// this only builds + runs on macOS — exercised by the `macos` CI lane.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn scan_reports_files_dirs_and_sizes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A regular file of known size...
+        let mut f = std::fs::File::create(dir.path().join("session.jsonl")).expect("create file");
+        f.write_all(b"0123456789").expect("write"); // exactly 10 bytes
+        drop(f);
+        // ...and a subdirectory, to check object-type classification.
+        std::fs::create_dir(dir.path().join("nested")).expect("mkdir");
+
+        let entries = scan(dir.path()).expect("getattrlistbulk scan should succeed on APFS/HFS+");
+
+        let file = entries
+            .iter()
+            .find(|e| e.name == "session.jsonl")
+            .expect("the regular file should be listed");
+        assert!(file.is_regular_file, "jsonl should be a regular file");
+        assert_eq!(file.size, 10, "DATALENGTH should match the bytes written");
+        assert!(file.mtime_secs > 0, "mtime should be populated");
+
+        let sub = entries
+            .iter()
+            .find(|e| e.name == "nested")
+            .expect("the subdirectory should be listed");
+        assert!(!sub.is_regular_file, "a directory is not a regular file");
+    }
+}

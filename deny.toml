@@ -1,0 +1,46 @@
+# cargo-deny policy. Single source of truth, consumed by:
+#   - .github/workflows/release.yml  (audit gate on every `v*` tag)
+#   - .github/workflows/supply-chain.yml  (weekly + manual re-audit)
+#
+# Advisory *detection* is also covered passively by GitHub Dependabot
+# alerts; this file is what enforces the license / bans / sources policy
+# and gives a hard, reproducible gate.
+
+[advisories]
+yanked = "deny"
+# `unmaintained`/`vulnerability` severities are evaluated by default; a
+# new advisory against the committed lockfile fails the run.
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  # nucleo-matcher (TUI fuzzy search) and option-ext (via dirs) are
+  # MPL-2.0 — weak, file-level copyleft. We link them unmodified, which
+  # carries no source-disclosure obligation.
+  "MPL-2.0",
+  # foldhash (via hashbrown) is Zlib — pure-permissive, BSD-like.
+  "Zlib",
+]
+
+# terminfo (pulled in by the TUI terminal stack) is WTFPL. It's
+# public-domain-equivalent, but scope it to this one crate rather than
+# blessing WTFPL for any future dependency.
+[[licenses.exceptions]]
+name = "terminfo"
+allow = ["WTFPL"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

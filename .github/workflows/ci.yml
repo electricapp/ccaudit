@@ -2,11 +2,11 @@ name: CI
 on:
   push:
     branches: [master, main]
-    paths-ignore:
-      - '**/*.md'
   pull_request:
-    paths-ignore:
-      - '**/*.md'
+# No `paths-ignore`: `rust`/`web` are *required* status checks, and a
+# workflow skipped by a path filter never reports them — which leaves a
+# docs-only PR stuck on "Expected — waiting for status". CI is ~2 min, so
+# running it on every change is cheaper than the sentinel-job workaround.
 
 # Cancel in-progress runs on the same ref when a new push/PR update lands.
 # Branch protection only blocks merge on the *latest* required-check result,
@@ -100,3 +100,60 @@ jobs:
 
       - name: JS unit tests (headless)
         run: node src/web/run-tests.js
+
+  # ── macOS: compile + clippy + test the macOS-only unsafe FFI ──
+  # The ubuntu jobs above never see `src/source/bulk_scan_darwin.rs`
+  # (getattrlistbulk) or the other `cfg(target_os = "macos")` code, so a
+  # compile/clippy regression there would otherwise surface only at
+  # release time on the mac runners. This lane lints it and runs the
+  # scan() smoke test on every change.
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal --component clippy
+          rustup default "${RUST_TOOLCHAIN}"
+          rustc --version
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-macos-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-macos-
+
+      - name: clippy (all features — includes the macOS-gated FFI)
+        run: cargo clippy --all-features --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --all-features
+
+  # ── Lint the workflow files themselves (YAML + embedded shell) ──
+  # shellcheck ships on the runner, so actionlint also checks the inline
+  # bash. Catches dead runner labels, quoting bugs, and bad expressions
+  # before they break a tag release (where failures are most expensive).
+  actionlint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Run actionlint (SHA-pinned download + checksum)
+        run: |
+          VER="1.7.12"
+          SHA="8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${VER}/actionlint_${VER}_linux_amd64.tar.gz" -o actionlint.tgz
+          echo "${SHA}  actionlint.tgz" | sha256sum -c -
+          tar -xzf actionlint.tgz actionlint
+          ./actionlint

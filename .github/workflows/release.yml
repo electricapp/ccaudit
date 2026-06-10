@@ -59,7 +59,7 @@ jobs:
       - name: Install cargo-audit + cargo-deny
         run: |
           cargo install cargo-audit@0.21.2 --locked
-          cargo install cargo-deny@0.16.4 --locked
+          cargo install cargo-deny@0.19.5 --locked
 
       - name: Audit vulnerabilities
         run: cargo audit --deny warnings
@@ -68,29 +68,9 @@ jobs:
         run: cargo audit --deny yanked
 
       - name: Check licenses + sources + duplicates
-        run: |
-          # Generate deny config inline (no extra file to maintain)
-          cat > /tmp/deny.toml << 'DENY'
-          [advisories]
-          vulnerability = "deny"
-          unmaintained = "warn"
-          yanked = "deny"
-
-          [licenses]
-          unlicensed = "deny"
-          allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Unicode-DFS-2016"]
-
-          [bans]
-          multiple-versions = "warn"
-          wildcards = "deny"
-
-          [sources]
-          unknown-registry = "deny"
-          unknown-git = "deny"
-          allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-          allow-git = []
-          DENY
-          cargo deny --config /tmp/deny.toml check
+        # Policy lives in the committed deny.toml (single source of truth,
+        # shared with the scheduled supply-chain workflow).
+        run: cargo deny check --config deny.toml
 
       - name: Verify Cargo.lock is committed and fresh
         run: |
@@ -113,7 +93,7 @@ jobs:
             os: macos-15
             npm_pkg: darwin-arm64
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-intel
             npm_pkg: darwin-x64
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
@@ -481,9 +461,9 @@ jobs:
             "linux-arm64:manylinux2014_aarch64"; do
             pkg=${pair%%:*}
             tag=${pair##*:}
-            cp -f ../../artifacts/$pkg/ccaudit src/ccaudit/bin/ccaudit
+            cp -f "../../artifacts/$pkg/ccaudit" src/ccaudit/bin/ccaudit
             chmod +x src/ccaudit/bin/ccaudit
-            python -m build --wheel -C--build-option=--plat-name=$tag
+            python -m build --wheel -C--build-option="--plat-name=$tag"
           done
           ls -la dist/
 
