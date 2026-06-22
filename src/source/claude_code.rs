@@ -71,8 +71,9 @@ impl Source for ClaudeCode {
         //    LiteLLM tends to key Claude models.
         if let Some(lookup) = super::prices::get() {
             if let Some(name) = model {
-                let candidates = claude_name_candidates(name);
-                if let Some(p) = lookup.lookup(&candidates) {
+                let (candidates, len) = claude_name_candidates(name);
+                #[allow(clippy::indexing_slicing)]
+                if let Some(p) = lookup.lookup(&candidates[..len]) {
                     return p;
                 }
             }
@@ -109,20 +110,32 @@ impl Source for ClaudeCode {
 // Build candidate names to probe against LiteLLM's keyspace. LiteLLM
 // tends to store Claude models under several forms; try the raw name
 // first, then with common prefixes, then with the date suffix stripped.
-fn claude_name_candidates(name: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::with_capacity(6);
-    out.push(name.to_string());
-    out.push(format!("anthropic/{name}"));
-    // Strip trailing -YYYYMMDD if present.
+fn claude_name_candidates(name: &str) -> ([String; 4], usize) {
+    let mut out = [
+        name.to_string(),
+        format!("anthropic/{name}"),
+        String::new(),
+        String::new(),
+    ];
+    let mut len = 2;
     if let Some(idx) = name.rfind('-') {
         let tail = &name[idx + 1..];
         if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit()) {
             let base = &name[..idx];
-            out.push(base.to_string());
-            out.push(format!("anthropic/{base}"));
+            #[allow(clippy::indexing_slicing)]
+            {
+                if len < 4 {
+                    out[len] = base.to_string();
+                    len += 1;
+                }
+                if len < 4 {
+                    out[len] = format!("anthropic/{base}");
+                    len += 1;
+                }
+            }
         }
     }
-    out
+    (out, len)
 }
 
 // Anthropic pricing, per-million tokens. These are the hardcoded fallback

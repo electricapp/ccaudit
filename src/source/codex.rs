@@ -70,8 +70,8 @@ impl Source for Codex {
 }
 
 // LiteLLM keys OpenAI models both bare and with an `openai/` prefix; try both.
-fn openai_name_candidates(name: &str) -> Vec<String> {
-    vec![name.to_string(), format!("openai/{name}")]
+fn openai_name_candidates(name: &str) -> [String; 2] {
+    [name.to_string(), format!("openai/{name}")]
 }
 
 const GPT5: Pricing = Pricing {

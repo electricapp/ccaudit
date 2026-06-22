@@ -10,30 +10,52 @@ use crate::source::Source;
 #[allow(clippy::print_stdout)]
 pub fn print<S: Source + ?Sized>(cache: &LoadedCache, opts: &Options, source: &S) {
     let today = current_day(opts.tz_offset_secs);
-    let filter = FilterOpts {
-        since_day: Some(today),
-        until_day: Some(today),
-        project: opts.project.as_deref(),
-        tz_offset_secs: opts.tz_offset_secs,
-    };
-    let today_roll = aggregate(cache, Bucket::Day, &filter, false, source);
+    let project_filter_id = opts.project.as_deref().and_then(|name| {
+        cache
+            .projects
+            .iter()
+            .position(|p| p == name)
+            .map(|i| i as u16)
+    });
 
     let mut input = 0u64;
     let mut output = 0u64;
     let mut cc = 0u64;
     let mut cr = 0u64;
     let mut cost = 0.0f64;
-    for u in today_roll.values() {
-        input += u.input;
-        output += u.output;
-        cc += u.cache_create;
-        cr += u.cache_read;
-        cost += u.cost;
+
+    if opts.tz_offset_secs == 0 {
+        for p in cache.preaggs() {
+            if p.day != today {
+                continue;
+            }
+            if project_filter_id.is_some() && Some(p.project_id) != project_filter_id {
+                continue;
+            }
+            input += u64::from(p.input);
+            output += u64::from(p.output);
+            cc += u64::from(p.cache_create);
+            cr += u64::from(p.cache_read);
+            cost += p.total_cost();
+        }
+    } else {
+        let filter = FilterOpts {
+            since_day: Some(today),
+            until_day: Some(today),
+            project: opts.project.as_deref(),
+            tz_offset_secs: opts.tz_offset_secs,
+        };
+        let today_roll = aggregate(cache, Bucket::Day, &filter, false, source);
+        for u in today_roll.values() {
+            input += u.input;
+            output += u.output;
+            cc += u.cache_create;
+            cr += u.cache_read;
+            cost += u.cost;
+        }
     }
     let total = input + output + cc + cr;
 
-    // Active 5h-block cost (local clock). Honors --project so the block
-    // figure is scoped the same way the today figure above is.
     let block_filter = FilterOpts {
         project: opts.project.as_deref(),
         tz_offset_secs: opts.tz_offset_secs,

@@ -2,8 +2,8 @@
 
 use super::fmt::{
     COMPACT, LIMIT_CELL_WIDTH, NORMAL, Widths, apply_tail, format_cost, format_limit_cell,
-    format_number, label_for, limit_color, normalize_model, sort_keys, title_for, write_cost,
-    write_number, write_title,
+    label_for, limit_color, normalize_model, sort_keys, title_for, write_cost, write_number,
+    write_title,
 };
 use crate::cache::{BLOCK_SECS, BreakdownKey, Bucket, BucketKey, BucketUsage, LoadedCache};
 use crate::cli::Options;
@@ -176,7 +176,7 @@ pub fn print<S: Source + ?Sized>(
 
         // Second column: Models list (or a single model row on --breakdown
         // per-model, or the project set if --instances).
-        let mut second_lines: Vec<String> = Vec::new();
+        let mut second_lines: Vec<String> = Vec::with_capacity(4);
         if opts.instances {
             for pid in u.projects.iter() {
                 if let Some(name) = cache.projects.get(pid as usize) {
@@ -283,17 +283,29 @@ pub fn print<S: Source + ?Sized>(
 
     // Totals
     buf.push_str(&mid_hline);
+    for s in &mut scratch {
+        s.clear();
+    }
+    write_number(&mut scratch[0], tot_in);
+    write_number(&mut scratch[1], tot_out);
+    write_number(&mut scratch[2], tot_cache_w);
+    write_number(&mut scratch[3], tot_cache_r);
+    write_number(
+        &mut scratch[4],
+        tot_in + tot_out + tot_cache_w + tot_cache_r,
+    );
+    write_cost(&mut scratch[5], tot_cost);
     write_total(
         &mut buf,
         w,
         "Total",
         [
-            &format_number(tot_in),
-            &format_number(tot_out),
-            &format_number(tot_cache_w),
-            &format_number(tot_cache_r),
-            &format_number(tot_in + tot_out + tot_cache_w + tot_cache_r),
-            &format_cost(tot_cost),
+            &scratch[0],
+            &scratch[1],
+            &scratch[2],
+            &scratch[3],
+            &scratch[4],
+            &scratch[5],
         ],
     );
 
@@ -305,17 +317,25 @@ pub fn print<S: Source + ?Sized>(
     // up to the Total Cost row exactly.
     let total_prices = tot_cost_in + tot_cost_out + tot_cost_cache_w + tot_cost_cache_r;
     buf.push_str(&mid_hline);
+    for s in &mut scratch {
+        s.clear();
+    }
+    write_cost(&mut scratch[0], tot_cost_in);
+    write_cost(&mut scratch[1], tot_cost_out);
+    write_cost(&mut scratch[2], tot_cost_cache_w);
+    write_cost(&mut scratch[3], tot_cost_cache_r);
+    write_cost(&mut scratch[4], total_prices);
     write_rates_row(
         &mut buf,
         w,
         "Total Prices",
         [
-            &format_cost(tot_cost_in),
-            &format_cost(tot_cost_out),
-            &format_cost(tot_cost_cache_w),
-            &format_cost(tot_cost_cache_r),
-            &format_cost(total_prices),
-            "", // cost column intentionally left blank (it's in the row above)
+            &scratch[0],
+            &scratch[1],
+            &scratch[2],
+            &scratch[3],
+            &scratch[4],
+            "",
         ],
     );
     buf.push_str(&bot_hline);
@@ -499,7 +519,12 @@ struct Row<'a> {
 // Returns `Borrowed` (no allocation) for the common in-width case.
 fn fit_cell(s: &str, w: usize) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
-    if w == 0 || s.chars().count() <= w {
+    let len = if s.is_ascii() {
+        s.len()
+    } else {
+        s.chars().count()
+    };
+    if w == 0 || len <= w {
         return Cow::Borrowed(s);
     }
     let mut out: String = s.chars().take(w.saturating_sub(1)).collect();

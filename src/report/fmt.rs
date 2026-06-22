@@ -186,11 +186,8 @@ pub fn write_cost(out: &mut String, c: f64) {
     out.push_str(sign);
     write_number(out, dollars);
     out.push('.');
-    if frac < 10 {
-        out.push('0');
-    }
-    use std::fmt::Write as _;
-    let _ = write!(out, "{frac}");
+    out.push((b'0' + (frac as u8 / 10)) as char);
+    out.push((b'0' + (frac as u8 % 10)) as char);
 }
 
 pub fn format_cost(c: f64) -> String {
@@ -292,8 +289,7 @@ pub fn format_block(key: BucketKey, tz_offset: i32) -> String {
 /// `phonon/crates/power/monitor` → `power-monitor`,
 /// `code/ccaudit` → `code-ccaudit`.
 pub fn ccusage_stem(project: &str) -> String {
-    let parts: Vec<&str> = project.split('/').filter(|s| !s.is_empty()).collect();
-    let mut rev = parts.iter().rev().copied();
+    let mut rev = project.rsplit('/').filter(|s| !s.is_empty());
     let last = rev.next().unwrap_or("");
     match rev.next() {
         Some(prev) => format!("{prev}-{last}"),
@@ -441,4 +437,48 @@ pub fn write_title(buf: &mut String, title: &str) {
     let _ = writeln!(buf, " │{spaces}│");
     let _ = writeln!(buf, " ╰{top}╯");
     let _ = writeln!(buf);
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::format_cost;
+
+    #[test]
+    fn cents_below_ten_are_two_digits() {
+        // Regression: the cents field must always render exactly two
+        // digits. A zero-pad branch that fired *in addition* to a
+        // two-digit writer once produced "$10.000" / "$5.005".
+        assert_eq!(format_cost(10.00), "$10.00");
+        assert_eq!(format_cost(5.05), "$5.05");
+        assert_eq!(format_cost(1.09), "$1.09");
+        assert_eq!(format_cost(0.07), "$0.07");
+        assert_eq!(format_cost(0.00), "$0.00");
+    }
+
+    #[test]
+    fn cents_ten_and_above_are_two_digits() {
+        assert_eq!(format_cost(12.50), "$12.50");
+        assert_eq!(format_cost(3.99), "$3.99");
+        assert_eq!(format_cost(0.99), "$0.99");
+    }
+
+    #[test]
+    fn thousands_separator_on_dollars_only() {
+        assert_eq!(format_cost(5706.77), "$5_706.77");
+        assert_eq!(format_cost(1_234_567.89), "$1_234_567.89");
+    }
+
+    #[test]
+    fn sub_cent_matches_web_fc_helper() {
+        // Half a cent shows "<$0.01" (not "$0.00") to agree with the web.
+        assert_eq!(format_cost(0.005), "<$0.01");
+        assert_eq!(format_cost(0.001), "<$0.01");
+    }
+
+    #[test]
+    fn negative_costs_are_defensive() {
+        assert_eq!(format_cost(-5.05), "-$5.05");
+        assert_eq!(format_cost(-12.50), "-$12.50");
+    }
 }

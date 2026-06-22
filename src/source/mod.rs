@@ -388,6 +388,9 @@ pub fn prettify_cwd(cwd: &str) -> String {
 /// is clean regardless of which provider produced it (renderers can still
 /// defensively re-escape).
 pub fn sanitize_control(s: &str) -> String {
+    if !s.contains(|c: char| c.is_control()) {
+        return s.to_string();
+    }
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
