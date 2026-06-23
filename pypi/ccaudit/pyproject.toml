@@ -17,7 +17,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ccaudit"
 version = "0.1.0"
-description = "Fast Claude Code log viewer — CLI + TUI + web. Single Rust binary, ~10 ms warm start."
+description = "Fast Claude Code log viewer — CLI + TUI + web. Single Rust binary, ~5 ms warm start."
 requires-python = ">=3.8"
 license = { text = "MIT" }
 authors = [{ name = "electricapp" }]

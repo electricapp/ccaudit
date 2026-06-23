@@ -1,6 +1,6 @@
 # ccaudit
 
-Fast, local Claude Code log viewer. CLI, TUI, and static web — Rust binary, <1.3 MB.
+Fast, local Claude Code log viewer. CLI, TUI, and static web — Rust binary, ~1.7 MB.
 
 <p align="center">
   <img src="docs/dashboard.png" alt="ccaudit web dashboard" width="900">
@@ -19,7 +19,7 @@ ccaudit statusline                    # one-line summary for your shell prompt
 
 ## What it is
 
-One Rust binary. CLI, TUI, and web for your `~/.claude` logs. Mmap'd cache, ~10 ms warm start.
+One Rust binary. CLI, TUI, and web for your `~/.claude` logs. Mmap'd cache, ~5 ms warm start.
 
 Inspired by:
 
@@ -29,7 +29,7 @@ Inspired by:
 
 |                       | ccaudit                  | ccusage        | claude-code-log    | claude-session-dashboard |
 | --------------------- | ------------------------ | -------------- | ------------------ | ------------------------ |
-| Runtime               | Rust binary (~1.3 MB)    | Node.js        | Python             | Node.js + browser        |
+| Runtime               | Rust binary (~1.7 MB)    | Node.js        | Python             | Node.js + browser        |
 | CLI reports           | yes (daily/monthly/…)    | reference impl | —                  | —                        |
 | TUI browser           | yes (`ccaudit tui`)      | —              | —                  | —                        |
 | Web dashboard         | yes (`ccaudit web`)      | —              | HTML export        | yes (local server)       |
@@ -40,26 +40,28 @@ Inspired by:
 
 ### Benchmarks
 
-Same dataset, same workload (`daily` token report). Single-shot wall time on Apple Silicon, against `~/.claude/projects/` = **3.0 GB / 822 JSONL files**.
+Same dataset, same workload (`daily` token report). Single-shot wall time on Apple Silicon, against `~/.claude/projects/` = **2.5 GB / 1161 JSONL files**. Reproduce with [`benches/bench-vs.sh`](benches/bench-vs.sh) — the table below is its output.
 
-|                            | uncached | cold cache | warm cache |
-| -------------------------- | -------: | ---------: | ---------: |
-| **ccaudit**                | 0.25 s   | **0.07 s** | **0.08 s** |
-| ccusage (`bunx`)           | 9.5 s    |     8.9 s  |     9.5 s  |
-| claude-code-log (`uvx`)    | 83.0 s   |    52.2 s  |    36.9 s  |
+|                                    | uncached   | warm cache  |
+| ---------------------------------- | ---------: | ----------: |
+| **ccaudit**                        | **0.14 s** | **0.005 s** |
+| ccusage (`bunx`)                   | 7.1 s      | 7.4 s       |
+| claude-code-log (`uvx`)            | 99 s       | 168 s       |
+| claude-session-dashboard (`npx`) † | 3.6 s      | 3.6 s       |
 
 - **uncached** — app-level cache wiped, forcing a full re-parse from JSONL
-- **cold cache** — app cache present, OS page cache evicted (`sudo purge`)
 - **warm cache** — re-run immediately afterwards; mmap + page cache hot
+
+† `claude-session-dashboard` is a local server, not a CLI report — its figure is cold-start to first-serve (ready banner). Two quirks the reproducible run surfaces: `ccusage` keeps no persistent parse cache (re-parses every run, so warm ≈ uncached), and `claude-code-log`'s Python pickle cache is *counterproductive* at this corpus size — a warm re-run is slower than a no-cache one. Competitor tools move fast; re-run the script for current numbers.
 
 ### Where the time goes
 
 Same input (`~/.claude/projects/`), same logical question ("daily token totals"). Here's what each tool does for each invocation:
 
 ```
-ccaudit daily — warm cache (~70 ms)
+ccaudit daily — warm cache (~5 ms)
 ─────────────────────────────────────────────
-  mmap claude-code.db / codex.db  (3 MB binary, already bucketed by day × model)
+  mmap claude-code.db / codex.db  (2 MB binary, already bucketed by day × model)
        │
        ▼
   sum PreAgg cells
@@ -69,12 +71,12 @@ ccaudit daily — warm cache (~70 ms)
 ```
 
 ```
-ccaudit daily — uncached (~250 ms, pays the cost ONCE per file lifetime)
+ccaudit daily — uncached (~140 ms, pays the cost ONCE per file lifetime)
 ─────────────────────────────────────────────
-  walk ~/.claude/projects → 822 files
+  walk ~/.claude/projects → 1161 files
        │
        ▼
-  rayon-parallel parse JSONL  (1.2 M lines, typed serde)
+  rayon-parallel parse JSONL  (318 K lines, typed serde)
        │
        ▼
   bucket by (day × model)
@@ -82,26 +84,26 @@ ccaudit daily — uncached (~250 ms, pays the cost ONCE per file lifetime)
        ▼
   ┌────────────────────────────┐
   │ persist binary cache.db    │ ◄── pay once,
-  └────────┬───────────────────┘     all future runs are 70 ms
+  └────────┬───────────────────┘     all future runs are ~5 ms
            ▼
   mmap + sum + print
 ```
 
 ```
-ccusage daily (~9 s, EVERY SINGLE RUN)
+ccusage daily (~7 s, EVERY SINGLE RUN)
 ─────────────────────────────────────────────
   ┌────────────────────────────────────────────┐
   │ ⏬ HTTP GET litellm/prices.json   (~1 MB)   │ ◄── network call,
   └────────┬───────────────────────────────────┘     every run
            ▼
-  parse pricing JSON (~1500 models)
+  parse pricing JSON (~2900 models)
            │
            ▼
-  walk ~/.claude/projects → 822 files
+  walk ~/.claude/projects → 1161 files
            │
            ▼
   ┌────────────────────────────────────────┐
-  │ for each of 1.2 M lines:               │
+  │ for each of 318 K lines:               │
   │   ├── read line from disk              │
   │   ├── JSON.parse(...)                  │ ◄── re-parse every run
   │   ├── lookup model in pricing map      │
@@ -113,12 +115,12 @@ ccusage daily (~9 s, EVERY SINGLE RUN)
 ```
 
 ```
-claude-code-log (~37 s warm / ~83 s uncached)
+claude-code-log (~99 s uncached / ~168 s warm)
 ─────────────────────────────────────────────
   load Python pickle cache (if present)
            │
            ▼
-  walk ~/.claude/projects → 822 files
+  walk ~/.claude/projects → 1161 files
            │
            ▼
   ┌────────────────────────────────────────────┐
@@ -145,15 +147,15 @@ The redundancy in one row:
 
 | once per run | ccaudit (warm) | ccusage | claude-code-log |
 | --- | :---: | :---: | :---: |
-| stat 822 JSONL files                           | — | ✓ | ✓ |
-| parse 1.2 M JSONL lines                        | — | ✓ | ✓ |
+| stat 1161 JSONL files                          | — | ✓ | ✓ |
+| parse 318 K JSONL lines                        | — | ✓ | ✓ |
 | build per-message parent→child DAG             | — | — | ✓ |
 | render thousands of HTML files                 | — | — | ✓ |
 | HTTP-fetch LiteLLM prices                      | — | ✓ | — |
 | look up model prices, multiply by tokens       | — | ✓ | — |
 | sum already-bucketed numbers + print           | ✓ | ✓ | — |
 
-ccaudit does the top six rows **once**, when it first sees a file, persists the result to a 3 MB binary cache, and every subsequent run is just the bottom row.
+ccaudit does the top six rows **once**, when it first sees a file, persists the result to a ~2 MB binary cache, and every subsequent run is just the bottom row.
 
 ### Cache layout
 
@@ -332,12 +334,13 @@ ccaudit completion zsh > ~/.zfunc/_ccaudit      # shell completions
 ## Development
 
 ```bash
-cargo test --release --all-features              # 68 tests across 5 suites
-cargo bench                                      # synthetic-corpus bench
+cargo test --release --all-features              # 74 tests across 5 suites
+cargo bench                                      # synthetic-corpus bench (ccaudit internals)
 BENCH_SIZE=large BENCH_RUNS=10 \
   cargo bench                                    # scaling stress
 BENCH_SAVE=baseline.json    cargo bench
 BENCH_COMPARE=baseline.json cargo bench          # diff vs baseline
+benches/bench-vs.sh                              # cross-tool wall-time table (vs ccusage / claude-code-log / dashboard)
 ```
 
 The bench builds a deterministic JSONL fixture in a tempdir (no
