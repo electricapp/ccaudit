@@ -27,14 +27,14 @@ Inspired by:
 - [claude-code-log](https://github.com/daaain/claude-code-log)
 - [claude-session-dashboard](https://github.com/dlupiak/claude-session-dashboard)
 
-|                       | ccaudit                  | ccusage        | claude-code-log    | claude-session-dashboard |
-| --------------------- | ------------------------ | -------------- | ------------------ | ------------------------ |
-| Runtime               | Rust binary (~1.7 MB)    | Node.js        | Python             | Node.js + browser        |
-| CLI reports           | yes (daily/monthly/…)    | reference impl | —                  | —                        |
-| TUI browser           | yes (`ccaudit tui`)      | —              | —                  | —                        |
-| Web dashboard         | yes (`ccaudit web`)      | —              | HTML export        | yes (local server)       |
-| Session detail viewer | yes                      | —              | yes                | yes                      |
-| Install               | binary / npm / cargo     | npm            | `pip install` + py | `npx` / `npm install -g` |
+|                       | ccaudit               | ccusage        | claude-code-log    | claude-session-dashboard |
+| --------------------- | --------------------- | -------------- | ------------------ | ------------------------ |
+| Runtime               | Rust binary (~1.7 MB) | Node.js        | Python             | Node.js + browser        |
+| CLI reports           | yes (daily/monthly/…) | reference impl | —                  | —                        |
+| TUI browser           | yes (`ccaudit tui`)   | —              | —                  | —                        |
+| Web dashboard         | yes (`ccaudit web`)   | —              | HTML export        | yes (local server)       |
+| Session detail viewer | yes                   | —              | yes                | yes                      |
+| Install               | binary / npm / cargo  | npm            | `pip install` + py | `npx` / `npm install -g` |
 
 `claude-session-dashboard` has one thing ccaudit doesn't: an **agent-delegation Gantt chart** for the sub-agent dispatch tree per session. Worth it if you run agentic workflows and want to see the delegation order.
 
@@ -42,17 +42,17 @@ Inspired by:
 
 Same dataset, same workload (`daily` token report). Single-shot wall time on Apple Silicon, against `~/.claude/projects/` = **2.5 GB / 1161 JSONL files**. Reproduce with [`benches/bench-vs.sh`](benches/bench-vs.sh) — the table below is its output.
 
-|                                    | uncached   | warm cache  |
+|                                    |   uncached |  warm cache |
 | ---------------------------------- | ---------: | ----------: |
 | **ccaudit**                        | **0.14 s** | **0.005 s** |
-| ccusage (`bunx`)                   | 7.1 s      | 7.4 s       |
-| claude-code-log (`uvx`)            | 99 s       | 168 s       |
-| claude-session-dashboard (`npx`) † | 3.6 s      | 3.6 s       |
+| ccusage (`bunx`)                   |      7.1 s |       7.4 s |
+| claude-code-log (`uvx`)            |       99 s |       168 s |
+| claude-session-dashboard (`npx`) † |      3.6 s |       3.6 s |
 
 - **uncached** — app-level cache wiped, forcing a full re-parse from JSONL
 - **warm cache** — re-run immediately afterwards; mmap + page cache hot
 
-† `claude-session-dashboard` is a local server, not a CLI report — its figure is cold-start to first-serve (ready banner). Two quirks the reproducible run surfaces: `ccusage` keeps no persistent parse cache (re-parses every run, so warm ≈ uncached), and `claude-code-log`'s Python pickle cache is *counterproductive* at this corpus size — a warm re-run is slower than a no-cache one. Competitor tools move fast; re-run the script for current numbers.
+† `claude-session-dashboard` is a local server, not a CLI report — its figure is cold-start to first-serve (ready banner). Two quirks the reproducible run surfaces: `ccusage` keeps no persistent parse cache (re-parses every run, so warm ≈ uncached), and `claude-code-log`'s Python pickle cache is _counterproductive_ at this corpus size — a warm re-run is slower than a no-cache one. Competitor tools move fast; re-run the script for current numbers.
 
 ### Where the time goes
 
@@ -145,15 +145,15 @@ claude-code-log (~99 s uncached / ~168 s warm)
 
 The redundancy in one row:
 
-| once per run | ccaudit (warm) | ccusage | claude-code-log |
-| --- | :---: | :---: | :---: |
-| stat 1161 JSONL files                          | — | ✓ | ✓ |
-| parse 318 K JSONL lines                        | — | ✓ | ✓ |
-| build per-message parent→child DAG             | — | — | ✓ |
-| render thousands of HTML files                 | — | — | ✓ |
-| HTTP-fetch LiteLLM prices                      | — | ✓ | — |
-| look up model prices, multiply by tokens       | — | ✓ | — |
-| sum already-bucketed numbers + print           | ✓ | ✓ | — |
+| once per run                             | ccaudit (warm) | ccusage | claude-code-log |
+| ---------------------------------------- | :------------: | :-----: | :-------------: |
+| stat 1161 JSONL files                    |       —        |    ✓    |        ✓        |
+| parse 318 K JSONL lines                  |       —        |    ✓    |        ✓        |
+| build per-message parent→child DAG       |       —        |    —    |        ✓        |
+| render thousands of HTML files           |       —        |    —    |        ✓        |
+| HTTP-fetch LiteLLM prices                |       —        |    ✓    |        —        |
+| look up model prices, multiply by tokens |       —        |    ✓    |        —        |
+| sum already-bucketed numbers + print     |       ✓        |    ✓    |        —        |
 
 ccaudit does the top six rows **once**, when it first sees a file, persists the result to a ~2 MB binary cache, and every subsequent run is just the bottom row.
 
@@ -329,7 +329,7 @@ ccaudit completion zsh > ~/.zfunc/_ccaudit      # shell completions
 - `--json` / `--plain` make output machine-readable; `--plain` is tab-separated with raw integers and no box-drawing or color.
 - `--order asc|desc`, `--offline`, and `--mode auto|calculate|display` are accepted for ccusage compatibility. ccaudit prices from its local cache on every run (update it online with `refresh-prices`), so `--offline` is already the default and `--mode display` falls back to calculated costs.
 - **Color** follows the [`NO_COLOR`](https://no-color.org) convention: ANSI color is emitted only when stdout is a terminal, and is disabled by `--no-color`, `NO_COLOR`, `CCAUDIT_NO_COLOR`, or `TERM=dumb` (force it back on with `FORCE_COLOR`). Piped output is always clean.
-- Mistyped a command or flag? ccaudit suggests the closest match (`ccaudit dialy` → *did you mean `ccaudit daily`?*).
+- Mistyped a command or flag? ccaudit suggests the closest match (`ccaudit dialy` → _did you mean `ccaudit daily`?_).
 
 ## Development
 
