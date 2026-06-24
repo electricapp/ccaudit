@@ -196,6 +196,23 @@ runner minutes matter, but keep the coverage.
 | **unused-deps** | `cargo machete` (via `taiki-e/install-action@<SHA>`) | flags dead deps |
 | **actionlint** | SHA-pinned download + `sha256` verify, then `./actionlint` | lints workflows + inline shell |
 
+**`cargo machete` (unused-deps) is mandatory in every repo's CI — no exceptions.**
+Unused dependencies inflate build time and the supply-chain surface and
+accumulate silently; the `unused-deps` job runs on every PR in all repos and is
+a required status check. Resolving a finding:
+
+- **Genuinely unused** crate -> remove it from `Cargo.toml`.
+- **False positive** — a crate used only via a macro, `derive`, re-export, or
+  feature that machete can't see (commonly `serde`, `serde_json`, `thiserror`,
+  `tokio`) -> do NOT delete it; add it to that crate's `Cargo.toml`:
+
+  ```toml
+  [package.metadata.cargo-machete]
+  ignored = ["serde", "thiserror"]
+  ```
+
+Never make the job non-blocking or drop it to "resolve" a finding.
+
 **Caching** — pick one and use it consistently:
 
 - `Swatinem/rust-cache@<SHA>` with a per-job `key:` (aethergraph/power-monitor).
