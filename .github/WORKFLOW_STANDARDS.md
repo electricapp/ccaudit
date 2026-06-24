@@ -12,21 +12,21 @@ repo-specific bits (binary name, targets, features) changed.
 > pin actions to commit SHAs, two float on mutable tags; one has no Dependabot
 > at all; one has no concurrency control; least-privilege `permissions` and
 > `actionlint` exist in only half. The org ships [`hasp`](https://github.com/electricapp/hasp)
-> — *"verifies pins, audits workflows"* — so our own workflows passing hasp's
+> — _"verifies pins, audits workflows"_ — so our own workflows passing hasp's
 > paranoid mode is table stakes, not aspiration.
 
 ---
 
 ## 0. Current-state matrix (2026-06)
 
-| Repo | branch | action pins | dependabot | least-priv perms | concurrency | actionlint job | deny.toml | governance | release hardening |
-|---|---|---|---|---|---|---|---|---|---|
-| `ccaudit` | main | yes (SHA) | yes (5 ecosystems) | yes (full) | yes | yes | yes | yes (gold) | yes (gold) |
-| `pgbattery` | main | yes (SHA) | yes (groups+docker) | partial | yes (+main nuance) | no | yes | no | partial (minisign) |
-| `hasp` | main | yes (SHA) | yes | yes (`{}`) | yes | no (self-scan) | no | no | yes (good) |
-| `power-monitor` | main | yes (SHA) | yes | no | yes | no | no | no | no |
-| `aethergraph` | main | **no (floating)** | yes (weekly) | no | yes | partial (config-only) | yes | no | no |
-| `ane-bridge-rs` | **master** | **no (floating)** | **no (none)** | no | **no (none)** | no | no | no | no |
+| Repo            | branch     | action pins       | dependabot          | least-priv perms | concurrency        | actionlint job        | deny.toml | governance | release hardening  |
+| --------------- | ---------- | ----------------- | ------------------- | ---------------- | ------------------ | --------------------- | --------- | ---------- | ------------------ |
+| `ccaudit`       | main       | yes (SHA)         | yes (5 ecosystems)  | yes (full)       | yes                | yes                   | yes       | yes (gold) | yes (gold)         |
+| `pgbattery`     | main       | yes (SHA)         | yes (groups+docker) | partial          | yes (+main nuance) | no                    | yes       | no         | partial (minisign) |
+| `hasp`          | main       | yes (SHA)         | yes                 | yes (`{}`)       | yes                | no (self-scan)        | no        | no         | yes (good)         |
+| `power-monitor` | main       | yes (SHA)         | yes                 | no               | yes                | no                    | no        | no         | no                 |
+| `aethergraph`   | main       | **no (floating)** | yes (weekly)        | no               | yes                | partial (config-only) | yes       | no         | no                 |
+| `ane-bridge-rs` | **master** | **no (floating)** | **no (none)**       | no               | **no (none)**      | no                    | no        | no         | no                 |
 
 The right-most "best" cell in each column is the target for every repo.
 
@@ -46,7 +46,7 @@ The right-most "best" cell in each column is the target for every repo.
 3. **Every job is bounded.** `timeout-minutes` on every job; `concurrency`
    with `cancel-in-progress` on every workflow.
 4. **The lockfile is the unit of trust.** `Cargo.lock` is committed; supply-chain
-   gates run against the *committed* lock on a schedule, not just at release.
+   gates run against the _committed_ lock on a schedule, not just at release.
 5. **Reproducible & attestable releases.** Anything we ship is signed (Sigstore
    keyless), attested (SLSA provenance), and published via OIDC Trusted
    Publishing — **no long-lived registry secrets**.
@@ -111,7 +111,7 @@ for some, neither for others.
     its `# 1.96`/`# nightly` channel-tag pins were converged to `@v1` without
     adding inputs — every Rust job broke until the inputs were restored.)
   - **inline `rustup`** (`rustup toolchain install "$RUST_TOOLCHAIN" --profile
-    minimal --component clippy,rustfmt`). No external action; fully explicit.
+minimal --component clippy,rustfmt`). No external action; fully explicit.
     Used by ccaudit/hasp.
 - `cargo-fuzz`, `miri`, sanitizers require **nightly** — install it only in the
   job that needs it, never as the repo default.
@@ -140,16 +140,16 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
-  RUST_TOOLCHAIN: "1.96.0"   # bump by hand; the msrv job guards the floor
+  RUSTFLAGS: '-D warnings'
+  RUST_TOOLCHAIN: '1.96.0' # bump by hand; the msrv job guards the floor
 ```
 
 Decisions baked in above, with rationale:
 
 - **`paths-ignore` vs required checks.** Do **not** add `paths-ignore: ['**/*.md']`
-  if the job is a *required* status check. A workflow skipped by a path filter
-  never reports its checks, so a docs-only PR hangs forever on *"Expected —
-  waiting for status"* (ccaudit learned this; its `ci.yml` documents it). Two
+  if the job is a _required_ status check. A workflow skipped by a path filter
+  never reports its checks, so a docs-only PR hangs forever on _"Expected —
+  waiting for status"_ (ccaudit learned this; its `ci.yml` documents it). Two
   valid resolutions: (a) no path filter, CI is cheap enough to always run
   (ccaudit's choice), or (b) path filter **plus** a sentinel "always-green"
   job carrying the required-check name. Pick (a) unless CI is slow.
@@ -167,9 +167,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: read          # re-granted explicitly even though it's the common case
+      contents: read # re-granted explicitly even though it's the common case
     steps:
-      - uses: actions/checkout@<SHA>  # v6.0.3
+      - uses: actions/checkout@<SHA> # v6.0.3
         with:
           persist-credentials: false
 ```
@@ -182,19 +182,19 @@ Every repo's `ci.yml` provides these checks (names matter — they become the
 required-status-check contexts in `settings.json`). Combine into fewer jobs if
 runner minutes matter, but keep the coverage.
 
-| Check | Command | Notes |
-|---|---|---|
-| **fmt** | `cargo fmt --all -- --check` | cheap; Linux runner even for macOS crates |
-| **clippy** | `cargo clippy --all-targets --all-features -- -D warnings` | all targets incl. tests/benches |
-| **feature matrix** | `clippy --no-default-features [--features X]` per feature | catches feature-gating bugs (ccaudit pattern) |
-| **test** | `cargo test --all-features` (`--release` if zero-alloc/optimizer-dependent tests) | bump `PROPTEST_CASES` for proptest repos (hasp: 2000) |
-| **doc** | `cargo doc --no-deps --all-features` with `RUSTDOCFLAGS: -D warnings` | catches broken intra-doc links; add `broken-intra-doc-links`, `private-intra-doc-links`, `invalid-codeblock-attributes` (power-monitor pattern) |
-| **msrv** | `cargo build --all-targets` on declared `rust-version` | the MSRV contract |
-| **deny** | `EmbarkStudios/cargo-deny-action@<SHA>` or `cargo deny check` | §8 |
-| **audit** | `rustsec/audit-check@<SHA>` (needs `checks: write`) or `cargo audit` | §8 |
-| **typos** | `crate-ci/typos@<SHA>` | docs + identifiers |
-| **unused-deps** | `cargo machete` (via `taiki-e/install-action@<SHA>`) | flags dead deps |
-| **actionlint** | SHA-pinned download + `sha256` verify, then `./actionlint` | lints workflows + inline shell |
+| Check              | Command                                                                           | Notes                                                                                                                                           |
+| ------------------ | --------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| **fmt**            | `cargo fmt --all -- --check`                                                      | cheap; Linux runner even for macOS crates                                                                                                       |
+| **clippy**         | `cargo clippy --all-targets --all-features -- -D warnings`                        | all targets incl. tests/benches                                                                                                                 |
+| **feature matrix** | `clippy --no-default-features [--features X]` per feature                         | catches feature-gating bugs (ccaudit pattern)                                                                                                   |
+| **test**           | `cargo test --all-features` (`--release` if zero-alloc/optimizer-dependent tests) | bump `PROPTEST_CASES` for proptest repos (hasp: 2000)                                                                                           |
+| **doc**            | `cargo doc --no-deps --all-features` with `RUSTDOCFLAGS: -D warnings`             | catches broken intra-doc links; add `broken-intra-doc-links`, `private-intra-doc-links`, `invalid-codeblock-attributes` (power-monitor pattern) |
+| **msrv**           | `cargo build --all-targets` on declared `rust-version`                            | the MSRV contract                                                                                                                               |
+| **deny**           | `EmbarkStudios/cargo-deny-action@<SHA>` or `cargo deny check`                     | §8                                                                                                                                              |
+| **audit**          | `rustsec/audit-check@<SHA>` (needs `checks: write`) or `cargo audit`              | §8                                                                                                                                              |
+| **typos**          | `crate-ci/typos@<SHA>`                                                            | docs + identifiers                                                                                                                              |
+| **unused-deps**    | `cargo machete` (via `taiki-e/install-action@<SHA>`)                              | flags dead deps                                                                                                                                 |
+| **actionlint**     | SHA-pinned download + `sha256` verify, then `./actionlint`                        | lints workflows + inline shell                                                                                                                  |
 
 **`cargo machete` (unused-deps) is mandatory in every repo's CI — no exceptions.**
 Unused dependencies inflate build time and the supply-chain surface and
@@ -257,25 +257,25 @@ Never make the job non-blocking or drop it to "resolve" a finding.
 
 Use these exact pins; let Dependabot move them forward in lockstep.
 
-| Action | Pin | Tag |
-|---|---|---|
-| `actions/checkout` | `df4cb1c069e1874edd31b4311f1884172cec0e10` | v6.0.3 |
-| `actions/cache` | `27d5ce7f107fe9357f9df03efb73ab90386fccae` | v5.0.5 |
-| `actions/upload-artifact` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` | v7.0.1 |
-| `actions/download-artifact` | `3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c` | v8.0.1 |
-| `actions/setup-node` | `48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e` | v6.4.0 |
-| `actions/setup-python` | `a309ff8b426b58ec0e2a45f0f869d46889d02405` | v6.2.0 |
-| `dtolnay/rust-toolchain` | `e97e2d8cc328f1b50210efc529dca0028893a2d9` | v1 |
-| `Swatinem/rust-cache` | `c19371144df3bb44fab255c43d04cbc2ab54d1c4` | v2.9.1 |
-| `EmbarkStudios/cargo-deny-action` | `bb137d7af7e4fb67e5f82a49c4fce4fad40782fe` | v2.0.20 |
-| `rustsec/audit-check` | `69366f33c96575abad1ee0dba8212993eecbe998` | v2.0.0 |
-| `crate-ci/typos` | `37bb98842b0d8c4ffebdb75301a13db0267cef89` | v1.47.2 |
-| `taiki-e/install-action` | `15449e3094499af05d8d964a1c884208e4b8b595` | v2.81.11 |
-| `docker/setup-buildx-action` | `d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5` | v4.1.0 |
-| `docker/build-push-action` | `f9f3042f7e2789586610d6e8b85c8f03e5195baf` | v7.2.0 |
-| `rust-lang/crates-io-auth-action` | `bbd81622f20ce9e2dd9622e3218b975523e45bbe` | v1.0.4 |
-| `pypa/gh-action-pypi-publish` | `cef221092ed1bacb1cc03d23a2d87d1d172e277b` | v1.14.0 |
-| `actions/attest-build-provenance` | `a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32` | v4.1.0 |
+| Action                            | Pin                                        | Tag      |
+| --------------------------------- | ------------------------------------------ | -------- |
+| `actions/checkout`                | `df4cb1c069e1874edd31b4311f1884172cec0e10` | v6.0.3   |
+| `actions/cache`                   | `27d5ce7f107fe9357f9df03efb73ab90386fccae` | v5.0.5   |
+| `actions/upload-artifact`         | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` | v7.0.1   |
+| `actions/download-artifact`       | `3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c` | v8.0.1   |
+| `actions/setup-node`              | `48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e` | v6.4.0   |
+| `actions/setup-python`            | `a309ff8b426b58ec0e2a45f0f869d46889d02405` | v6.2.0   |
+| `dtolnay/rust-toolchain`          | `e97e2d8cc328f1b50210efc529dca0028893a2d9` | v1       |
+| `Swatinem/rust-cache`             | `c19371144df3bb44fab255c43d04cbc2ab54d1c4` | v2.9.1   |
+| `EmbarkStudios/cargo-deny-action` | `bb137d7af7e4fb67e5f82a49c4fce4fad40782fe` | v2.0.20  |
+| `rustsec/audit-check`             | `69366f33c96575abad1ee0dba8212993eecbe998` | v2.0.0   |
+| `crate-ci/typos`                  | `37bb98842b0d8c4ffebdb75301a13db0267cef89` | v1.47.2  |
+| `taiki-e/install-action`          | `15449e3094499af05d8d964a1c884208e4b8b595` | v2.81.11 |
+| `docker/setup-buildx-action`      | `d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5` | v4.1.0   |
+| `docker/build-push-action`        | `f9f3042f7e2789586610d6e8b85c8f03e5195baf` | v7.2.0   |
+| `rust-lang/crates-io-auth-action` | `bbd81622f20ce9e2dd9622e3218b975523e45bbe` | v1.0.4   |
+| `pypa/gh-action-pypi-publish`     | `cef221092ed1bacb1cc03d23a2d87d1d172e277b` | v1.14.0  |
+| `actions/attest-build-provenance` | `a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32` | v4.1.0   |
 
 > **Needs resolution** (currently floating in aethergraph/ane-bridge-rs — pin
 > to current SHA via `gh api repos/<owner>/<repo>/git/ref/tags/<tag>`):
@@ -311,29 +311,29 @@ Canonical baseline (extend with docker/npm/pip per repo):
 version: 2
 updates:
   - package-ecosystem: cargo
-    directory: "/"
+    directory: '/'
     schedule:
       interval: daily
     open-pull-requests-limit: 99
     commit-message:
-      prefix: "deps(rust)"
-    labels: ["dependencies", "rust"]
+      prefix: 'deps(rust)'
+    labels: ['dependencies', 'rust']
     groups:
       cargo:
-        patterns: ["*"]
-        update-types: ["patch", "minor", "major"]
+        patterns: ['*']
+        update-types: ['patch', 'minor', 'major']
 
   - package-ecosystem: github-actions
-    directory: "/"
+    directory: '/'
     schedule:
       interval: daily
     open-pull-requests-limit: 99
     commit-message:
-      prefix: "deps(actions)"
-    labels: ["dependencies", "actions"]
+      prefix: 'deps(actions)'
+    labels: ['dependencies', 'actions']
     groups:
       actions:
-        patterns: ["*"]
+        patterns: ['*']
 ```
 
 Pair Dependabot with repo-level **Dependabot security updates** and
@@ -344,7 +344,7 @@ Pair Dependabot with repo-level **Dependabot security updates** and
 ## 8. Supply-chain: `deny.toml` + scheduled re-audit
 
 **Problem today:** hasp, power-monitor, ane-bridge-rs have **no `deny.toml`**.
-Only ccaudit runs a *scheduled* re-audit; everyone else only checks at PR/release
+Only ccaudit runs a _scheduled_ re-audit; everyone else only checks at PR/release
 time, so an advisory disclosed against an already-shipped dep goes unnoticed
 until the next push.
 
@@ -355,14 +355,14 @@ until the next push.
 2. CI runs `cargo deny check` + `cargo audit` (the `deny`/`audit` jobs in §5).
 3. Add **`supply-chain.yml`** — a scheduled (weekly, off-peak-minute cron) +
    `workflow_dispatch` job that re-audits the **committed lockfile** against the
-   live advisory DB. This catches *newly disclosed* advisories with no version
+   live advisory DB. This catches _newly disclosed_ advisories with no version
    bump to trigger CI. ccaudit's is the template:
 
 ```yaml
 name: Supply chain
 on:
   schedule:
-    - cron: "17 7 * * 1"   # Mon 07:17 UTC — offset off the busy top-of-hour
+    - cron: '17 7 * * 1' # Mon 07:17 UTC — offset off the busy top-of-hour
   workflow_dispatch:
 permissions:
   contents: read
@@ -374,7 +374,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@<SHA>  # v6.0.3
+      - uses: actions/checkout@<SHA> # v6.0.3
         with: { persist-credentials: false }
       - name: Install Rust
         run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
@@ -399,6 +399,7 @@ jobs:
 Apply the tier that matches what the repo distributes.
 
 **Tier 0 — every release.yml:**
+
 - Trigger only on `push: tags: ['v*']`; `permissions: {}` top-level, per-job grants.
 - Build matrix of real targets (`fail-fast: false`); cross-compile linux-arm64
   with `gcc-aarch64-linux-gnu`; static musl where it buys portability (hasp).
@@ -407,22 +408,25 @@ Apply the tier that matches what the repo distributes.
 - Generate a `.sha256` per artifact; `--generate-notes` on the GitHub release.
 
 **Tier 1 — signing & provenance (anything users install):**
+
 - **Sigstore keyless** signing via `cosign sign-blob` (cosign fetched by version
-  + sha256, never unpinned). Verify the signature in the same step.
+  - sha256, never unpinned). Verify the signature in the same step.
 - **SLSA build provenance** via `actions/attest-build-provenance@<SHA>` (needs
   `id-token: write` + `attestations: write`), or `gh attestation create`.
 - **SBOM**: `cargo sbom --output-format spdx_json_2_3` attached to the release
   (hasp).
 
 **Tier 2 — registry publishing without secrets:**
+
 - **OIDC Trusted Publishing** — no long-lived tokens:
   - crates.io: `rust-lang/crates-io-auth-action@<SHA>` -> short-lived token.
   - npm: `npm ≥ 11.5.1` + `npm publish --provenance` (token exchanged from OIDC).
   - PyPI: `pypa/gh-action-pypi-publish@<SHA>`.
 - Gate each publish behind a **deployment environment** (`environment:
-  crates-publish` etc.) with a reviewer + wait timer + tag policy (§10).
+crates-publish` etc.) with a reviewer + wait timer + tag policy (§10).
 
 **Tier 3 — reproducibility & integrity (ccaudit's extras, recommended):**
+
 - `SOURCE_DATE_EPOCH=0` + `RUSTFLAGS: --remap-path-prefix=$workspace=.` for
   path-independent, time-independent builds (hasp).
 - Build-twice-and-compare reproducibility check.
@@ -472,17 +476,28 @@ a CI/cron audit.
       "required_linear_history": true,
       "allow_force_pushes": false,
       "allow_deletions": false,
-      "required_conversation_resolution": true
-    }
+      "required_conversation_resolution": true,
+    },
   },
   "environments": [
-    { "name": "crates-publish", "wait_timer": 10, "reviewer_logins": ["electricapp"], "tag_patterns": ["v*.*.*"] }
+    {
+      "name": "crates-publish",
+      "wait_timer": 10,
+      "reviewer_logins": ["electricapp"],
+      "tag_patterns": ["v*.*.*"],
+    },
   ],
   "repo": {
-    "allow_squash_merge": true, "allow_merge_commit": false, "allow_rebase_merge": false,
-    "delete_branch_on_merge": true, "allow_auto_merge": true
+    "allow_squash_merge": true,
+    "allow_merge_commit": false,
+    "allow_rebase_merge": false,
+    "delete_branch_on_merge": true,
+    "allow_auto_merge": true,
   },
-  "security_and_analysis": { "secret_scanning": "enabled", "secret_scanning_push_protection": "enabled" }
+  "security_and_analysis": {
+    "secret_scanning": "enabled",
+    "secret_scanning_push_protection": "enabled",
+  },
 }
 ```
 
@@ -515,23 +530,23 @@ Repos with no self-hosted runners don't need this file — but they still need t
 These are not required everywhere, but they are the org's proven techniques —
 adopt the ones that fit each repo's failure modes.
 
-| Technique | Source repo | When to use |
-|---|---|---|
-| **feature-matrix clippy** | ccaudit | any repo with cargo features |
-| **fuzz-clippy** (lint an out-of-workspace `fuzz/` crate every PR) | pgbattery | repos with a separate fuzz crate that drifts |
-| **`cargo-fuzz` short-budget job** (60s/target) + scheduled deep soak | aethergraph, ane | parsers, decoders, untrusted input |
-| **miri** (`-Zmiri-strict-provenance`) | aethergraph | `unsafe`, raw pointers, custom allocators |
-| **loom** (exhaustive interleavings) | aethergraph, ane | lock-free / hand-rolled sync |
-| **macOS heap guards** (`MallocGuardEdges`/`Scribble`/`CheckHeap`) | ane | FFI / C interop on macOS, no nightly needed |
-| **ThreadSanitizer + `leaks`** | ane | C/Obj-C FFI, data-race & leak hunting |
-| **clang-format + clang-tidy** (`--Werror`) | ane | repos with a C/Obj-C component |
-| **self-scan / dogfood** (run the tool on its own repo, must pass clean) | hasp | any repo that *is* a code/security tool |
-| **`action-diff`** (post upstream changelog on Dependabot action-bump PRs) | hasp | reduces blind-merging of action bumps |
-| **`ratelimit.yml`** (`workflow_dispatch` GH API budget check) | hasp | repos that hit the GitHub API in tests/CI |
-| **`nightly-bench` + criterion summary** | aethergraph | perf-sensitive libs; track regressions |
-| **coverage** (`cargo-llvm-cov`) | ane | libraries wanting a coverage gate/badge |
-| **`$GITHUB_STEP_SUMMARY` rollups** | aethergraph | multi-job matrices — one glanceable table |
-| **per-commit `main` signal** (no cancel on main) | pgbattery | repos where CI bisection matters |
+| Technique                                                                 | Source repo      | When to use                                  |
+| ------------------------------------------------------------------------- | ---------------- | -------------------------------------------- |
+| **feature-matrix clippy**                                                 | ccaudit          | any repo with cargo features                 |
+| **fuzz-clippy** (lint an out-of-workspace `fuzz/` crate every PR)         | pgbattery        | repos with a separate fuzz crate that drifts |
+| **`cargo-fuzz` short-budget job** (60s/target) + scheduled deep soak      | aethergraph, ane | parsers, decoders, untrusted input           |
+| **miri** (`-Zmiri-strict-provenance`)                                     | aethergraph      | `unsafe`, raw pointers, custom allocators    |
+| **loom** (exhaustive interleavings)                                       | aethergraph, ane | lock-free / hand-rolled sync                 |
+| **macOS heap guards** (`MallocGuardEdges`/`Scribble`/`CheckHeap`)         | ane              | FFI / C interop on macOS, no nightly needed  |
+| **ThreadSanitizer + `leaks`**                                             | ane              | C/Obj-C FFI, data-race & leak hunting        |
+| **clang-format + clang-tidy** (`--Werror`)                                | ane              | repos with a C/Obj-C component               |
+| **self-scan / dogfood** (run the tool on its own repo, must pass clean)   | hasp             | any repo that _is_ a code/security tool      |
+| **`action-diff`** (post upstream changelog on Dependabot action-bump PRs) | hasp             | reduces blind-merging of action bumps        |
+| **`ratelimit.yml`** (`workflow_dispatch` GH API budget check)             | hasp             | repos that hit the GitHub API in tests/CI    |
+| **`nightly-bench` + criterion summary**                                   | aethergraph      | perf-sensitive libs; track regressions       |
+| **coverage** (`cargo-llvm-cov`)                                           | ane              | libraries wanting a coverage gate/badge      |
+| **`$GITHUB_STEP_SUMMARY` rollups**                                        | aethergraph      | multi-job matrices — one glanceable table    |
+| **per-commit `main` signal** (no cancel on main)                          | pgbattery        | repos where CI bisection matters             |
 
 ---
 
@@ -540,16 +555,18 @@ adopt the ones that fit each repo's failure modes.
 Ordered by blast radius. DONE = already compliant, TODO = action needed.
 
 ### `ane-bridge-rs` (most drift)
-- TODO: **Add `dependabot.yml`** (cargo + github-actions). *Currently none.*
+
+- TODO: **Add `dependabot.yml`** (cargo + github-actions). _Currently none._
 - TODO: **Pin all actions to SHAs** (`@v4`/`@v5`/`@stable` -> table pins).
 - TODO: **Add `concurrency` + `permissions: {}` + `timeout-minutes`** to every workflow.
 - TODO: `persist-credentials: false` on checkout.
 - TODO: Add `deny.toml` + `deny`/`audit` jobs + `supply-chain.yml`.
 - TODO: Add `actionlint` job; add `settings.json` + `apply-settings.sh`.
 - TODO: Decide `master` -> `main`.
-- DONE: Keep its excellent sanitizer/heap-guard/loom/TSAN lanes (§12 — these are a *model* for other FFI repos).
+- DONE: Keep its excellent sanitizer/heap-guard/loom/TSAN lanes (§12 — these are a _model_ for other FFI repos).
 
 ### `aethergraph`
+
 - TODO: **Pin all actions to SHAs** (`@v6`/`@stable`/`@nightly`, `setup-uv@v7`, `setup-bun@v2`).
 - TODO: Add top-level `permissions:` + per-job least privilege + `persist-credentials: false`.
 - TODO: Add `timeout-minutes` to the jobs missing it; add an **actionlint job** (config already present).
@@ -557,6 +574,7 @@ Ordered by blast radius. DONE = already compliant, TODO = action needed.
 - DONE: Dependabot present (consider daily+grouped to match standard); deny.toml present; miri/loom/fuzz exemplary.
 
 ### `power-monitor`
+
 - TODO: Add top-level `permissions:` + per-job grants + `persist-credentials: false`.
 - TODO: Add `deny.toml` + `deny`/`audit` jobs + `supply-chain.yml`.
 - TODO: Add `actionlint` job; add `settings.json` + `apply-settings.sh`.
@@ -564,12 +582,14 @@ Ordered by blast radius. DONE = already compliant, TODO = action needed.
 - DONE: SHA-pinned; concurrency; dependabot; macOS lane; doc-warnings-as-errors.
 
 ### `hasp`
+
 - TODO: Add `deny.toml` + `cargo deny check` (currently audit-only).
 - TODO: Add `actionlint` job (ironic gap for a workflow-security tool) — or wire its own `self-scan` to enforce it.
 - TODO: Add `settings.json` + `apply-settings.sh`.
 - DONE: SHA-pinned; `permissions: {}`; dependabot; self-scan; action-diff; SBOM; signed release.
 
 ### `pgbattery`
+
 - TODO: Tighten `permissions:` (top-level deny-all + per-job grants; `persist-credentials: false`).
 - TODO: Add `actionlint` job; converge dtolnay to the `@v1` SHA **and add explicit
   `toolchain:` inputs** (`1.96` for the main jobs, `nightly` for the fuzz lane) —
@@ -580,6 +600,7 @@ Ordered by blast radius. DONE = already compliant, TODO = action needed.
 - DONE: SHA-pinned; broad CI; grouped dependabot; concurrency main-nuance.
 
 ### `ccaudit` (reference — keep as the template)
+
 - DONE: Compliant across the board. Only gap: add a committed `.github/actionlint.yaml`
   if/when it gains a self-hosted runner (none today). Use it as the copy source.
 
@@ -604,4 +625,7 @@ Ordered by blast radius. DONE = already compliant, TODO = action needed.
    needs; migrate pgbattery to cosign keyless.
 7. Verify with **hasp** itself: `hasp --paranoid` against every repo's
    `.github/workflows` should pass clean.
+
+```
+
 ```

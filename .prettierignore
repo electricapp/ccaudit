@@ -3,5 +3,4 @@ node_modules
 src/**/*.rs
 *.toml
 *.lock
-*.md
 Makefile

@@ -29,12 +29,12 @@ Or: `make pypi-wheels` to do all four targets in sequence.
 
 Platform → PEP 425 wheel tag:
 
-| Rust target                        | Wheel `--plat-name`        |
-| ---------------------------------- | -------------------------- |
-| `aarch64-apple-darwin`             | `macosx_11_0_arm64`        |
-| `x86_64-apple-darwin`              | `macosx_10_12_x86_64`      |
-| `x86_64-unknown-linux-musl`        | `manylinux_2_17_x86_64`    |
-| `aarch64-unknown-linux-musl`       | `manylinux_2_17_aarch64`   |
+| Rust target                  | Wheel `--plat-name`      |
+| ---------------------------- | ------------------------ |
+| `aarch64-apple-darwin`       | `macosx_11_0_arm64`      |
+| `x86_64-apple-darwin`        | `macosx_10_12_x86_64`    |
+| `x86_64-unknown-linux-musl`  | `manylinux_2_17_x86_64`  |
+| `aarch64-unknown-linux-musl` | `manylinux_2_17_aarch64` |
 
 musl-linked Linux binaries are portable across glibc versions, so the
 `manylinux_2_17_*` tag is conservative but accurate — PyPI accepts
