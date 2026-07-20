@@ -170,7 +170,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install cargo-machete
-        uses: taiki-e/install-action@682e7d9e49c5e653d371fc6adbda67653461378a # v2.82.4
+        uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
         with:
           tool: cargo-machete
       - name: Check for unused dependencies
