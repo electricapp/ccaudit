@@ -1216,6 +1216,44 @@ fn subcommand_list_is_identical_in_help_and_completion() {
     }
 }
 
+/// A streamed assistant message bills its FINAL usage, not its first.
+///
+/// Claude Code rewrites a streamed message as it arrives, repeating the
+/// same `message.id` on each line. `input_tokens` and the cache counts
+/// are fixed by the request and repeat unchanged; `output_tokens` is a
+/// running total that grows. Coalescing to the first line booked a
+/// partial output count for every streamed message — 20% of all output
+/// on a year of real logs, and invisible because the input and cache
+/// columns still looked right.
+#[test]
+fn streamed_message_bills_its_final_usage() {
+    let h = Harness::new();
+    // One API call written across three lines, output climbing 100 →
+    // 400 → 900 while everything else stays put.
+    let usage = |out: u32| {
+        format!(
+            r#"{{"type":"assistant","timestamp":"2026-04-01T10:00:00.000Z","message":{{"id":"msg_stream","role":"assistant","model":"claude-opus-4-6-20251205","content":[{{"type":"text","text":"hi"}}],"usage":{{"input_tokens":1000,"output_tokens":{out},"cache_read_input_tokens":500,"cache_creation_input_tokens":0}}}}}}"#
+        )
+    };
+    let (partial, more, final_) = (usage(100), usage(400), usage(900));
+    let _ = h.write_jsonl("-Users-me-code-alpha", "s1", &[&partial, &more, &final_]);
+
+    let out = h.run(&["daily", "--json"]);
+    require_success(&out, "daily --json");
+    let parsed: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let totals = &parsed["totals"];
+
+    assert_eq!(
+        totals["output"].as_u64(),
+        Some(900),
+        "the run must collapse to its final output count, not its first"
+    );
+    // The three lines describe one call, so the repeated columns are
+    // counted once — not tripled.
+    assert_eq!(totals["input"].as_u64(), Some(1000));
+    assert_eq!(totals["cache_read"].as_u64(), Some(500));
+}
+
 /// `--source` names every provider in the registry, in every screen that
 /// mentions one. Adding a `SourceKind` must not leave a help screen
 /// advertising a stale list.

@@ -45,7 +45,11 @@ pub struct ParsedLine {
     pub input: u32,
     pub output: u32,
     pub cache_read: u32,
+    /// Total cache-creation tokens, both TTLs.
     pub cache_create: u32,
+    /// Portion of `cache_create` written at the 1-hour TTL. A subset of
+    /// it, priced at a higher rate — see [`Tokens`].
+    pub cache_create_1h: u32,
     // NOTE: when a provider (o1/o3-style reasoning models) starts emitting
     // reasoning-class tokens, add `pub reasoning: u32` here, mirror it in
     // Pricing + compute_cost, add a matching column to LineEntry / PreAgg
@@ -62,6 +66,22 @@ pub struct SourceFile {
     pub size: u64,
 }
 
+/// Token counts for one pricing call.
+///
+/// `cache_write_1h` is the portion of `cache_write` written at the
+/// 1-hour TTL — a subset of it, not an amount on top. Anthropic bills
+/// the two cache TTLs at different multiples of the input rate (1.25×
+/// for five minutes, 2× for an hour), so one blended cache-write number
+/// cannot price a session that used both.
+#[derive(Clone, Copy, Default)]
+pub struct Tokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_write: u64,
+    pub cache_write_1h: u64,
+    pub cache_read: u64,
+}
+
 // Per-million-token prices. A provider returns one of these for each
 // model it knows about; unknown models fall back to the provider's
 // default (typically Sonnet-tier).
@@ -69,21 +89,35 @@ pub struct SourceFile {
 pub struct Pricing {
     pub input: f64,
     pub output: f64,
+    /// 5-minute cache-write tier.
     pub cache_write: f64,
+    /// 1-hour cache-write tier. Providers without a second TTL set this
+    /// equal to `cache_write`.
+    pub cache_write_1h: f64,
     pub cache_read: f64,
 }
 
 impl Pricing {
-    /// Per-column dollar cost for a token quad. The single arithmetic
+    /// Per-column dollar cost for a token count. The single arithmetic
     /// primitive — `price_columns` and the memoized `ModelRates` both
     /// route through it so float-summation ordering stays identical
     /// across cache build, totals, and report output.
-    pub fn columns(&self, input: u64, output: u64, cache_write: u64, cache_read: u64) -> [f64; 4] {
+    ///
+    /// Both cache tiers land in the same (third) column: they are one
+    /// line item on the bill and one column in every report, priced at
+    /// two rates.
+    pub fn columns(&self, t: Tokens) -> [f64; 4] {
+        // Clamp: a provider claiming more 1h tokens than total cache
+        // writes is contradicting itself, and the subtraction below would
+        // underflow.
+        let long_ttl = t.cache_write_1h.min(t.cache_write);
+        let short_ttl = t.cache_write - long_ttl;
         [
-            (input as f64) * self.input / 1_000_000.0,
-            (output as f64) * self.output / 1_000_000.0,
-            (cache_write as f64) * self.cache_write / 1_000_000.0,
-            (cache_read as f64) * self.cache_read / 1_000_000.0,
+            (t.input as f64) * self.input / 1_000_000.0,
+            (t.output as f64) * self.output / 1_000_000.0,
+            (long_ttl as f64).mul_add(self.cache_write_1h, (short_ttl as f64) * self.cache_write)
+                / 1_000_000.0,
+            (t.cache_read as f64) * self.cache_read / 1_000_000.0,
         ]
     }
 }
@@ -189,29 +223,13 @@ pub trait Source: Sync + Send {
     /// Single arithmetic source of truth — every cost-producing site
     /// (cache build, per-session totals, JSON output) routes through
     /// this method so floating-point ordering stays identical.
-    fn price_columns(
-        &self,
-        model: Option<&str>,
-        input: u64,
-        output: u64,
-        cache_write: u64,
-        cache_read: u64,
-    ) -> [f64; 4] {
-        self.price(model)
-            .columns(input, output, cache_write, cache_read)
+    fn price_columns(&self, model: Option<&str>, t: Tokens) -> [f64; 4] {
+        self.price(model).columns(t)
     }
 
     /// Sum-of-columns convenience for callers that don't need the split.
-    fn compute_cost(
-        &self,
-        model: Option<&str>,
-        input: u64,
-        output: u64,
-        cache_write: u64,
-        cache_read: u64,
-    ) -> f64 {
-        let cols = self.price_columns(model, input, output, cache_write, cache_read);
-        cols.iter().sum()
+    fn compute_cost(&self, model: Option<&str>, t: Tokens) -> f64 {
+        self.price_columns(model, t).iter().sum()
     }
 }
 
@@ -248,20 +266,13 @@ impl ModelRates {
     /// Per-column cost for `mid`'s rate. `u16::MAX` (or an out-of-range
     /// id) falls back to the provider's unknown-model pricing — identical
     /// to `price_columns(None, …)`.
-    pub fn columns(
-        &self,
-        mid: u16,
-        input: u64,
-        output: u64,
-        cache_write: u64,
-        cache_read: u64,
-    ) -> [f64; 4] {
+    pub fn columns(&self, mid: u16, t: Tokens) -> [f64; 4] {
         let p = if mid == u16::MAX {
             &self.unknown
         } else {
             self.pricing.get(mid as usize).unwrap_or(&self.unknown)
         };
-        p.columns(input, output, cache_write, cache_read)
+        p.columns(t)
     }
 }
 
@@ -444,4 +455,87 @@ pub fn sanitize_control(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::float_cmp)]
+mod tests {
+    use super::{Pricing, Tokens};
+
+    // Claude Opus 4.x, mirroring `claude_code::OPUS`.
+    const OPUS: Pricing = Pricing {
+        input: 5.0,
+        output: 25.0,
+        cache_write: 6.25,
+        cache_write_1h: 10.0,
+        cache_read: 0.50,
+    };
+
+    /// Cache writes bill at two rates, and the 1-hour count is a subset
+    /// of the total rather than an amount on top of it.
+    ///
+    /// Reading only `cache_creation_input_tokens` and pricing all of it
+    /// at the 5-minute rate under-reported real spend by 5.6% on a
+    /// year of local logs, so this pins the split, not just the sum.
+    #[test]
+    fn cache_writes_price_per_ttl() {
+        let short_ttl = OPUS.columns(Tokens {
+            cache_write: 1_000_000,
+            ..Tokens::default()
+        });
+        assert_eq!(short_ttl[2], 6.25);
+
+        let long_ttl = OPUS.columns(Tokens {
+            cache_write: 1_000_000,
+            cache_write_1h: 1_000_000,
+            ..Tokens::default()
+        });
+        assert_eq!(long_ttl[2], 10.0, "a full 1h write bills at 2x input");
+
+        let mixed = OPUS.columns(Tokens {
+            cache_write: 1_000_000,
+            cache_write_1h: 400_000,
+            ..Tokens::default()
+        });
+        assert_eq!(
+            mixed[2], 7.75,
+            "600k at 6.25/M plus 400k at 10.0/M — the 1h count is part of the total, not extra"
+        );
+    }
+
+    /// A provider reporting more 1h tokens than total cache writes is
+    /// contradicting itself; clamp rather than bill the excess or
+    /// underflow the 5-minute remainder.
+    #[test]
+    fn nonsensical_1h_share_is_clamped() {
+        let over = OPUS.columns(Tokens {
+            cache_write: 1_000_000,
+            cache_write_1h: 5_000_000,
+            ..Tokens::default()
+        });
+        assert_eq!(over[2], 10.0);
+    }
+
+    /// Providers with one cache tier set both rates equal, so the split
+    /// is a no-op for them however the tokens are attributed.
+    #[test]
+    fn single_tier_providers_are_unaffected() {
+        let gpt5 = Pricing {
+            input: 1.25,
+            output: 10.0,
+            cache_write: 1.25,
+            cache_write_1h: 1.25,
+            cache_read: 0.125,
+        };
+        let split = Tokens {
+            cache_write: 800_000,
+            cache_write_1h: 800_000,
+            ..Tokens::default()
+        };
+        let flat = Tokens {
+            cache_write: 800_000,
+            ..Tokens::default()
+        };
+        assert_eq!(gpt5.columns(flat)[2], gpt5.columns(split)[2]);
+    }
 }

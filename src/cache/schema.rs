@@ -38,9 +38,10 @@
 use bytemuck::{Pod, Zeroable};
 
 pub const MAGIC: u32 = 0x4343_5547; // "CCUG"
-// Version history (a mismatch forces one full rebuild):
-//   v1: preaggs include usage from tool_use-only assistant lines.
-pub const VERSION: u32 = 1;
+// Bump on any change to the structs below or to what the build writes
+// into them; a mismatch forces one full rebuild, which is what keeps a
+// stale `.db` from being reinterpreted under a new layout.
+pub const VERSION: u32 = 0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -95,7 +96,13 @@ pub struct LineEntry {
     pub input: u32,
     pub output: u32,
     pub cache_read: u32,
+    /// Total cache-creation tokens, both TTLs.
     pub cache_create: u32,
+    /// Portion of `cache_create` at the 1-hour TTL. Stored per line
+    /// rather than folded into the cost at build time because
+    /// `per_session_totals` re-prices from these rows.
+    pub cache_create_1h: u32,
+    pub(crate) _pad: u32,
 }
 
 // Pre-aggregated bucket: one row per (day, model_id, project_id) triple.
@@ -116,13 +123,33 @@ pub struct PreAgg {
     pub input: u32,
     pub output: u32,
     pub cache_read: u32,
+    /// Total cache-creation tokens, both TTLs.
     pub cache_create: u32,
     pub cost_input: f64,
     pub cost_output: f64,
     pub cost_cache_read: f64,
     pub cost_cache_create: f64,
     pub line_count: u32,
-    pub(crate) _pad: u32,
+    /// Portion of `cache_create` at the 1-hour TTL. Reuses what was
+    /// alignment padding, so carrying it costs nothing; `cost_cache_create`
+    /// already has the tier split baked in, but a caller re-pricing from
+    /// preaggs needs the split itself.
+    pub cache_create_1h: u32,
+}
+
+impl LineEntry {
+    /// Token counts for pricing this row. Every aggregation loop prices
+    /// through this, so a new token column can't be added to the row and
+    /// silently left out of one of them.
+    pub fn tokens(&self) -> crate::source::Tokens {
+        crate::source::Tokens {
+            input: u64::from(self.input),
+            output: u64::from(self.output),
+            cache_write: u64::from(self.cache_create),
+            cache_write_1h: u64::from(self.cache_create_1h),
+            cache_read: u64::from(self.cache_read),
+        }
+    }
 }
 
 impl PreAgg {
@@ -144,6 +171,6 @@ const _: () = {
     assert!(HDR_SZ == 32);
     assert!(SESS_SZ == 48);
     assert!(SESS_EXT_SZ == 16);
-    assert!(LINE_SZ == 32);
+    assert!(LINE_SZ == 40);
     assert!(PREAGG_SZ == 64);
 };

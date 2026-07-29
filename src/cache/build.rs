@@ -86,6 +86,8 @@ pub fn build<S: Source + ?Sized>(mut parsed: Vec<ParsedSession>, source: &S) -> 
                 output: l.output,
                 cache_read: l.cache_read,
                 cache_create: l.cache_create,
+                cache_create_1h: l.cache_create_1h,
+                _pad: 0,
             });
         }
         ts_unix.extend_from_slice(&p.ts_unix);
@@ -198,13 +200,7 @@ fn build_preaggs<S: Source + ?Sized>(
             // Split cost by column so renders can show which token type
             // drove spend without re-pricing at query time. Single
             // pricing primitive shared with per_session_totals + reports.
-            let [ci, co, ccw, ccr] = rates.columns(
-                mid,
-                u64::from(line.input),
-                u64::from(line.output),
-                u64::from(line.cache_create),
-                u64::from(line.cache_read),
-            );
+            let [ci, co, ccw, ccr] = rates.columns(mid, line.tokens());
 
             let key: u64 =
                 (u64::from(line.day as u32) << 32) | (u64::from(mid) << 16) | u64::from(project_id);
@@ -221,12 +217,13 @@ fn build_preaggs<S: Source + ?Sized>(
                 cost_cache_read: 0.0,
                 cost_cache_create: 0.0,
                 line_count: 0,
-                _pad: 0,
+                cache_create_1h: 0,
             });
             entry.input = entry.input.saturating_add(line.input);
             entry.output = entry.output.saturating_add(line.output);
             entry.cache_read = entry.cache_read.saturating_add(line.cache_read);
             entry.cache_create = entry.cache_create.saturating_add(line.cache_create);
+            entry.cache_create_1h = entry.cache_create_1h.saturating_add(line.cache_create_1h);
             entry.cost_input += ci;
             entry.cost_output += co;
             entry.cost_cache_read += ccr;

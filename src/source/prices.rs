@@ -37,6 +37,11 @@ struct LiteLLMEntry {
     output_cost_per_token: Option<f64>,
     #[serde(default)]
     cache_creation_input_token_cost: Option<f64>,
+    /// 1-hour cache-write tier. Present on models that offer the longer
+    /// TTL (Anthropic 4.5+); absent everywhere else, where the single
+    /// cache-write rate applies to every write.
+    #[serde(default)]
+    cache_creation_input_token_cost_above_1hr: Option<f64>,
     #[serde(default)]
     cache_read_input_token_cost: Option<f64>,
 }
@@ -167,13 +172,21 @@ fn parse(bytes: &[u8]) -> Result<PricesLookup, String> {
             continue;
         };
         // LiteLLM values are per-token; our Pricing struct is per-million.
+        let cache_write = e
+            .cache_creation_input_token_cost
+            .map(|c| c * 1_000_000.0)
+            .unwrap_or(in_c * 1_000_000.0 * 1.25); // LiteLLM convention when unset
         let p = Pricing {
             input: in_c * 1_000_000.0,
             output: out_c * 1_000_000.0,
-            cache_write: e
-                .cache_creation_input_token_cost
-                .map(|c| c * 1_000_000.0)
-                .unwrap_or(in_c * 1_000_000.0 * 1.25), // LiteLLM convention when unset
+            cache_write,
+            // Absent means the model has one cache tier, so the write
+            // rate covers every write. Falling back to `cache_write`
+            // (rather than assuming a 2× tier) keeps a model without the
+            // longer TTL priced at what it actually charges.
+            cache_write_1h: e
+                .cache_creation_input_token_cost_above_1hr
+                .map_or(cache_write, |c| c * 1_000_000.0),
             cache_read: e
                 .cache_read_input_token_cost
                 .map(|c| c * 1_000_000.0)
@@ -283,6 +296,7 @@ mod tests {
                     input: n,
                     output: n,
                     cache_write: n,
+                    cache_write_1h: n,
                     cache_read: n,
                 },
             );

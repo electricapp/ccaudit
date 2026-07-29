@@ -169,27 +169,30 @@ fn claude_name_candidates(name: &str) -> ([String; 4], usize) {
 
 // Anthropic pricing, per-million tokens. These are the hardcoded fallback
 // used when `prices.json` (from `ccaudit refresh-prices`) isn't present.
-// Numbers mirror what LiteLLM currently reports for Claude 4.x — the
-// standard 5-minute cache write tier (1.25× input) and 90% cache-read
-// discount. Values here are verified against:
+// Numbers mirror what LiteLLM currently reports for Claude 4.x: the
+// 5-minute cache write tier at 1.25× input, the 1-hour tier at 2×, and a
+// 90% cache-read discount. Values here are verified against:
 //   https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
 // (keys: claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5).
 const OPUS: Pricing = Pricing {
     input: 5.0,
     output: 25.0,
     cache_write: 6.25,
+    cache_write_1h: 10.0,
     cache_read: 0.50,
 };
 const SONNET: Pricing = Pricing {
     input: 3.0,
     output: 15.0,
     cache_write: 3.75,
+    cache_write_1h: 6.0,
     cache_read: 0.30,
 };
 const HAIKU: Pricing = Pricing {
     input: 1.0,
     output: 5.0,
     cache_write: 1.25,
+    cache_write_1h: 2.0,
     cache_read: 0.10,
 };
 // Claude 3.x generations (legacy logs). Keys: claude-3-opus,
@@ -198,18 +201,21 @@ const OPUS_3: Pricing = Pricing {
     input: 15.0,
     output: 75.0,
     cache_write: 18.75,
+    cache_write_1h: 30.0,
     cache_read: 1.50,
 };
 const HAIKU_3_5: Pricing = Pricing {
     input: 0.80,
     output: 4.0,
     cache_write: 1.0,
+    cache_write_1h: 1.6,
     cache_read: 0.08,
 };
 const HAIKU_3: Pricing = Pricing {
     input: 0.25,
     output: 1.25,
     cache_write: 0.30,
+    cache_write_1h: 0.5,
     cache_read: 0.03,
 };
 
@@ -299,10 +305,18 @@ fn display_name_of(session: &Session) -> String {
 // Turn the Claude-shaped Session (which the TUI/web data model uses)
 // into a provider-agnostic ParsedSession. Consecutive sub-messages with
 // the same `message_id` are coalesced — the parser emits one per content
-// block but they all represent a single API call.
+// block, but they all describe a single API call.
+//
+// Coalescing keeps the LAST line of a run, not the first. Claude Code
+// rewrites a streamed assistant message as it arrives, and `usage`
+// carries the running total: `input_tokens` and the cache counts are
+// fixed by the request and repeat unchanged, while `output_tokens` grows
+// with each line. Keeping the first line therefore booked a partial
+// output count for every streamed message — 4.4M tokens (~20% of all
+// output) missing across a year of local logs.
 fn to_parsed_session(path: &Path, src: &SourceFile, session: &Session) -> ParsedSession {
-    let mut lines = Vec::new();
-    let mut ts_unix = Vec::new();
+    let mut lines: Vec<ParsedLine> = Vec::new();
+    let mut ts_unix: Vec<i64> = Vec::new();
     let mut last_id: Option<&str> = None;
     for msg in &session.messages {
         let Message {
@@ -321,11 +335,7 @@ fn to_parsed_session(path: &Path, src: &SourceFile, session: &Session) -> Parsed
         let Some(t) = tokens.as_ref() else { continue };
         let Some(ts) = *timestamp else { continue };
         let id = message_id.as_deref();
-        if id.is_some() && id == last_id {
-            continue;
-        }
-        last_id = id;
-        lines.push(ParsedLine {
+        let line = ParsedLine {
             day: day_from_ts(ts),
             msg_id_hash: id.map(|s| fnv1a(s.as_bytes())),
             model: model.clone(),
@@ -333,7 +343,25 @@ fn to_parsed_session(path: &Path, src: &SourceFile, session: &Session) -> Parsed
             output: t.output.min(u64::from(u32::MAX)) as u32,
             cache_read: t.cache_read.min(u64::from(u32::MAX)) as u32,
             cache_create: t.cache_create.min(u64::from(u32::MAX)) as u32,
-        });
+            cache_create_1h: t.cache_create_1h.min(u64::from(u32::MAX)) as u32,
+        };
+        // Same id as the previous line: overwrite it rather than append,
+        // so the run collapses to its final, complete usage. `max` on
+        // each column rather than a blind overwrite, because a later
+        // line reporting *less* than an earlier one would otherwise
+        // discard tokens that were already billed.
+        if id.is_some() && id == last_id {
+            if let Some(prev) = lines.last_mut() {
+                prev.output = prev.output.max(line.output);
+                prev.input = prev.input.max(line.input);
+                prev.cache_read = prev.cache_read.max(line.cache_read);
+                prev.cache_create = prev.cache_create.max(line.cache_create);
+                prev.cache_create_1h = prev.cache_create_1h.max(line.cache_create_1h);
+                continue;
+            }
+        }
+        last_id = id;
+        lines.push(line);
         ts_unix.push(ts.timestamp());
     }
     ParsedSession {

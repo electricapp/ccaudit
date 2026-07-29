@@ -447,6 +447,7 @@ fn reconstruct_from_cache(
             output: l.output,
             cache_read: l.cache_read,
             cache_create: l.cache_create,
+            cache_create_1h: l.cache_create_1h,
         });
     }
     let started_at = if s.started_ts == i64::MIN {

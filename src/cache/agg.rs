@@ -219,13 +219,7 @@ pub fn per_session_totals<S: Source + ?Sized>(
             if rates.skip(mid) {
                 continue;
             }
-            let [ci, co, ccw, ccr] = rates.columns(
-                mid,
-                u64::from(line.input),
-                u64::from(line.output),
-                u64::from(line.cache_create),
-                u64::from(line.cache_read),
-            );
+            let [ci, co, ccw, ccr] = rates.columns(mid, line.tokens());
 
             totals.input += u64::from(line.input);
             totals.output += u64::from(line.output);
@@ -351,13 +345,7 @@ pub fn aggregate<S: Source + ?Sized>(
             if rates.skip(mid) {
                 continue;
             }
-            let [ci, co, ccw, ccr] = rates.columns(
-                mid,
-                u64::from(line.input),
-                u64::from(line.output),
-                u64::from(line.cache_create),
-                u64::from(line.cache_read),
-            );
+            let [ci, co, ccw, ccr] = rates.columns(mid, line.tokens());
 
             let key = match bucket {
                 Bucket::Day => BucketKey(i64::from(effective_day)),

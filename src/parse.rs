@@ -119,7 +119,13 @@ pub struct TokenUsage {
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
+    /// Total cache-creation tokens, both TTLs.
     pub cache_create: u64,
+    /// Portion of `cache_create` written at the 1-hour TTL, which bills
+    /// at a higher rate. `serde(default)` so a per-session cache blob
+    /// written before this field existed still deserializes.
+    #[serde(default)]
+    pub cache_create_1h: u64,
 }
 
 // ── Per-session binary cache (postcard) ──
@@ -156,14 +162,11 @@ fn cache_key(path: &Path) -> String {
     format!("{:016x}", crate::source::path_hash(path))
 }
 
-// Bumped whenever Session header or Message struct changes shape, OR
-// when the on-disk encoding changes, OR when parser behavior changes
-// what a Session contains (a stale blob would otherwise stay "fresh"
-// forever since invalidation is fingerprint-based).
-//   v1: tool_use parts with unmodeled inputs are kept, user block-array
-//       text is MessageKind::User, id-less multi-part lines carry usage
-//       on the first part only.
-const CACHE_VERSION: u8 = 1;
+// Bump whenever the Session header or Message struct changes shape, the
+// on-disk encoding changes, or the parser changes what a Session
+// contains — invalidation is fingerprint-based, so a stale blob would
+// otherwise stay "fresh" forever.
+const CACHE_VERSION: u8 = 0;
 
 #[derive(Serialize, Deserialize)]
 struct CacheMeta {
@@ -360,6 +363,17 @@ struct RawUsage {
     output_tokens: Option<u64>,
     cache_read_input_tokens: Option<u64>,
     cache_creation_input_tokens: Option<u64>,
+    /// Per-TTL split of `cache_creation_input_tokens`. Anthropic bills
+    /// the 1-hour tier at 2× input against the 5-minute tier's 1.25×, so
+    /// the flat total alone can't be priced. Absent on older logs, where
+    /// only the 5-minute tier existed.
+    cache_creation: Option<RawCacheCreation>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawCacheCreation {
+    ephemeral_1h_input_tokens: u64,
 }
 
 #[derive(Deserialize, Default)]
@@ -598,6 +612,10 @@ fn parse_one_line(line: &[u8]) -> Option<ParsedLine> {
                 output: u.output_tokens.unwrap_or(0),
                 cache_read: u.cache_read_input_tokens.unwrap_or(0),
                 cache_create: u.cache_creation_input_tokens.unwrap_or(0),
+                cache_create_1h: u
+                    .cache_creation
+                    .as_ref()
+                    .map_or(0, |c| c.ephemeral_1h_input_tokens),
             });
             Some(ParsedLine {
                 kind: LineParsed::Assistant {

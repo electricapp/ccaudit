@@ -90,23 +90,28 @@ fn openai_name_candidates(name: &str) -> [String; 2] {
     [name.to_string(), format!("openai/{name}")]
 }
 
+// OpenAI doesn't bill cache writes separately — the input rate covers
+// them — and has no second cache TTL, so both write tiers are the input
+// rate here.
 const GPT5: Pricing = Pricing {
     input: 1.25,
     output: 10.0,
-    // OpenAI doesn't bill cache writes separately — the input rate covers it.
     cache_write: 1.25,
+    cache_write_1h: 1.25,
     cache_read: 0.125,
 };
 const GPT5_MINI: Pricing = Pricing {
     input: 0.25,
     output: 2.0,
     cache_write: 0.25,
+    cache_write_1h: 0.25,
     cache_read: 0.025,
 };
 const GPT5_NANO: Pricing = Pricing {
     input: 0.05,
     output: 0.40,
     cache_write: 0.05,
+    cache_write_1h: 0.05,
     cache_read: 0.005,
 };
 
@@ -360,6 +365,7 @@ fn parse_codex_session(src: &SourceFile) -> Option<ParsedSession> {
                         output: output.min(u64::from(u32::MAX)) as u32,
                         cache_read: cached.min(u64::from(u32::MAX)) as u32,
                         cache_create: 0,
+                        cache_create_1h: 0,
                     });
                     ts_unix.push(line.timestamp.timestamp());
                 }
@@ -659,8 +665,10 @@ fn parse_codex_messages(path: &Path) -> Option<crate::parse::Session> {
                     output,
                     cache_read: cached,
                     // OpenAI bills cache writes at the input rate rather
-                    // than as a separate column — see `GPT5`.
+                    // than as a separate column, and has no second cache
+                    // TTL — see `GPT5`.
                     cache_create: 0,
+                    cache_create_1h: 0,
                 };
                 // The count follows the API call it belongs to, so the
                 // tokens land on whatever that call just produced: the
