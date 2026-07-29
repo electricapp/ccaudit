@@ -772,68 +772,176 @@ pub fn version_detail() -> String {
     format!("ccaudit {}", version_core())
 }
 
+/// U+0020 SPACE, the pad character for every help column. Named so the
+/// layout below is written as widths in columns rather than as runs of
+/// literal spaces nobody can count without a cursor.
+const PAD: char = '\u{20}';
+
+/// Body indent, in columns, shared by every `--help` section, so the
+/// screen has one left edge to scan down instead of a per-section one.
+const HELP_INDENT_COLS: usize = 3;
+
+/// Width, in columns, of the `-x, ` short-alias column. A flag with no
+/// short alias pads to the same width, keeping every long flag in one
+/// column.
+const SHORT_GUTTER_COLS: usize = 4;
+
+/// Columns between a two-column block's left column and its descriptions.
+const COL_GAP_COLS: usize = 2;
+
+/// `cols` worth of [`PAD`].
+fn pad(cols: usize) -> String {
+    std::iter::repeat_n(PAD, cols).collect()
+}
+
+/// Display width of `s` in terminal columns.
+fn cols(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
+/// Print `(left, description)` pairs as an aligned two-column block.
+///
+/// The left column is padded to its widest entry by display width, so a
+/// newly added row lands in the same description column as its
+/// neighbours and a non-ASCII metavar can't over-pad. An empty
+/// description prints the left column alone, with no trailing pad, and
+/// does not widen the column — one overlong uncommented row would
+/// otherwise push every description off to the right.
+#[allow(clippy::print_stdout)] // part of requested help → stdout
+fn print_two_col(rows: &[(String, &str)]) {
+    let indent = pad(HELP_INDENT_COLS);
+    let left_w = rows
+        .iter()
+        .filter(|(_, desc)| !desc.is_empty())
+        .map(|(l, _)| cols(l))
+        .max()
+        .unwrap_or(0);
+    for (left, desc) in rows {
+        if desc.is_empty() {
+            println!("{indent}{left}");
+            continue;
+        }
+        let gap = pad(left_w.saturating_sub(cols(left)) + COL_GAP_COLS);
+        println!("{indent}{left}{gap}{desc}");
+    }
+}
+
 #[allow(clippy::print_stdout)] // requested help is primary output → stdout
 pub fn print_help() {
     // Sectioned layout modeled on cloudflared / phonon: NAME, USAGE,
-    // DESCRIPTION, COMMANDS, GLOBAL OPTIONS, EXAMPLES, LEARN MORE,
-    // SUPPORT. Section headers give onboarding readers something to
-    // skim; the two-space command/flag columns line up for scanning.
+    // VERSION, DESCRIPTION, COMMANDS, GLOBAL OPTIONS, EXAMPLES, LEARN
+    // MORE, SUPPORT. Section headers give onboarding readers something
+    // to skim. Backticks are markdown, not terminal syntax — command
+    // names in prose are left bare so they don't render as literals.
+    let i = pad(HELP_INDENT_COLS);
     println!("NAME:");
-    println!("   ccaudit - fast Claude Code token usage analyzer");
+    println!("{i}ccaudit - fast token usage + cost analyzer for Claude Code and Codex logs");
     println!();
     println!("USAGE:");
-    println!("   ccaudit [COMMAND] [FLAGS]");
+    println!("{i}ccaudit [COMMAND] [FLAGS]");
     println!();
     println!("VERSION:");
-    println!("   {}", version_core());
+    println!("{i}{}", version_core());
     println!();
     println!("DESCRIPTION:");
-    println!("   Token usage and cost reports for your local Claude Code logs —");
-    println!("   daily, weekly, monthly, per session, or per 5-hour billing block,");
-    println!("   as tables, JSON, an interactive TUI, or a web dashboard.");
-    println!("   Update model prices anytime with `ccaudit refresh-prices`.");
+    println!("{i}Token usage and cost reports for your local Claude Code or Codex");
+    println!("{i}logs — daily, weekly, monthly, per session, or per 5-hour billing");
+    println!("{i}block, as tables, JSON, an interactive TUI, or a web dashboard.");
+    println!("{i}Update model prices anytime with ccaudit refresh-prices.");
     println!();
+
     println!("COMMANDS:");
-    println!("  daily           (default) daily token usage + cost");
-    println!("  weekly          aggregate by week (Mon-anchored)");
-    println!("  monthly         aggregate by month");
-    println!("  session         aggregate by conversation session");
-    println!("  blocks          5-hour billing windows, with active detection");
-    println!("  statusline      compact one-line summary for terminal status bars");
+    let mut commands: Vec<(String, &str)> = vec![
+        ("daily".into(), "(default) daily token usage + cost"),
+        ("weekly".into(), "aggregate by week (Mon-anchored)"),
+        ("monthly".into(), "aggregate by month"),
+        ("session".into(), "aggregate by conversation session"),
+        (
+            "blocks".into(),
+            "5-hour billing windows, with active detection",
+        ),
+        (
+            "statusline".into(),
+            "compact one-line summary for terminal status bars",
+        ),
+    ];
     #[cfg(feature = "tui")]
-    println!("  tui             interactive TUI browser");
+    commands.push(("tui".into(), "interactive TUI browser"));
     #[cfg(feature = "web")]
-    println!("  web             generate static site + serve");
-    println!("  refresh-prices  fetch latest model prices from LiteLLM");
-    println!("  completion      print a shell completion script (bash/zsh/fish)");
-    println!("  version         print the version");
-    println!("  help [COMMAND]  show help for ccaudit or for a command");
+    commands.push(("web".into(), "generate static site + serve"));
+    commands.extend([
+        (
+            "refresh-prices".into(),
+            "fetch latest model prices from LiteLLM",
+        ),
+        (
+            "completion".into(),
+            "print a shell completion script (bash/zsh/fish)",
+        ),
+        ("version".into(), "print the version"),
+        (
+            "help [COMMAND]".into(),
+            "show help for ccaudit or for a command",
+        ),
+    ]);
+    print_two_col(&commands);
     println!();
+
     println!("GLOBAL OPTIONS:");
-    println!("      --since YYYYMMDD    filter by start date (inclusive)");
-    println!("      --until YYYYMMDD    filter by end date (inclusive)");
-    println!("      --project NAME      filter to a single project");
-    println!("      --timezone TZ      UTC, Local, or ±HH:MM (default UTC)");
-    println!("      --locale LOC       date locale (e.g. en_US, ja_JP)");
-    println!("      --source NAME      log provider: claude-code (default), codex");
-    println!("      --no-color         disable ANSI color (also: NO_COLOR env)");
-    println!("  -q, --quiet            suppress non-essential output");
-    println!("  -V, --version          print the version");
-    println!("  -h, --help             show help");
+    // (short alias, long form + metavar, description).
+    let flags: &[(&str, &str, &str)] = &[
+        ("", "--since YYYYMMDD", "filter by start date (inclusive)"),
+        ("", "--until YYYYMMDD", "filter by end date (inclusive)"),
+        ("", "--project NAME", "filter to a single project"),
+        ("", "--timezone TZ", "UTC, Local, or ±HH:MM (default UTC)"),
+        ("", "--locale LOC", "date locale (e.g. en_US, ja_JP)"),
+        (
+            "",
+            "--source NAME",
+            "log provider: claude-code (default), codex",
+        ),
+        ("", "--no-color", "disable ANSI color (also: NO_COLOR env)"),
+        ("-q", "--quiet", "suppress non-essential output"),
+        ("-V", "--version", "print the version"),
+        ("-h", "--help", "show help"),
+    ];
+    let flag_rows: Vec<(String, &str)> = flags
+        .iter()
+        .map(|(short, long, desc)| {
+            let mut gutter = if short.is_empty() {
+                String::new()
+            } else {
+                format!("{short},")
+            };
+            gutter.push_str(&pad(SHORT_GUTTER_COLS.saturating_sub(cols(&gutter))));
+            (format!("{gutter}{long}"), *desc)
+        })
+        .collect();
+    print_two_col(&flag_rows);
     println!();
+
+    // The pipe examples carry no trailing comment, so they don't widen
+    // the comment column (see `print_two_col`).
     println!("EXAMPLES:");
-    println!("   $ ccaudit                                  # today + recent daily usage");
-    println!("   $ ccaudit monthly --breakdown              # months, split per model");
-    println!("   $ ccaudit blocks --active                  # just the live 5-hour window");
-    println!("   $ ccaudit daily --since 20260101 --json | jq .totals");
-    println!("   $ ccaudit daily --plain | awk '{{print $1, $NF}}'");
+    let examples: &[(&str, &str)] = &[
+        ("$ ccaudit", "# today + recent daily usage"),
+        ("$ ccaudit monthly --breakdown", "# months, split per model"),
+        ("$ ccaudit blocks --active", "# just the live 5-hour window"),
+        ("$ ccaudit daily --since 20260101 --json | jq .totals", ""),
+        ("$ ccaudit daily --plain | awk '{print $1, $NF}'", ""),
+    ];
+    let example_rows: Vec<(String, &str)> = examples
+        .iter()
+        .map(|(cmd, note)| ((*cmd).to_owned(), *note))
+        .collect();
+    print_two_col(&example_rows);
     println!();
     println!("LEARN MORE:");
-    println!("   Use `ccaudit <command> --help` for command-specific flags.");
-    println!("   Read the full docs at https://github.com/electricapp/ccaudit");
+    println!("{i}Use ccaudit <command> --help for command-specific flags.");
+    println!("{i}Read the full docs at https://github.com/electricapp/ccaudit");
     println!();
     println!("SUPPORT:");
-    println!("   Report bugs at https://github.com/electricapp/ccaudit/issues");
+    println!("{i}Report bugs at https://github.com/electricapp/ccaudit/issues");
 }
 
 #[allow(clippy::print_stdout)] // requested help is primary output → stdout
@@ -860,7 +968,7 @@ pub fn print_subcommand_help(cmd: Cmd) {
             println!("  ccaudit statusline [GLOBAL FLAGS]");
             println!();
             println!("FLAGS");
-            println!("  (global flags only — see `ccaudit --help`)");
+            println!("  (global flags only — see ccaudit --help)");
             println!();
             println!("EXAMPLES");
             println!("  ccaudit statusline");
@@ -879,7 +987,7 @@ pub fn print_subcommand_help(cmd: Cmd) {
             println!("  ccaudit tui");
             println!();
             println!("Note: global filter flags (--since/--until/--project) are not yet honored");
-            println!("by `tui`. It launches the browser with all data loaded.");
+            println!("by tui. It launches the browser with all data loaded.");
         }
         Cmd::Web => {
             println!("ccaudit web - generate static site + serve");
@@ -897,7 +1005,7 @@ pub fn print_subcommand_help(cmd: Cmd) {
             println!("  ccaudit web --port 8080 --out ./site");
             println!();
             println!("Note: global filter flags (--since/--until/--project) are not yet honored");
-            println!("by `web`. It generates the site with all data loaded.");
+            println!("by web. It generates the site with all data loaded.");
         }
         Cmd::RefreshPrices => {
             println!("ccaudit refresh-prices - fetch latest model prices from LiteLLM");
@@ -958,7 +1066,7 @@ fn print_report_help(name: &str, tagline: &str, extra: Option<&[(&str, &str)]>) 
     for (flag, desc) in extra.unwrap_or(&[]) {
         println!("  {flag:<19} {desc}");
     }
-    println!("  (plus global flags — see `ccaudit --help`)");
+    println!("  (plus global flags — see ccaudit --help)");
     println!();
     println!("EXAMPLES");
     println!("  ccaudit {name}");
