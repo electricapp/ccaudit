@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 env:
-  RUST_TOOLCHAIN: "1.95.0"
+  RUST_TOOLCHAIN: "1.97.1"
 
 concurrency:
   group: ${{ github.workflow }}

@@ -87,9 +87,9 @@ jobs, sanitizer lanes, `security.yml` (self-scan), `action-diff.yml`,
 ## 3. Toolchain & MSRV policy
 
 **Problem today:** toolchains are scattered — `1.94` (hasp), `1.95`
-(ccaudit/aethergraph/ane), `1.96` (pgbattery/power-monitor), and bare `stable`
-(aethergraph/ane). MSRV is declared in `Cargo.toml` for some, enforced in CI
-for some, neither for others.
+(aethergraph/ane), `1.96` (pgbattery/power-monitor), `1.97.1` (ccaudit), and
+bare `stable` (aethergraph/ane). MSRV is declared in `Cargo.toml` for some,
+enforced in CI for some, neither for others.
 
 **Standard:**
 
