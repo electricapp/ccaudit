@@ -67,6 +67,23 @@ impl Source for ClaudeCode {
         Some(to_parsed_session(&src.path, src, &session))
     }
 
+    fn parse_messages(&self, path: &Path) -> Option<Session> {
+        parse::parse_session_allow_empty(path)
+    }
+
+    fn project_key(&self, path: &Path, _cwd: Option<&str>) -> String {
+        // Group by the project directory, not the file's immediate
+        // parent: subagent transcripts live at
+        // `<project>/<uuid>/subagents/agent-*.jsonl`, and bucketing
+        // those by `parent()` would invent a `subagents` project per
+        // conversation instead of folding them into the real one.
+        project_root_of(path)
+            .or_else(|| path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn price(&self, model: Option<&str>) -> &Pricing {
         // 1. Try the user's refreshed LiteLLM cache (if present). This
         //    matches ccusage's approach and keeps prices current without

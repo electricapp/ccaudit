@@ -1099,3 +1099,140 @@ fn locale_flag_validates_instead_of_silently_ignoring() {
         );
     }
 }
+
+// ── Flag-list parity ──
+//
+// ccaudit has no clap dependency: the parser, the typo-hint table, the
+// help screens, and the completion scripts each carry their own list of
+// flags, and nothing in the type system ties them together. These tests
+// do.
+//
+// This is the one guarantee a derive-based parser gives for free. Buying
+// it with a test instead keeps `--help`'s layout fully under our control
+// (clap's `{options}` block is not width-configurable) and the
+// dependency tree lean, without carrying the drift risk silently.
+
+/// Long flags (sans dashes) named anywhere in the top-level help or in
+/// any subcommand's help.
+fn advertised_flags(h: &Harness) -> Vec<String> {
+    let mut screens = vec![read_stdout(&h.run(&["--help"]))];
+    for cmd in [
+        "daily",
+        "weekly",
+        "monthly",
+        "session",
+        "blocks",
+        "statusline",
+        "tui",
+        "web",
+        "refresh-prices",
+        "completion",
+    ] {
+        screens.push(read_stdout(&h.run(&["help", cmd])));
+    }
+    let mut out: Vec<String> = screens
+        .iter()
+        .flat_map(|s| s.split_whitespace())
+        .filter_map(|w| w.strip_prefix("--"))
+        // Trailing punctuation from prose ("--source." / "--out,").
+        .map(|w| w.trim_end_matches(|c: char| !c.is_ascii_alphanumeric()))
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+#[test]
+fn every_advertised_flag_is_actually_parsed() {
+    let h = Harness::new();
+    setup_single_project(&h);
+    let flags = advertised_flags(&h);
+    assert!(
+        flags.len() > 20,
+        "help scrape found only {flags:?} — the scraper is broken, not the help"
+    );
+    for flag in &flags {
+        // A flag counts as parsed if any subcommand recognizes it. Scope
+        // violations ("--port only applies to web") and missing values
+        // both prove the parser knows the spelling; only `unknown flag`
+        // means the help advertises something that does not exist.
+        let arg = format!("--{flag}");
+        let unknown_everywhere = ["daily", "session", "blocks", "statusline", "tui", "web"]
+            .iter()
+            .all(|cmd| read_stderr(&h.run(&[cmd, &arg])).contains("unknown flag"));
+        assert!(
+            !unknown_everywhere,
+            "help advertises --{flag} but no subcommand's parser accepts it"
+        );
+    }
+}
+
+#[test]
+fn completion_offers_every_advertised_flag() {
+    let h = Harness::new();
+    let advertised = advertised_flags(&h);
+    for shell in ["bash", "zsh", "fish"] {
+        let script = read_stdout(&h.run(&["completion", shell]));
+        for flag in &advertised {
+            // `--help` / `--version` are conventionally left out of
+            // completion candidate lists; anything else a user can read
+            // about, they should be able to tab-complete.
+            if flag == "help" || flag == "version" {
+                continue;
+            }
+            assert!(
+                script.contains(flag.as_str()),
+                "{shell} completion omits --{flag}, which the help advertises"
+            );
+        }
+    }
+}
+
+#[test]
+fn subcommand_list_is_identical_in_help_and_completion() {
+    let h = Harness::new();
+    let help = read_stdout(&h.run(&["--help"]));
+    let commands: Vec<&str> = help
+        .lines()
+        .skip_while(|l| !l.starts_with("COMMANDS:"))
+        .skip(1)
+        .take_while(|l| !l.trim().is_empty())
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    assert!(
+        commands.len() > 5,
+        "COMMANDS scrape found {commands:?} — the scraper is broken"
+    );
+    for shell in ["bash", "zsh", "fish"] {
+        let script = read_stdout(&h.run(&["completion", shell]));
+        for cmd in &commands {
+            assert!(
+                script.contains(cmd),
+                "{shell} completion omits the `{cmd}` subcommand"
+            );
+        }
+    }
+}
+
+/// `--source` names every provider in the registry, in every screen that
+/// mentions one. Adding a `SourceKind` must not leave a help screen
+/// advertising a stale list.
+#[test]
+fn help_names_every_registered_source() {
+    let h = Harness::new();
+    let ids = ["claude-code", "codex"];
+    for screen in [
+        read_stdout(&h.run(&["--help"])),
+        read_stdout(&h.run(&["help", "tui"])),
+        read_stdout(&h.run(&["help", "web"])),
+    ] {
+        for id in ids {
+            assert!(
+                screen.contains(id),
+                "a --source screen omits the `{id}` provider:\n{screen}"
+            );
+        }
+    }
+}

@@ -14,12 +14,12 @@ Fast, local Claude Code log viewer. CLI, TUI, and static web — Rust binary, ~1
 ccaudit daily                         # token usage + cost, today and lately
 ccaudit tui                           # interactive terminal browser
 ccaudit web                           # generate + serve the web dashboard
-ccaudit statusline                    # one-line summary for your shell prompt
+ccaudit statusline                    # one-line summary for a shell prompt
 ```
 
 ## What it is
 
-One Rust binary. CLI, TUI, and web for your `~/.claude` logs. Mmap'd cache, ~5 ms warm start.
+One Rust binary. CLI, TUI, and web over `~/.claude` logs. Mmap'd cache, ~5 ms warm start.
 
 Inspired by:
 
@@ -36,7 +36,7 @@ Inspired by:
 | Session detail viewer | yes                   | —              | yes                | yes                      |
 | Install               | binary / npm / cargo  | npm            | `pip install` + py | `npx` / `npm install -g` |
 
-`claude-session-dashboard` has one thing ccaudit doesn't: an **agent-delegation Gantt chart** for the sub-agent dispatch tree per session. Worth it if you run agentic workflows and want to see the delegation order.
+`claude-session-dashboard` has one thing ccaudit doesn't: an **agent-delegation Gantt chart** for the sub-agent dispatch tree per session. Worth it for agentic workflows where the delegation order matters.
 
 ### Benchmarks
 
@@ -184,22 +184,29 @@ ccaudit keeps two purpose-built caches under `~/.claude/ccaudit-cache/`. CLI rep
 
 ```
 ~/.claude/ccaudit-web/
-├── index.html
-├── app.js  /  style.css  /  util.js     ◄── single-file bundle (no build step)
-├── index.json                            ◄── one fetch:
-│                                              project + session metadata,
-│                                              hourly histograms, tool counts,
-│                                              + a daily rollup pulled straight
-│                                                from <source>.db so the heatmap
-│                                                can't drift from the CLI
-├── search.json                           ◄── word → session posting list
-└── s/
-    └── <pi>_<si>.json                    ◄── per-session message tree,
+├── index.html                            ◄── shell + app.js / style.css /
+│                                              util.js inlined (no build step),
+│                                              shared by every provider
+├── sources.json                          ◄── provider manifest: which one the
+│                                              bundle opened with (--source),
+│                                              plus session count + cost each
+└── <source-id>/                          ◄── one directory per provider
+    ├── index.json                        ◄── one fetch:
+    │                                          project + session metadata,
+    │                                          hourly histograms, tool counts,
+    │                                          + a daily rollup pulled straight
+    │                                            from <source>.db so the heatmap
+    │                                            can't drift from the CLI
+    ├── search.json                       ◄── word → session posting list
+    └── s/
+        └── <pi>_<si>.json                ◄── per-session message tree,
                                               lazy-loaded by the browser
-                                              only when you open that session
+                                              only when that session is opened
 ```
 
-The browser fetches `index.json` once and renders the dashboard / table from it. Opening a session is one HTTP GET for `<pi>_<si>.json`; repeat opens hit the browser's HTTP cache. The bundled HTTP server is a 10-line static file handler, no API.
+The browser reads `sources.json`, then fetches that provider's `index.json` once and renders the dashboard / table from it. Opening a session is one HTTP GET for `<pi>_<si>.json`; repeat opens hit the browser's HTTP cache. The bundled HTTP server is a 10-line static file handler, no API.
+
+Every provider with logs on the machine is generated into the bundle, so the header's source dropdown switches between them client-side — no regeneration, and `--no-serve` exports stay self-contained. `--source` picks which provider the bundle opens on, and which one `reset` returns to.
 
 End result: writing a daily report, scrolling the TUI, and clicking through 200 sessions in the web view all share the same parsed-once-on-disk substrate. The only thing that ever re-parses a JSONL file is a real change to that file (mtime or size moves).
 
@@ -329,7 +336,7 @@ ccaudit completion zsh > ~/.zfunc/_ccaudit      # shell completions
 - `--json` / `--plain` make output machine-readable; `--plain` is tab-separated with raw integers and no box-drawing or color.
 - `--order asc|desc`, `--offline`, and `--mode auto|calculate|display` are accepted for ccusage compatibility. ccaudit prices from its local cache on every run (update it online with `refresh-prices`), so `--offline` is already the default and `--mode display` falls back to calculated costs.
 - **Color** follows the [`NO_COLOR`](https://no-color.org) convention: ANSI color is emitted only when stdout is a terminal, and is disabled by `--no-color`, `NO_COLOR`, `CCAUDIT_NO_COLOR`, or `TERM=dumb` (force it back on with `FORCE_COLOR`). Piped output is always clean.
-- Mistyped a command or flag? ccaudit suggests the closest match (`ccaudit dialy` → _did you mean `ccaudit daily`?_).
+- Mistyped a command or flag? ccaudit names the closest match (`ccaudit dialy` → _a similar command exists: ccaudit daily_).
 
 ## Development
 

@@ -10,7 +10,7 @@
 #   • bench.rs     — ccaudit-only microbenchmarks on a *synthetic* corpus
 #                    (parse/cache/aggregate/web internals). Reproducible,
 #                    hermetic, but does NOT touch the competitors.
-#   • bench-vs.sh  — this file. Cross-tool, on your *real* logs, the numbers
+#   • bench-vs.sh  — this file. Cross-tool, on *real* logs, the numbers
 #                    that actually appear on the front page.
 #
 # States measured (the README's "cold cache" row is intentionally omitted —
@@ -108,7 +108,7 @@ wipe_dashboard()      { :; } # no documented on-disk cache; reads ~/.claude each
 
 # ── Commands (the "daily token report" workload) ───────────────────────────
 # All run with HOME=$RUN_HOME so a custom PROJECTS resolves correctly; for the
-# default ~/.claude/projects this is just your real HOME.
+# default ~/.claude/projects this is just the real HOME.
 cmd_ccaudit()        { echo "env HOME='$RUN_HOME' '$CCAUDIT_BIN' daily --no-color"; }
 cmd_ccusage()        { echo "env HOME='$RUN_HOME' bunx ccusage@latest daily"; }
 # uncached: --no-cache forces a full reprocess every sample. warm: omit it.

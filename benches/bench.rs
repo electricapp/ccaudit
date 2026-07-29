@@ -40,7 +40,7 @@
 //   BENCH_COMPARE  read baseline JSON, print diff   (default: don't compare)
 //
 // Stderr from the code under test (cache hits/misses, web stats) is
-// printed as-is. Pipe `2>/dev/null` if you want clean stdout only.
+// printed as-is; `2>/dev/null` leaves clean stdout only.
 
 #![allow(
     clippy::print_stdout,

@@ -23,7 +23,7 @@ fn main() {
         Err(e) => {
             // clig.dev signal-to-noise: a one-line error plus a pointer,
             // not a wall of help text. `e` may already carry a
-            // `did you mean ...?` hint line from the parser.
+            // typo-hint line from the parser.
             eprintln!("error: {e}");
             eprintln!("Run `ccaudit --help` for usage.");
             process::exit(2);
@@ -82,15 +82,11 @@ fn main() {
             }
         },
         cli::Cmd::Tui => {
-            // The TUI/web session browser renders Claude Code transcripts;
-            // other providers only feed the usage reports today. Silently
-            // proceeding would show Claude sessions costed against the
-            // wrong provider's cache ($0.00 everywhere).
-            reject_non_claude_browser(&opts, "tui");
             #[cfg(feature = "tui")]
             {
-                let projects = parse::load_all_projects(source::pick(opts.source));
-                match run_tui(projects) {
+                let source = source::pick(opts.source);
+                let projects = parse::load_all_projects(source);
+                match run_tui(projects, source) {
                     Ok(Some(ui::PostAction::Resume { id, cwd })) => {
                         resume_session(&id, cwd.as_deref());
                     }
@@ -121,7 +117,6 @@ fn main() {
             }
         }
         cli::Cmd::Web => {
-            reject_non_claude_browser(&opts, "web");
             #[cfg(feature = "web")]
             {
                 run_web_cmd(&opts);
@@ -192,20 +187,11 @@ fn main() {
     }
 }
 
-/// Exit 2 when `--source` names a provider the TUI/web browser can't
-/// render. No-op for Claude Code (the default).
-#[allow(clippy::print_stderr)]
-fn reject_non_claude_browser(opts: &cli::Options, cmd: &str) {
-    if opts.source != source::SourceKind::ClaudeCode {
-        eprintln!(
-            "error: `{cmd}` only supports --source claude-code (usage reports support every source)"
-        );
-        process::exit(2);
-    }
-}
-
 #[cfg(feature = "tui")]
-fn run_tui(projects: Vec<parse::Project>) -> std::io::Result<Option<ui::PostAction>> {
+fn run_tui(
+    projects: Vec<parse::Project>,
+    source: &'static dyn source::Source,
+) -> std::io::Result<Option<ui::PostAction>> {
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     // Bracketed paste: without it a paste arrives as individual
@@ -235,7 +221,7 @@ fn run_tui(projects: Vec<parse::Project>) -> std::io::Result<Option<ui::PostActi
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let mut app = ui::App::new(projects);
+    let mut app = ui::App::new(projects, source);
     let run_result = app.run(&mut terminal);
 
     crossterm::terminal::disable_raw_mode()?;
@@ -293,14 +279,6 @@ fn resume_session(id: &str, cwd: Option<&str>) {
 // Writes error messages to stderr before exiting non-zero.
 #[allow(clippy::print_stderr)]
 fn run_web_cmd(opts: &cli::Options) {
-    let source = source::pick(opts.source);
-    // One load: `cache` is the same aggregation substrate the CLI usage
-    // reports use (daily/monthly/blocks), and `load_all_projects` already
-    // builds it internally — returning it avoids a second full
-    // scan+validate pass. Web emits its daily rollup from this shared
-    // cache rather than re-deriving it from session totals, so the
-    // heatmap bucketing matches the usage table — no cross-midnight drift.
-    let (projects, cache) = parse::load_all_projects_with_cache(source);
     let out_dir = opts
         .out_dir
         .as_deref()
@@ -310,7 +288,45 @@ fn run_web_cmd(opts: &cli::Options) {
                 .map(|h| h.join(".claude").join("ccaudit-web"))
                 .unwrap_or_else(|| std::path::PathBuf::from("ccaudit-web"))
         });
-    if let Err(e) = web::generate(&projects, &cache, &out_dir) {
+
+    // Every provider with logs on this machine gets its own payload under
+    // `out_dir/{id}/`, so the browser's source dropdown can switch
+    // without calling back into ccaudit. `--source` picks which one the
+    // bundle opens on (and which one `reset` returns to), not which one
+    // gets generated — a bundle with a single provider baked in couldn't
+    // offer the switch at all, and `--no-serve` exports have no server to
+    // ask for the rest later.
+    let mut manifest: Vec<web::SourceEntry> = Vec::new();
+    for kind in source::SourceKind::ALL {
+        let src = source::pick(kind);
+        // One load: `cache` is the same aggregation substrate the CLI
+        // usage reports use (daily/monthly/blocks), and
+        // `load_all_projects` already builds it internally — returning it
+        // avoids a second full scan+validate pass. Web emits its daily
+        // rollup from this shared cache rather than re-deriving it from
+        // session totals, so the heatmap bucketing matches the usage
+        // table — no cross-midnight drift.
+        let (projects, cache) = parse::load_all_projects_with_cache(src);
+        // A provider with nothing to show is left out of the dropdown
+        // rather than offered as a dead end — except the one the user
+        // asked for, which must stay selectable so an empty result reads
+        // as "no sessions" instead of a silent switch to another
+        // provider's data.
+        if projects.is_empty() && kind != opts.source {
+            continue;
+        }
+        if let Err(e) = web::generate(&projects, &cache, &out_dir.join(src.id())) {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+        manifest.push(web::SourceEntry {
+            id: src.id(),
+            label: src.display_name(),
+            sessions: projects.iter().map(|p| p.sessions.len()).sum(),
+            cost: projects.iter().map(|p| p.total_cost).sum(),
+        });
+    }
+    if let Err(e) = web::write_shell(&out_dir, source::pick(opts.source).id(), &manifest) {
         eprintln!("error: {e}");
         process::exit(1);
     }

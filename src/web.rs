@@ -211,10 +211,58 @@ fn build_daily_index(cache: &LoadedCache) -> DailyIndex<'_> {
     }
 }
 
+/// One provider's entry in the bundle manifest.
+///
+/// The web app reads these to populate the source dropdown, so it can
+/// offer a switch without a round-trip to ccaudit — every listed
+/// provider's payload is already on disk under `out_dir/{id}/`.
+#[derive(Serialize)]
+pub struct SourceEntry {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub sessions: usize,
+    pub cost: f64,
+}
+
+/// Write the bundle manifest and the single HTML shell that serves every
+/// provider.
+///
+/// `default_id` is the provider `ccaudit web` was invoked for. The app
+/// opens on it and `reset` returns to it, so switching providers in the
+/// browser never loses the entry point the user chose on the command
+/// line.
+pub fn write_shell(
+    out_dir: &Path,
+    default_id: &str,
+    sources: &[SourceEntry],
+) -> std::io::Result<()> {
+    #[derive(Serialize)]
+    struct Manifest<'a> {
+        default: &'a str,
+        sources: &'a [SourceEntry],
+    }
+    let mut w = BufWriter::new(fs::File::create(out_dir.join("sources.json"))?);
+    serde_json::to_writer(
+        &mut w,
+        &Manifest {
+            default: default_id,
+            sources,
+        },
+    )
+    .map_err(std::io::Error::other)?;
+    w.flush()?;
+    drop(w);
+
+    write_index_html(out_dir)
+}
+
 // Prints build-stats lines ("search index: …KB", "wrote …") to stderr
 // so the user sees what the `ccaudit web` run produced. Suppressed when
 // `CCAUDIT_QUIET=1` (set by the bench harness and any caller that
 // invokes generate in a loop).
+//
+// `out_dir` is one provider's subdirectory of the bundle — the shared
+// HTML shell above it is written once by [`write_shell`].
 #[allow(clippy::print_stderr)]
 pub fn generate(projects: &[Project], cache: &LoadedCache, out_dir: &Path) -> std::io::Result<()> {
     use rayon::prelude::*;
@@ -414,9 +462,25 @@ pub fn generate(projects: &[Project], cache: &LoadedCache, out_dir: &Path) -> st
         eprintln!("search index: {:.0}KB", search_size as f64 / 1024.0);
     }
 
+    if !quiet {
+        let total_session_files: usize = projects.iter().map(|p| p.sessions.len()).sum();
+        eprintln!(
+            "wrote {} ({:.0}KB index + {} session files)",
+            out_dir.display(),
+            index_size as f64 / 1024.0,
+            total_session_files
+        );
+    }
+    Ok(())
+}
+
+// The HTML shell is provider-agnostic: it ships the app, and the app
+// picks which `{source}/index.json` to load from `sources.json`. Written
+// once per bundle rather than once per provider.
+fn write_index_html(out_dir: &Path) -> std::io::Result<()> {
     let out_file = out_dir.join("index.html");
     let mut f = BufWriter::new(fs::File::create(&out_file)?);
-    f.write_all(b"<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<meta name=\"color-scheme\" content=\"dark\">\n<meta name=\"description\" content=\"Browse Claude Code session logs - projects, token usage, costs, and full message history.\">\n<meta property=\"og:title\" content=\"ccaudit\">\n<meta property=\"og:description\" content=\"Claude Code session log browser.\">\n<meta property=\"og:type\" content=\"website\">\n<title>ccaudit</title>\n<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%230d0d0f'/><text x='16' y='22' font-size='18' text-anchor='middle' fill='%236e9eff' font-family='monospace'>cc</text></svg>\">\n<style>")?;
+    f.write_all(b"<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<meta name=\"color-scheme\" content=\"dark\">\n<meta name=\"description\" content=\"Browse coding-agent session logs - projects, token usage, costs, and full message history.\">\n<meta property=\"og:title\" content=\"ccaudit\">\n<meta property=\"og:description\" content=\"Coding-agent session log browser.\">\n<meta property=\"og:type\" content=\"website\">\n<title>ccaudit</title>\n<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%230d0d0f'/><text x='16' y='22' font-size='18' text-anchor='middle' fill='%236e9eff' font-family='monospace'>cc</text></svg>\">\n<style>")?;
     // Swap the `/* TOKENS */` placeholder with a :root block generated
     // from the shared design tokens. One source of truth (style.rs).
     // Spaces around `TOKENS` are required — prettier normalizes the
@@ -429,22 +493,11 @@ pub fn generate(projects: &[Project], cache: &LoadedCache, out_dir: &Path) -> st
     );
     let css = CSS.replacen(TOKEN_MARKER, &build_css_tokens(), 1);
     f.write_all(css.as_bytes())?;
-    f.write_all(b"</style>\n</head>\n<body>\n<div id=\"narrow\" role=\"alert\"><strong>ccaudit is desktop-only</strong>The views are dense and table-heavy \xe2\x80\x94 they need a wider viewport than this device offers. Open ccaudit on a laptop or desktop browser.</div>\n<div id=\"app\">\n  <header>\n    <div class=\"bar\">\n      <button id=\"back\" onclick=\"goBack()\" class=\"hidden\" aria-label=\"back\">&larr;</button>\n      <nav id=\"crumbs\" class=\"crumbs\" aria-label=\"breadcrumb\">\n        <span class=\"crumb-lbl\">project:</span><a id=\"crumb-p\" class=\"crumb dim\" onclick=\"crumbClickP()\" role=\"button\" tabindex=\"0\">\xe2\x80\x94</a>\n        <span class=\"crumb-sep\" aria-hidden=\"true\">/</span>\n        <span class=\"crumb-lbl\">session:</span><a id=\"crumb-s\" class=\"crumb dim\" onclick=\"crumbClickS()\" role=\"button\" tabindex=\"0\">\xe2\x80\x94</a>\n      </nav>\n      <div class=\"filterset\" role=\"toolbar\" aria-label=\"filters\">\n        <input id=\"search\" type=\"search\" placeholder=\"/ search\" autocomplete=\"off\" spellcheck=\"false\" aria-label=\"search\">\n        <button class=\"pbtn reset\" onclick=\"resetAll()\" title=\"clear all filters / sort / scope (r)\" aria-label=\"reset filters\">reset</button>\n        <input id=\"dfrom\" type=\"date\" class=\"dateinp\" title=\"from date\" aria-label=\"from date\">\n        <input id=\"dto\" type=\"date\" class=\"dateinp\" title=\"to date\" aria-label=\"to date\">\n        <div class=\"presets\" role=\"group\" aria-label=\"date preset\">\n          <button class=\"pbtn\" data-days=\"7\" onclick=\"setDateRange(7)\">7d</button>\n          <button class=\"pbtn\" data-days=\"30\" onclick=\"setDateRange(30)\">30d</button>\n          <button class=\"pbtn\" data-days=\"90\" onclick=\"setDateRange(90)\">90d</button>\n          <button class=\"pbtn\" data-days=\"0\" onclick=\"setDateRange(null)\">all</button>\n        </div>\n        <div id=\"mfilt\" class=\"drop\" data-drop=\"model\" title=\"filter by model\"></div>\n      </div>\n    </div>\n  </header>\n  <main id=\"main\" role=\"main\"><div class=\"loading\" role=\"status\" aria-live=\"polite\">loading...</div></main>\n  <button id=\"btt\" onclick=\"document.getElementById('main').scrollTo({top:0,behavior:'smooth'})\" title=\"back to top\" aria-label=\"back to top\">\xe2\x86\x91</button>\n</div>\n<script>\n")?;
+    f.write_all(b"</style>\n</head>\n<body>\n<div id=\"narrow\" role=\"alert\"><strong>ccaudit is desktop-only</strong>The views are dense and table-heavy \xe2\x80\x94 they need a wider viewport than this device offers. Open ccaudit on a laptop or desktop browser.</div>\n<div id=\"app\">\n  <header>\n    <div class=\"bar\">\n      <button id=\"back\" onclick=\"goBack()\" class=\"hidden\" aria-label=\"back\">&larr;</button>\n      <nav id=\"crumbs\" class=\"crumbs\" aria-label=\"breadcrumb\">\n        <span class=\"crumb-lbl\">project:</span><a id=\"crumb-p\" class=\"crumb dim\" onclick=\"crumbClickP()\" role=\"button\" tabindex=\"0\">\xe2\x80\x94</a>\n        <span class=\"crumb-sep\" aria-hidden=\"true\">/</span>\n        <span class=\"crumb-lbl\">session:</span><a id=\"crumb-s\" class=\"crumb dim\" onclick=\"crumbClickS()\" role=\"button\" tabindex=\"0\">\xe2\x80\x94</a>\n      </nav>\n      <div class=\"filterset\" role=\"toolbar\" aria-label=\"filters\">\n        <input id=\"search\" type=\"search\" placeholder=\"/ search\" autocomplete=\"off\" spellcheck=\"false\" aria-label=\"search\">\n        <button class=\"pbtn reset\" onclick=\"resetAll()\" title=\"clear all filters / sort / scope (r)\" aria-label=\"reset filters\">reset</button>\n        <input id=\"dfrom\" type=\"date\" class=\"dateinp\" title=\"from date\" aria-label=\"from date\">\n        <input id=\"dto\" type=\"date\" class=\"dateinp\" title=\"to date\" aria-label=\"to date\">\n        <div class=\"presets\" role=\"group\" aria-label=\"date preset\">\n          <button class=\"pbtn\" data-days=\"7\" onclick=\"setDateRange(7)\">7d</button>\n          <button class=\"pbtn\" data-days=\"30\" onclick=\"setDateRange(30)\">30d</button>\n          <button class=\"pbtn\" data-days=\"90\" onclick=\"setDateRange(90)\">90d</button>\n          <button class=\"pbtn\" data-days=\"0\" onclick=\"setDateRange(null)\">all</button>\n        </div>\n        <div id=\"mfilt\" class=\"drop\" data-drop=\"model\" title=\"filter by model\"></div>\n        <div id=\"sfilt\" class=\"drop\" data-drop=\"source\" title=\"switch provider (reset returns to the one this bundle opened with)\"></div>\n      </div>\n    </div>\n  </header>\n  <main id=\"main\" role=\"main\"><div class=\"loading\" role=\"status\" aria-live=\"polite\">loading...</div></main>\n  <button id=\"btt\" onclick=\"document.getElementById('main').scrollTo({top:0,behavior:'smooth'})\" title=\"back to top\" aria-label=\"back to top\">\xe2\x86\x91</button>\n</div>\n<script>\n")?;
     f.write_all(UTIL.as_bytes())?;
     f.write_all(JS.as_bytes())?;
     f.write_all(b"\n</script>\n</body>\n</html>")?;
-    f.flush()?;
-
-    if !quiet {
-        let total_session_files: usize = projects.iter().map(|p| p.sessions.len()).sum();
-        eprintln!(
-            "wrote {} ({:.0}KB index + {} session files)",
-            out_file.display(),
-            index_size as f64 / 1024.0,
-            total_session_files
-        );
-    }
-    Ok(())
+    f.flush()
 }
 
 /// Split `text` into searchable terms. Must match the client's

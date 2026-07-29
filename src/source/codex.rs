@@ -44,6 +44,19 @@ impl Source for Codex {
         parse_codex_session(src)
     }
 
+    fn parse_messages(&self, path: &Path) -> Option<crate::parse::Session> {
+        parse_codex_messages(path)
+    }
+
+    fn project_key(&self, _path: &Path, cwd: Option<&str>) -> String {
+        // Rollouts live under `~/.codex/sessions/YYYY/MM/DD/`, so the
+        // directory records when a session ran, not what it was about.
+        // The `session_meta` cwd is the only real project signal;
+        // sessions missing one share a single bucket rather than
+        // fragmenting into one project per calendar day.
+        cwd.unwrap_or("unknown").to_owned()
+    }
+
     fn price(&self, model: Option<&str>) -> &Pricing {
         // `model` first so `price(None)` never forces the LiteLLM table
         // load — see the matching note in `ClaudeCode::price`.
@@ -222,6 +235,21 @@ struct TokenUsage {
     output_tokens: i64,
 }
 
+/// Identity of one `last_token_usage` triple.
+///
+/// Codex re-emits an unchanged triple on rate-limit-only updates
+/// (upstream #14489). Both passes over a rollout — the cache one below
+/// and the transcript one further down — must skip exactly the same
+/// events, or the browser's hour histogram would out-count the usage
+/// report built from the cache. Sharing the hash is what guarantees it.
+fn usage_hash(uncached: u64, cached: u64, output: u64) -> u64 {
+    let mut buf = [0u8; 24];
+    buf[0..8].copy_from_slice(&uncached.to_le_bytes());
+    buf[8..16].copy_from_slice(&cached.to_le_bytes());
+    buf[16..24].copy_from_slice(&output.to_le_bytes());
+    fnv1a(&buf)
+}
+
 fn parse_codex_session(src: &SourceFile) -> Option<ParsedSession> {
     // Slurp the whole file — Codex sessions are small (typically <1 MB
     // even for long runs) so a single read beats line-by-line BufReader
@@ -319,11 +347,7 @@ fn parse_codex_session(src: &SourceFile) -> Option<ParsedSession> {
                     // and two genuinely distinct calls (other sessions, or
                     // non-consecutive in this one) can share a token triple;
                     // using it as a global dedup key silently undercounts them.
-                    let mut buf = [0u8; 24];
-                    buf[0..8].copy_from_slice(&uncached.to_le_bytes());
-                    buf[8..16].copy_from_slice(&cached.to_le_bytes());
-                    buf[16..24].copy_from_slice(&output.to_le_bytes());
-                    let h = fnv1a(&buf);
+                    let h = usage_hash(uncached, cached, output);
                     if last_token_hash == Some(h) {
                         continue;
                     }
@@ -378,6 +402,300 @@ fn parse_codex_session(src: &SourceFile) -> Option<ParsedSession> {
         lines,
         ts_unix,
     })
+}
+
+// ── Transcript parsing (session browser) ──
+//
+// `parse_codex_session` above feeds the aggregation cache and reads only
+// what the token columns need. The TUI and web transcript views want the
+// conversation itself, so this second pass maps Codex's `response_item`
+// payloads onto the canonical `parse::Message` shape.
+//
+// Only `response_item` lines become messages. Codex also emits an
+// `event_msg`/`user_message` echo of every user turn, and keeping both
+// would print each prompt twice — `response_item` is the model-visible
+// conversation, so it wins. `event_msg` is read here only for
+// `token_count`, which attaches usage to the call it followed.
+
+/// One `response_item` payload, deserialized loosely.
+///
+/// Every field is optional and an unrecognized `type` falls through to a
+/// skip: the Responses API item set grows with each Codex release, and a
+/// variant we don't know yet has to degrade to "not rendered" rather
+/// than failing the line (and with it the rest of the transcript).
+#[derive(Deserialize)]
+struct ItemPayload {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    role: Option<String>,
+    content: Option<Vec<ContentPart>>,
+    /// `reasoning` items carry their visible text here, not in `content`.
+    summary: Option<Vec<ContentPart>>,
+    name: Option<String>,
+    arguments: Option<String>,
+    input: Option<String>,
+    output: Option<serde_json::Value>,
+    action: Option<serde_json::Value>,
+}
+
+// Matched on the presence of `text` rather than on the part's `type`:
+// `input_text`, `output_text`, `summary_text` and bare `text` all carry
+// it, while parts that don't (refusals, images) have nothing to render.
+#[derive(Deserialize)]
+struct ContentPart {
+    text: Option<String>,
+}
+
+fn join_text(parts: Option<&[ContentPart]>) -> String {
+    let mut out = String::new();
+    for p in parts.unwrap_or_default() {
+        let Some(t) = p.text.as_deref() else { continue };
+        if t.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(t);
+    }
+    out
+}
+
+/// `function_call_output.output` is a bare JSON string in some Codex
+/// versions and `{"content": "…", "metadata": {…}}` in others. Render
+/// whichever is present, falling back to the raw JSON so a third shape
+/// still shows something instead of an empty result block.
+fn render_output(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(map) => map
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(|| v.to_string(), str::to_string),
+        other => other.to_string(),
+    }
+}
+
+/// `local_shell_call.action` is `{"type":"exec","command":["bash","-lc","…"]}`.
+/// Join the argv back into the command line the user would recognize.
+fn render_action(v: &serde_json::Value) -> String {
+    v.get("command")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_else(|| v.to_string())
+}
+
+/// Map one `response_item` onto a `Message` and append it.
+///
+/// Returns without pushing for item types the browser has nothing to
+/// show for — that is the graceful-degradation path for future variants.
+fn push_item(
+    s: &mut crate::parse::Session,
+    ts: Option<DateTime<Utc>>,
+    model: Option<&str>,
+    p: &ItemPayload,
+) {
+    use crate::parse::{Message, MessageKind};
+
+    let (kind, content, tool_name) = match p.kind.as_deref().unwrap_or("") {
+        "message" => {
+            let text = join_text(p.content.as_deref());
+            match p.role.as_deref().unwrap_or("") {
+                "assistant" => (MessageKind::Assistant, text, None),
+                // Codex injects environment context, permission blocks
+                // and abort notices as `role: "user"` items wrapped in an
+                // XML-ish tag. They're scaffolding, not something the
+                // user typed, so they render as System and stay out of
+                // both the turn count and the session title.
+                "user" if !text.starts_with('<') => (MessageKind::User, text, None),
+                _ => (MessageKind::System, text, None),
+            }
+        }
+        "reasoning" => {
+            let mut text = join_text(p.summary.as_deref());
+            if text.is_empty() {
+                text = join_text(p.content.as_deref());
+            }
+            (MessageKind::Thinking, text, None)
+        }
+        "function_call" | "custom_tool_call" => {
+            let body = p
+                .arguments
+                .clone()
+                .or_else(|| p.input.clone())
+                .unwrap_or_default();
+            (
+                MessageKind::ToolUse,
+                body,
+                Some(p.name.clone().unwrap_or_else(|| "tool".to_owned())),
+            )
+        }
+        "local_shell_call" => (
+            MessageKind::ToolUse,
+            p.action.as_ref().map(render_action).unwrap_or_default(),
+            Some("shell".to_owned()),
+        ),
+        "function_call_output" | "custom_tool_call_output" => (
+            MessageKind::ToolResult,
+            p.output.as_ref().map(render_output).unwrap_or_default(),
+            None,
+        ),
+        "web_search_call" => (
+            MessageKind::ToolUse,
+            String::new(),
+            Some("web_search".to_owned()),
+        ),
+        _ => return,
+    };
+
+    // Same keep-rule as the Claude parser: tool calls survive an empty
+    // rendered body (an unmodeled tool still happened), everything else
+    // with no text is noise.
+    if content.is_empty() && kind != MessageKind::ToolUse {
+        return;
+    }
+    if kind == MessageKind::User {
+        s.turn_count += 1;
+        if s.first_user_msg.is_none() {
+            s.first_user_msg = Some(crate::parse::truncated_copy(&content, 200));
+        }
+    }
+    s.messages.push(Message {
+        timestamp: ts,
+        kind,
+        content,
+        tokens: None,
+        tool_name,
+        model: model.map(str::to_owned),
+        message_id: None,
+    });
+}
+
+fn parse_codex_messages(path: &Path) -> Option<crate::parse::Session> {
+    use crate::parse::{Message, MessageKind, Session, TokenUsage};
+
+    // Fingerprint BEFORE the read: an append racing the parse must leave
+    // the per-session cache entry stale, never stamp a fresh
+    // (mtime, size) onto content that predates it.
+    let fingerprint = crate::parse::file_fingerprint(path)?;
+    let data = fs::read(path).ok()?;
+
+    let mut s = Session {
+        id: path
+            .file_stem()
+            .and_then(|x| x.to_str())
+            .unwrap_or("unknown")
+            .to_owned(),
+        file_path: path.to_path_buf(),
+        fingerprint: Some(fingerprint),
+        ..Session::default()
+    };
+    let mut current_model: Option<String> = None;
+    let mut last_token_hash: Option<u64> = None;
+
+    for raw in data.split(|&b| b == b'\n') {
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(line) = serde_json::from_slice::<RolloutLine>(raw) else {
+            continue;
+        };
+        let ts = Some(line.timestamp);
+        match line.kind.as_ref() {
+            "session_meta" => {
+                if let Some(p) = payload_as::<SessionMetaPayload>(line.payload) {
+                    s.id = p.id;
+                    s.cwd = p.cwd;
+                }
+                if s.started_at.is_none() {
+                    s.started_at = ts;
+                }
+            }
+            "turn_context" => {
+                let Some(m) = payload_as::<TurnContextPayload>(line.payload).and_then(|p| p.model)
+                else {
+                    continue;
+                };
+                if s.model.is_none() {
+                    s.model = Some(m.clone());
+                }
+                // Mirrors the cache pass: on a model switch, clear the
+                // consecutive-duplicate guard so an identical triple
+                // under a *different* model isn't wrongly skipped.
+                if current_model.as_deref() != Some(m.as_str()) {
+                    last_token_hash = None;
+                }
+                current_model = Some(m);
+            }
+            "response_item" => {
+                if let Some(p) = payload_as::<ItemPayload>(line.payload) {
+                    push_item(&mut s, ts, current_model.as_deref(), &p);
+                }
+            }
+            "event_msg" => {
+                let Some(EventMsgPayload::TokenCount { info: Some(info) }) =
+                    payload_as::<EventMsgPayload>(line.payload)
+                else {
+                    continue;
+                };
+                let u = info.last_token_usage;
+                let cached = u.cached_input_tokens.max(0) as u64;
+                // Codex `input_tokens` includes cached; subtract for the
+                // uncached-rate column, exactly as the cache pass does.
+                let uncached = (u.input_tokens.max(0) as u64).saturating_sub(cached);
+                let output = u.output_tokens.max(0) as u64;
+                let h = usage_hash(uncached, cached, output);
+                if last_token_hash == Some(h) {
+                    continue;
+                }
+                last_token_hash = Some(h);
+                let usage = TokenUsage {
+                    input: uncached,
+                    output,
+                    cache_read: cached,
+                    // OpenAI bills cache writes at the input rate rather
+                    // than as a separate column — see `GPT5`.
+                    cache_create: 0,
+                };
+                // The count follows the API call it belongs to, so the
+                // tokens land on whatever that call just produced: the
+                // assistant message, or the `function_call` when the
+                // model went straight to a tool. Attaching to the tail
+                // instead of searching back for an assistant turn keeps
+                // multi-call tool loops (one count per call) on the
+                // right timestamps.
+                if matches!(s.messages.last(), Some(m) if m.tokens.is_none()) {
+                    if let Some(m) = s.messages.last_mut() {
+                        m.tokens = Some(usage);
+                    }
+                } else {
+                    s.messages.push(Message {
+                        timestamp: ts,
+                        kind: MessageKind::Assistant,
+                        content: String::new(),
+                        tokens: Some(usage),
+                        tool_name: None,
+                        model: current_model.clone(),
+                        message_id: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    s.msg_count = u32::try_from(s.messages.len()).unwrap_or(u32::MAX);
+    // A truncated or missing `session_meta` would otherwise leave this
+    // `None`, sorting the session to the front of every list.
+    if s.started_at.is_none() {
+        s.started_at = s.messages.first().and_then(|m| m.timestamp);
+    }
+    Some(s)
 }
 
 #[cfg(test)]
@@ -441,5 +759,161 @@ mod tests {
         assert_eq!(line.model.as_deref(), Some("gpt-5.4"));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    // Writes `body` to a uniquely-named rollout file and hands back the
+    // path plus a cleanup guard, so parallel test threads don't collide
+    // on a shared filename the way a bare pid would.
+    fn rollout(tag: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ccaudit-codex-msgs-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join(format!("rollout-{tag}.jsonl"));
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn transcript_maps_every_response_item_kind() {
+        let path = rollout(
+            "kinds",
+            r#"{"timestamp":"2026-04-21T22:07:55.744Z","type":"session_meta","payload":{"id":"abc-123","cwd":"/Users/me/code/cclog"}}
+{"timestamp":"2026-04-21T22:07:55.745Z","type":"turn_context","payload":{"model":"gpt-5.4"}}
+{"timestamp":"2026-04-21T22:07:55.746Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"count the files"}]}}
+{"timestamp":"2026-04-21T22:07:56.000Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"list then count"}]}}
+{"timestamp":"2026-04-21T22:07:57.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":\"ls\"}","call_id":"c1"}}
+{"timestamp":"2026-04-21T22:07:58.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":{"content":"a.rs\nb.rs"}}}
+{"timestamp":"2026-04-21T22:07:59.000Z","type":"response_item","payload":{"type":"local_shell_call","action":{"type":"exec","command":["bash","-lc","wc -l"]}}}
+{"timestamp":"2026-04-21T22:08:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"two files"}]}}
+{"timestamp":"2026-04-21T22:08:01.000Z","type":"response_item","payload":{"type":"some_future_item","content":[{"type":"output_text","text":"ignored"}]}}
+"#,
+        );
+        let s = parse_codex_messages(&path).expect("parse");
+
+        assert_eq!(s.id, "abc-123");
+        assert_eq!(s.cwd.as_deref(), Some("/Users/me/code/cclog"));
+        assert_eq!(s.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(s.first_user_msg.as_deref(), Some("count the files"));
+        assert_eq!(s.turn_count, 1);
+
+        let got: Vec<(String, &str, Option<&str>)> = s
+            .messages
+            .iter()
+            .map(|m| {
+                (
+                    m.kind.to_string(),
+                    m.content.as_str(),
+                    m.tool_name.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("USER".to_owned(), "count the files", None),
+                ("THNK".to_owned(), "list then count", None),
+                ("TOOL".to_owned(), r#"{"command":"ls"}"#, Some("shell")),
+                ("RSLT".to_owned(), "a.rs\nb.rs", None),
+                ("TOOL".to_owned(), "bash -lc wc -l", Some("shell")),
+                ("ASST".to_owned(), "two files", None),
+            ],
+            "an unrecognized item type must be skipped, not abort the transcript"
+        );
+        assert_eq!(s.msg_count, 6);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn transcript_treats_injected_user_items_as_system() {
+        // Codex wraps environment context and abort notices as
+        // `role: "user"` items. They must not become the session title
+        // or inflate the turn count.
+        let path = rollout(
+            "injected",
+            r#"{"timestamp":"2026-04-21T22:07:55.746Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<permissions instructions>"}]}}
+{"timestamp":"2026-04-21T22:07:56.746Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>cwd</environment_context>"}]}}
+{"timestamp":"2026-04-21T22:07:57.746Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"real question"}]}}
+"#,
+        );
+        let s = parse_codex_messages(&path).expect("parse");
+        let kinds: Vec<String> = s.messages.iter().map(|m| m.kind.to_string()).collect();
+        assert_eq!(kinds, vec!["SYS", "SYS", "USER"]);
+        assert_eq!(s.turn_count, 1);
+        assert_eq!(s.first_user_msg.as_deref(), Some("real question"));
+        // `session_meta` was missing — started_at still has to come from
+        // somewhere, or the session sorts to the front of every list.
+        assert!(s.started_at.is_some());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn transcript_does_not_double_count_user_turns() {
+        // `event_msg`/`user_message` echoes the `response_item` the model
+        // saw. Rendering both would print every prompt twice.
+        let path = rollout(
+            "echo",
+            r#"{"timestamp":"2026-04-21T22:07:55.746Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}
+{"timestamp":"2026-04-21T22:07:55.747Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}
+"#,
+        );
+        let s = parse_codex_messages(&path).expect("parse");
+        assert_eq!(s.messages.len(), 1);
+        assert_eq!(s.turn_count, 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn transcript_usage_matches_the_cache_pass() {
+        // Both passes read the same rollout; a token_count the cache
+        // skips as a duplicate must be skipped here too, or the web's
+        // hour histogram out-counts `ccaudit daily`.
+        let body = r#"{"timestamp":"2026-04-21T22:07:55.744Z","type":"session_meta","payload":{"id":"s1","cwd":"/Users/me/code/x"}}
+{"timestamp":"2026-04-21T22:07:55.745Z","type":"turn_context","payload":{"model":"gpt-5.4"}}
+{"timestamp":"2026-04-21T22:07:56.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"ls","call_id":"c1"}}
+{"timestamp":"2026-04-21T22:07:57.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":50}}}}
+{"timestamp":"2026-04-21T22:07:58.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}
+{"timestamp":"2026-04-21T22:07:59.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":50}}}}
+{"timestamp":"2026-04-21T22:08:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":2000,"cached_input_tokens":500,"output_tokens":90}}}}
+"#;
+        let path = rollout("usage", body);
+        let meta = fs::metadata(&path).unwrap();
+        let cached = parse_codex_session(&SourceFile {
+            path_hash: 1,
+            path: path.clone(),
+            mtime: 0,
+            size: meta.len(),
+        })
+        .expect("cache pass");
+        let s = parse_codex_messages(&path).expect("transcript pass");
+
+        let sum = |acc: (u64, u64, u64), t: &crate::parse::TokenUsage| {
+            (acc.0 + t.input, acc.1 + t.output, acc.2 + t.cache_read)
+        };
+        let from_msgs = s
+            .messages
+            .iter()
+            .filter_map(|m| m.tokens.as_ref())
+            .fold((0, 0, 0), sum);
+        let from_cache = cached.lines.iter().fold((0u64, 0u64, 0u64), |a, l| {
+            (
+                a.0 + u64::from(l.input),
+                a.1 + u64::from(l.output),
+                a.2 + u64::from(l.cache_read),
+            )
+        });
+        assert_eq!(from_msgs, from_cache);
+        // Two distinct calls survive the dedup; the repeat in between
+        // is dropped by both passes.
+        assert_eq!(cached.lines.len(), 2);
+        assert_eq!(from_msgs, (800 + 1500, 50 + 90, 200 + 500));
+
+        // The first count landed on the tool call it paid for, not on a
+        // synthesized assistant row.
+        let tooluse = s
+            .messages
+            .iter()
+            .find(|m| m.kind == crate::parse::MessageKind::ToolUse)
+            .expect("tool call");
+        assert_eq!(tooluse.tokens.map(|t| t.output), Some(50));
+        let _ = fs::remove_file(&path);
     }
 }

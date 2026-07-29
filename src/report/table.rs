@@ -309,8 +309,8 @@ pub fn print<S: Source + ?Sized>(
     );
 
     // Per-column dollar cost. We already know token counts per column;
-    // this row shows the dollars attributable to each column so you can
-    // see which token type is actually driving spend (usually cache-
+    // this row shows the dollars attributable to each column, surfacing
+    // which token type is actually driving spend (usually cache-
     // create for heavy contexts, output for agentic loops). The printed
     // total sums the CENT-ROUNDED column values so the row reconciles
     // with its own cells — summing the raw values would let four

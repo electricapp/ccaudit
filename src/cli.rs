@@ -67,7 +67,7 @@ impl Cmd {
     }
 
     /// Every subcommand, in help-display order. Single source of truth
-    /// for `from_positional` (parse), the `did you mean` matcher, and
+    /// for `from_positional` (parse), the typo-hint matcher, and
     /// help rendering.
     pub const ALL: [Cmd; 12] = [
         Cmd::Daily,
@@ -394,7 +394,9 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             }
             _ if a.starts_with('-') => {
                 return Err(match nearest(a.trim_start_matches('-'), KNOWN_FLAGS) {
-                    Some(s) => format!("unknown flag: {a}\n  did you mean `--{s}`?"),
+                    // rustc's phrasing: the hint names the closest match
+                    // without addressing the reader in second person.
+                    Some(s) => format!("unknown flag: {a}\n  a similar flag exists: --{s}"),
                     None => format!("unknown flag: {a}"),
                 });
             }
@@ -402,7 +404,9 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
                 // A bare word in the first slot is almost always a
                 // misspelled subcommand — suggest the closest one.
                 return Err(match nearest(a, &Cmd::ALL.map(Cmd::as_str)) {
-                    Some(s) => format!("unexpected argument: {a}\n  did you mean `ccaudit {s}`?"),
+                    Some(s) => {
+                        format!("unexpected argument: {a}\n  a similar command exists: ccaudit {s}")
+                    }
                     None => format!("unexpected argument: {a}"),
                 });
             }
@@ -445,9 +449,30 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
 }
 
 /// Every long-flag spelling we recognize (sans leading dashes). Used
-/// only by the `did you mean` matcher on an unknown flag, so it doesn't
+/// only by the typo-hint matcher on an unknown flag, so it doesn't
 /// need to track which command each applies to — `validate_flag_scopes`
 /// handles correctness; this just rescues typos like `--complact`.
+/// Rendered `--source` value list, e.g. `claude-code (default), codex`.
+///
+/// Built from [`SourceKind::ALL`] rather than typed out, so a provider
+/// added to the registry shows up in every help screen that names one —
+/// the whole point of the `Source` trait is that adding a provider
+/// touches the provider file and the registry, nothing else.
+fn source_values() -> String {
+    crate::source::SourceKind::ALL
+        .iter()
+        .map(|&k| {
+            let id = crate::source::pick(k).id();
+            if k == crate::source::SourceKind::default() {
+                format!("{id} (default)")
+            } else {
+                id.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 const KNOWN_FLAGS: &[&str] = &[
     "help",
     "json",
@@ -482,7 +507,7 @@ const KNOWN_FLAGS: &[&str] = &[
 /// Closest candidate to `input` within edit distance 2, or `None`. The
 /// distance must also be strictly less than the candidate length so a
 /// 2-char input doesn't "match" every 2-char command. Used for the
-/// `did you mean ...?` hints on unknown subcommands and flags.
+/// typo hints on unknown subcommands and flags.
 fn nearest(input: &str, candidates: &[&'static str]) -> Option<&'static str> {
     let mut best: Option<(&'static str, usize)> = None;
     for &c in candidates {
@@ -670,17 +695,6 @@ fn validate_flag_scopes(o: &Options) -> Result<(), String> {
         }
     }
 
-    // tui/web read Claude Code's project tree directly (the loader hardcodes
-    // ~/.claude/projects and Claude's project-dir layout), so a non-default
-    // --source would scan Claude's logs while pricing from another
-    // provider's cache. Reject rather than silently mismatch.
-    if matches!(o.cmd, Cmd::Tui | Cmd::Web) && o.source != crate::source::SourceKind::ClaudeCode {
-        return Err(format!(
-            "--source is not supported by `{}` (it reads Claude Code logs only)",
-            o.cmd.as_str()
-        ));
-    }
-
     Ok(())
 }
 
@@ -835,7 +849,7 @@ pub fn print_help() {
     // names in prose are left bare so they don't render as literals.
     let i = pad(HELP_INDENT_COLS);
     println!("NAME:");
-    println!("{i}ccaudit - fast token usage + cost analyzer for Claude Code and Codex logs");
+    println!("{i}ccaudit - fast token usage + cost analyzer for coding-agent logs");
     println!();
     println!("USAGE:");
     println!("{i}ccaudit [COMMAND] [FLAGS]");
@@ -844,10 +858,11 @@ pub fn print_help() {
     println!("{i}{}", version_core());
     println!();
     println!("DESCRIPTION:");
-    println!("{i}Token usage and cost reports for your local Claude Code or Codex");
-    println!("{i}logs — daily, weekly, monthly, per session, or per 5-hour billing");
-    println!("{i}block, as tables, JSON, an interactive TUI, or a web dashboard.");
-    println!("{i}Update model prices anytime with ccaudit refresh-prices.");
+    println!("{i}Token usage and cost reports from local coding-agent logs — daily,");
+    println!("{i}weekly, monthly, per session, or per 5-hour billing block, as");
+    println!("{i}tables, JSON, an interactive TUI, or a web dashboard. Claude Code");
+    println!("{i}by default; --source lists the other providers. Refresh model");
+    println!("{i}prices anytime with ccaudit refresh-prices.");
     println!();
 
     println!("COMMANDS:");
@@ -889,17 +904,14 @@ pub fn print_help() {
 
     println!("GLOBAL OPTIONS:");
     // (short alias, long form + metavar, description).
+    let source_desc = format!("log provider: {}", source_values());
     let flags: &[(&str, &str, &str)] = &[
         ("", "--since YYYYMMDD", "filter by start date (inclusive)"),
         ("", "--until YYYYMMDD", "filter by end date (inclusive)"),
         ("", "--project NAME", "filter to a single project"),
         ("", "--timezone TZ", "UTC, Local, or ±HH:MM (default UTC)"),
         ("", "--locale LOC", "date locale (e.g. en_US, ja_JP)"),
-        (
-            "",
-            "--source NAME",
-            "log provider: claude-code (default), codex",
-        ),
+        ("", "--source NAME", source_desc.as_str()),
         ("", "--no-color", "disable ANSI color (also: NO_COLOR env)"),
         ("-q", "--quiet", "suppress non-essential output"),
         ("-V", "--version", "print the version"),
@@ -978,13 +990,17 @@ pub fn print_subcommand_help(cmd: Cmd) {
             println!("ccaudit tui - interactive TUI browser");
             println!();
             println!("USAGE");
-            println!("  ccaudit tui");
+            println!("  ccaudit tui [FLAGS]");
             println!();
             println!("FLAGS");
-            println!("  (none currently)");
+            println!(
+                "  --source NAME       provider to browse: {}",
+                source_values()
+            );
             println!();
             println!("EXAMPLES");
             println!("  ccaudit tui");
+            println!("  ccaudit tui --source codex");
             println!();
             println!("Note: global filter flags (--since/--until/--project) are not yet honored");
             println!("by tui. It launches the browser with all data loaded.");
@@ -999,10 +1015,19 @@ pub fn print_subcommand_help(cmd: Cmd) {
             println!("  --port N            HTTP server port (default 3131)");
             println!("  --out DIR           output directory (default: ~/.claude/ccaudit-web)");
             println!("  --no-serve          generate the static site, then exit (no browser)");
+            println!(
+                "  --source NAME       provider to open on: {}",
+                source_values()
+            );
             println!();
             println!("EXAMPLES");
             println!("  ccaudit web");
             println!("  ccaudit web --port 8080 --out ./site");
+            println!("  ccaudit web --source codex");
+            println!();
+            println!("The bundle carries every provider that has logs on this machine, so");
+            println!("the browser's source dropdown switches between them with no rebuild;");
+            println!("--source picks which one it opens on, and which one reset returns to.");
             println!();
             println!("Note: global filter flags (--since/--until/--project) are not yet honored");
             println!("by web. It generates the site with all data loaded.");
@@ -1149,13 +1174,13 @@ mod tests {
     fn unknown_flag_suggests_nearest() {
         let e = parse_err(&["daily", "--complact"]);
         assert!(e.contains("unknown flag"), "{e}");
-        assert!(e.contains("did you mean `--compact`"), "{e}");
+        assert!(e.contains("a similar flag exists: --compact"), "{e}");
     }
 
     #[test]
     fn unknown_subcommand_suggests_nearest() {
         let e = parse_err(&["dialy"]);
-        assert!(e.contains("did you mean `ccaudit daily`"), "{e}");
+        assert!(e.contains("a similar command exists: ccaudit daily"), "{e}");
     }
 
     #[test]

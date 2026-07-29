@@ -138,7 +138,11 @@ fn cache_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("ccaudit-cache"))
 }
 
-fn file_fingerprint(path: &Path) -> Option<(u64, u64)> {
+/// `(mtime_secs, size)` for `path`, or `None` if it can't be stat'd.
+///
+/// Public so a provider's transcript parser can capture the fingerprint
+/// BEFORE it reads the file — see the `Session::fingerprint` contract.
+pub fn file_fingerprint(path: &Path) -> Option<(u64, u64)> {
     let meta = fs::metadata(path).ok()?;
     let mtime = meta
         .modified()
@@ -229,10 +233,15 @@ pub fn load_messages_for(path: &Path) -> Option<Vec<Message>> {
     postcard::from_bytes(&data).ok()
 }
 
-/// Convenience: load messages for `path` into `session.messages` if
-/// they're not already present. No-op if the cache is missing — callers
-/// that need a guarantee should re-parse the JSONL on `false`.
-pub fn ensure_messages_loaded(session: &mut Session, path: &Path) -> bool {
+/// Load messages for `path` into `session.messages` if not already there.
+///
+/// Falls back to re-reading the provider's log when the per-session
+/// cache is missing or stale; `false` means even that produced nothing.
+pub fn ensure_messages_loaded<S: crate::source::Source + ?Sized>(
+    source: &S,
+    session: &mut Session,
+    path: &Path,
+) -> bool {
     if !session.messages.is_empty() {
         return true;
     }
@@ -240,7 +249,7 @@ pub fn ensure_messages_loaded(session: &mut Session, path: &Path) -> bool {
         session.messages = msgs;
         return true;
     }
-    if let Some(s) = parse_session(path) {
+    if let Some(s) = source.parse_messages(path) {
         session.messages = s.messages;
         return true;
     }
@@ -808,7 +817,7 @@ impl SessionBuilder {
 
 // Slice-truncate a String into a fresh, short owned copy. Avoids
 // cloning the whole input when we know the keeper portion is small.
-fn truncated_copy(s: &str, max_bytes: usize) -> String {
+pub(crate) fn truncated_copy(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
@@ -1002,7 +1011,8 @@ pub fn load_all_projects_with_cache<S: crate::source::Source + ?Sized>(
     let cache_misses = AtomicUsize::new(0);
 
     struct ParsedFile {
-        dir: PathBuf,
+        /// Provider-supplied grouping key — see `Source::project_key`.
+        bucket: String,
         path_hash: u64,
         session: Session,
     }
@@ -1010,13 +1020,6 @@ pub fn load_all_projects_with_cache<S: crate::source::Source + ?Sized>(
         .par_iter()
         .filter_map(|src| {
             let file = &src.path;
-            // Group by the project directory, not the file's immediate
-            // parent: subagent transcripts live at
-            // `<project>/<uuid>/subagents/agent-*.jsonl`, and bucketing
-            // those by `parent()` would invent a `subagents` project per
-            // conversation instead of folding them into the real one.
-            let dir = crate::source::claude_code::project_root_of(file)
-                .or_else(|| file.parent().map(Path::to_path_buf))?;
             let path_hash = src.path_hash;
             // Header-only fast path — skips deserializing the messages
             // blob, which is what made warm cold-starts expensive.
@@ -1029,7 +1032,7 @@ pub fn load_all_projects_with_cache<S: crate::source::Source + ?Sized>(
                 session.file_path.clone_from(file);
                 let _ = cache_hits.fetch_add(1, Ordering::Relaxed);
                 return Some(ParsedFile {
-                    dir,
+                    bucket: source.project_key(file, session.cwd.as_deref()),
                     path_hash,
                     session,
                 });
@@ -1039,17 +1042,18 @@ pub fn load_all_projects_with_cache<S: crate::source::Source + ?Sized>(
             // hit the header-only path above. Empty sessions are cached
             // (so the next run's header path skips them cheaply) but not
             // listed.
-            let session = parse_session_allow_empty(file)?;
+            let session = source.parse_messages(file)?;
             save_to_cache(file, &session);
             if session.messages.is_empty() {
                 return None;
             }
+            let bucket = source.project_key(file, session.cwd.as_deref());
             // Keep header in memory but drop messages — consumers that need
             // them will re-read from `.msgs`.
             let mut header_only = session;
             header_only.messages = Vec::new();
             Some(ParsedFile {
-                dir,
+                bucket,
                 path_hash,
                 session: header_only,
             })
@@ -1082,21 +1086,21 @@ pub fn load_all_projects_with_cache<S: crate::source::Source + ?Sized>(
         }
     }
 
-    let mut project_map: FxHashMap<PathBuf, Vec<Session>> = FxHashMap::default();
+    let mut project_map: FxHashMap<String, Vec<Session>> = FxHashMap::default();
     for p in parsed {
-        project_map.entry(p.dir).or_default().push(p.session);
+        project_map.entry(p.bucket).or_default().push(p.session);
     }
 
     let mut projects: Vec<Project> = project_map
         .into_iter()
-        .map(|(dir, mut sessions)| {
+        .map(|(bucket, mut sessions)| {
             sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
             // Prefer the unambiguous cwd recorded inside any session in this
             // project dir — the dash-encoded dir name loses real hyphens.
             let pretty_name = if let Some(c) = sessions.iter().find_map(|s| s.cwd.as_deref()) {
                 crate::source::prettify_cwd(c)
             } else {
-                let name = dir
+                let name = Path::new(&bucket)
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown");

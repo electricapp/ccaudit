@@ -9,7 +9,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState,
 };
 use rustc_hash::FxHashMap;
@@ -51,6 +51,10 @@ pub enum PostAction {
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     projects: Vec<Project>,
+    /// Provider whose logs are on screen. Held so a session opened from
+    /// the list re-reads its transcript through the same parser that
+    /// built the list, rather than assuming Claude Code's log shape.
+    source: &'static dyn crate::source::Source,
     searcher: Searcher,
     view: View,
     search_query: String,
@@ -78,6 +82,10 @@ pub struct App {
     dash_scroll: u16,
     dash_max_scroll: u16,
     session_detail_open: bool,
+    /// `?` overlay. The status bar only has room for the current view's
+    /// bindings, so the full reference lives behind a key — same set the
+    /// web's `?` shows, so the two surfaces document one keymap.
+    keys_open: bool,
     pub post_action: Option<PostAction>,
     quit: bool,
     // Dashboard aggregations computed once at App::new(). Projects are
@@ -268,7 +276,7 @@ fn compute_dashboard(projects: &[Project]) -> DashboardAgg {
 }
 
 impl App {
-    pub fn new(projects: Vec<Project>) -> Self {
+    pub fn new(projects: Vec<Project>, source: &'static dyn crate::source::Source) -> Self {
         let count = projects.len();
         let filtered: Vec<usize> = (0..count).collect();
         let mut state = ListState::default();
@@ -278,6 +286,7 @@ impl App {
         let dashboard = compute_dashboard(&projects);
         Self {
             projects,
+            source,
             searcher: Searcher::new(),
             view: View::Projects,
             search_query: String::new(),
@@ -296,6 +305,7 @@ impl App {
             dash_scroll: 0,
             dash_max_scroll: 0,
             session_detail_open: false,
+            keys_open: false,
             post_action: None,
             quit: false,
             dashboard,
@@ -373,7 +383,18 @@ impl App {
             return;
         }
 
+        // The key overlay swallows the next keystroke: any key closes it,
+        // rather than firing an action against a view the overlay is
+        // covering.
+        if self.keys_open {
+            self.keys_open = false;
+            return;
+        }
+
         match key.code {
+            KeyCode::Char('?') => {
+                self.keys_open = true;
+            }
             // A committed filter (typed, then Enter) hides the input box
             // but keeps the list narrowed — clear it before quitting or
             // stepping back.
@@ -611,6 +632,7 @@ impl App {
         let (Some(pi), Some(si)) = (self.selected_project, self.selected_session) else {
             return;
         };
+        let source = self.source;
         if let Some(s) = self
             .projects
             .get_mut(pi)
@@ -618,7 +640,7 @@ impl App {
         {
             if s.messages.is_empty() {
                 let path = s.file_path.clone();
-                let _ = parse::ensure_messages_loaded(s, &path);
+                let _ = parse::ensure_messages_loaded(source, s, &path);
             }
         }
     }
@@ -740,6 +762,9 @@ impl App {
         }
 
         self.render_statusbar(f, chunks[1]);
+        if self.keys_open {
+            render_key_help(f);
+        }
     }
 
     /// Status-bar segment for an active filter, e.g. ` | filter "auth" 3/91`.
@@ -776,7 +801,7 @@ impl App {
                     self.filter_note(),
                 ),
                 String::from(
-                    "j/k nav | / search | enter select | o open web | d dashboard | q quit ",
+                    "j/k nav | g/G ends | / search | enter select | o web | d dash | ? keys | q quit ",
                 ),
             ),
             View::Sessions => {
@@ -791,7 +816,7 @@ impl App {
                             self.filter_note(),
                         ),
                         String::from(
-                            "j/k nav | / search | enter view | tab detail | c resume | o web | esc back ",
+                            "j/k nav | g/G ends | / search | enter view | tab detail | c resume | ? keys | esc back ",
                         ),
                     )
                 } else {
@@ -808,7 +833,9 @@ impl App {
                             s.model.as_deref().unwrap_or("?"),
                             format_cost(s.cost),
                         ),
-                        String::from("j/k scroll | PgDn/PgUp page | c resume | esc back "),
+                        String::from(
+                            "j/k scroll | g/G ends | PgDn/PgUp page | c resume | ? keys | esc back ",
+                        ),
                     )
                 } else {
                     (String::new(), String::new())
@@ -819,7 +846,7 @@ impl App {
                     " dashboard | {} total",
                     format_cost(self.dashboard.total_cost)
                 ),
-                String::from("j/k scroll | d close | q quit "),
+                String::from("j/k scroll | g/G ends | d close | ? keys | q quit "),
             ),
         };
 
@@ -1277,7 +1304,7 @@ fn build_message_lines(session: &parse::Session, width: u16) -> Vec<Line<'static
         // palette the web `.tg-*` CSS uses, so colors match across
         // TUI and web for each message kind.
         let (tag, tag_color) = match msg.kind {
-            MessageKind::User => ("YOU", style::tui(style::K_USER)),
+            MessageKind::User => ("USR", style::tui(style::K_USER)),
             MessageKind::Assistant => ("AI ", style::tui(style::K_ASSISTANT)),
             MessageKind::ToolUse => (">>>", style::tui(style::K_TOOLUSE)),
             MessageKind::ToolResult => ("<<<", style::tui(style::K_TOOLRESULT)),
@@ -1551,6 +1578,76 @@ fn unified_row_line(
     ])
 }
 
+/// Full keymap, `(group, keys, what)`.
+///
+/// Mirrors `KEY_HELP` in `src/web/app.js` so `?` describes the same
+/// bindings on both surfaces. The web adds dashboard-only keys (y/p/H
+/// histogram bucket, L log scale, m/t pie mode) for charts the TUI
+/// dashboard doesn't draw; every binding listed here means the same
+/// thing in both.
+const KEY_HELP: &[(&str, &str, &str)] = &[
+    ("Navigate", "j / k / ↑ / ↓", "move the selection, or scroll"),
+    ("", "g / G", "first / last row, or top / bottom"),
+    ("", "l / → / enter", "open the selected row"),
+    ("", "h / ← / q / esc", "back"),
+    ("", "PgDn / PgUp", "page through a session or the dashboard"),
+    ("Find", "/", "filter the list"),
+    ("Act", "c", "resume the session in Claude Code"),
+    ("", "tab", "expand session detail"),
+    ("", "d", "toggle the dashboard"),
+    ("", "o", "regenerate the web bundle and open it"),
+    ("", "?", "this list"),
+    ("", "q / ctrl-c", "quit"),
+];
+
+// Centered `?` overlay. `Clear` wipes the cells first so the view
+// underneath doesn't bleed through the popup's interior.
+fn render_key_help(f: &mut Frame) {
+    let area = f.area();
+    let w = 54u16.min(area.width.saturating_sub(2));
+    let h = (KEY_HELP.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    let group_w = KEY_HELP.iter().map(|(g, ..)| g.len()).max().unwrap_or(0);
+    let key_w = KEY_HELP
+        .iter()
+        .map(|(_, k, _)| unicode_width::UnicodeWidthStr::width(*k))
+        .max()
+        .unwrap_or(0);
+    let lines: Vec<Line<'static>> = KEY_HELP
+        .iter()
+        .map(|(group, keys, what)| {
+            let pad_g = " ".repeat(group_w.saturating_sub(group.len()));
+            let pad_k =
+                " ".repeat(key_w.saturating_sub(unicode_width::UnicodeWidthStr::width(*keys)));
+            Line::from(vec![
+                Span::styled(
+                    format!("{group}{pad_g}  "),
+                    Style::default().fg(style::tui(style::FG3)),
+                ),
+                Span::styled(
+                    format!("{keys}{pad_k}  "),
+                    Style::default().fg(style::tui(style::CYAN)),
+                ),
+                Span::styled(
+                    (*what).to_string(),
+                    Style::default().fg(style::tui(style::FG2)),
+                ),
+            ])
+        })
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" keys — any key closes ")
+        .border_style(Style::default().fg(style::tui(style::BORDER)));
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
 // Truncate to a display-width budget, appending "..." when over. Width,
 // not byte length: comparing `s.len()` to a cell budget over-truncated
 // CJK/emoji text and threw off right-edge padding math downstream.
@@ -1574,4 +1671,63 @@ fn truncate_line(s: &str, max: usize) -> String {
     }
     out.push_str("...");
     out
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::KEY_HELP;
+
+    // The web app's copy of the keymap. Read as source text rather than
+    // executed: the point is to catch one surface's bindings moving
+    // without the other's, and the two are written in different
+    // languages, so the string is the only shared artifact.
+    const WEB_APP_JS: &str = include_str!("web/app.js");
+
+    /// Motion keys mean the same thing in the TUI and the web.
+    ///
+    /// These are the bindings a user carries between the two surfaces
+    /// without thinking, so they're the ones worth pinning. The web's
+    /// `?` overlay spells them identically or the surfaces have drifted.
+    #[test]
+    fn motion_keys_match_the_web_overlay() {
+        let motion = ["j / k / ↑ / ↓", "g / G", "l / → / enter", "h / ← / q / esc"];
+        for keys in motion {
+            assert!(
+                KEY_HELP.iter().any(|(_, k, _)| *k == keys),
+                "the TUI keymap dropped `{keys}`"
+            );
+            // Quoted, so the match is the whole `KEY_HELP` cell rather
+            // than a substring of a longer one: bare `contains("g / G")`
+            // is still satisfied by `'gg / GG'`.
+            assert!(
+                WEB_APP_JS.contains(&format!("'{keys}'")),
+                "src/web/app.js no longer lists `{keys}` — the two keymaps have drifted"
+            );
+        }
+    }
+
+    /// `h` and `l` are motion in every web view, with no per-view
+    /// exception.
+    ///
+    /// The dashboard used to bind them to its hour-histogram and
+    /// log-scale toggles, which made the same keystroke mean different
+    /// things depending on the screen. Those moved to `H` / `L`. One
+    /// handler apiece is what "no exception" looks like in the source; a
+    /// second occurrence means a view claimed the letter back.
+    #[test]
+    fn web_binds_h_and_l_only_as_motion() {
+        for (key, what) in [
+            ("'h'", "back"),
+            ("'l'", "open the selected row"),
+            ("'H'", "the dashboard's hour histogram"),
+            ("'L'", "the dashboard's log-scale toggle"),
+        ] {
+            let n = WEB_APP_JS.matches(&format!("e.key === {key}")).count();
+            assert_eq!(
+                n, 1,
+                "expected exactly one `e.key === {key}` handler ({what}), found {n}"
+            );
+        }
+    }
 }

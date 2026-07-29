@@ -140,6 +140,33 @@ pub trait Source: Sync + Send {
     /// rebuild on every run.
     fn parse_session(&self, src: &SourceFile) -> Option<ParsedSession>;
 
+    /// Parse one session's *message content* for the session browser.
+    ///
+    /// [`Source::parse_session`] feeds the aggregation cache and only
+    /// needs token rows; this is the heavier second read that the TUI
+    /// and web transcript views consume. Same allow-empty contract as
+    /// `parse_session`: a readable log with nothing renderable returns
+    /// `Some` with empty `messages` (the per-session cache stores that
+    /// so the next run skips it cheaply), and `None` means the file
+    /// couldn't be read at all.
+    ///
+    /// A provider that has no browsable transcript can return an empty
+    /// `Session` unconditionally — it then contributes no sessions to
+    /// the browser and drops out of the web bundle's source list, while
+    /// still reporting usage through `parse_session`.
+    fn parse_messages(&self, path: &Path) -> Option<crate::parse::Session>;
+
+    /// Bucket key grouping one session into a browser "project".
+    ///
+    /// The default is the file's parent directory, which is right for
+    /// providers that store one directory per project. Providers with a
+    /// flat log layout override — Codex writes everything under
+    /// `YYYY/MM/DD/`, so keying on the directory would invent one
+    /// project per calendar day.
+    fn project_key(&self, path: &Path, _cwd: Option<&str>) -> String {
+        path.parent().unwrap_or(path).to_string_lossy().into_owned()
+    }
+
     /// Pricing for a given model. `None` means "unknown model" — the
     /// implementation decides the fallback.
     fn price(&self, model: Option<&str>) -> &Pricing;
@@ -317,6 +344,14 @@ pub enum SourceKind {
     #[default]
     ClaudeCode,
     Codex,
+}
+
+impl SourceKind {
+    /// Every provider ccaudit knows about, in display order. Single
+    /// source of truth for the web bundle's source list — a provider
+    /// added to `pick` but missed here would silently never appear in
+    /// the browser's dropdown.
+    pub const ALL: [Self; 2] = [Self::ClaudeCode, Self::Codex];
 }
 
 impl std::str::FromStr for SourceKind {

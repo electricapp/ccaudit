@@ -192,7 +192,16 @@ fn web_totals(h: &Harness) -> (f64, f64) {
     let out = h.run(&["web", "--no-serve", "--out", out_dir.to_str().unwrap()]);
     require_success(&out, "ccaudit web --no-serve");
 
-    let index_path = out_dir.join("index.json");
+    // The bundle holds one payload per provider; `sources.json` names the
+    // one `ccaudit web` opened with. Routing through the manifest (rather
+    // than hardcoding `claude-code/`) is what keeps this test honest if
+    // the default ever moves.
+    let man: Value = serde_json::from_slice(
+        &std::fs::read(out_dir.join("sources.json")).expect("read sources.json"),
+    )
+    .expect("valid manifest JSON");
+    let default_src = man["default"].as_str().expect("manifest names a default");
+    let index_path = out_dir.join(default_src).join("index.json");
     let body = std::fs::read(&index_path).expect("read index.json");
     let doc: Value = serde_json::from_slice(&body).expect("valid JSON");
 

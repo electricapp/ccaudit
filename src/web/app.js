@@ -24,6 +24,23 @@ let renderToken = 0,
   pendingGroups = null,
   pendingCtx = null;
 let showKinds = new Set(['User', 'Assistant', 'ToolUse', 'ToolResult', 'Thinking', 'System']);
+// Pixels per j/k press in the scrolling views. The TUI advances three
+// terminal rows per press (`move_down`), so this is three rendered lines
+// at the message body's line-height — close enough that muscle memory
+// carries between the two surfaces, and cheaper than measuring the
+// computed line-height on every keypress.
+const SCROLL_STEP = 66;
+// Short label per MessageKind, used by both the filter buttons and the
+// message-group tag. One map so the two can't drift into calling the
+// same kind different things on the same screen.
+const KIND_LABELS = Object.freeze({
+  User: 'user',
+  Assistant: 'ai',
+  ToolUse: 'tool',
+  ToolResult: 'result',
+  Thinking: 'think',
+  System: 'sys',
+});
 let detail = 'high',
   compact = false,
   dateFrom = '',
@@ -98,31 +115,95 @@ const M = $('#main'),
   DT = $('#dto'),
   BT = $('#btt'),
   MF = $('#mfilt'),
+  SF = $('#sfilt'),
   CP = $('#crumb-p'),
   CS = $('#crumb-s');
 
-// Load index + search index in parallel, then resolve any pre-loaded
-// URL (e.g. user pasted a deep link) into navigation state, then render.
+// ── Provider selection ──
+//
+// The bundle ships one payload per provider under /{id}/. SRC_DEFAULT is
+// the provider `ccaudit web` was invoked for: the app opens on it and
+// `reset` returns to it, so switching in the browser never loses the
+// entry point chosen on the command line. A non-default choice rides in
+// the URL as ?src=<id>, so a pasted link to a Codex session still lands
+// on Codex rather than resolving its slug against Claude Code's tree.
+let SOURCES = [],
+  SRC_DEFAULT = '',
+  src = '';
 // Absolute paths on every fetch — the SPA router puts us at arbitrary
 // URLs (e.g. /p/1/s/2) and relative paths would resolve against the
 // nested path instead of the site root, yielding "not found" on deep
 // links.
-Promise.all([
-  fetch('/index.json').then((r) => r.json()),
-  fetch('/search.json').then((r) => r.json()),
-])
-  .then(([idx, six]) => {
+function dataPath(rel) {
+  return '/' + src + rel;
+}
+function knownSource(id) {
+  return SOURCES.some((s) => s.id === id);
+}
+function srcLabel(id) {
+  const e = SOURCES.find((s) => s.id === id);
+  return e ? e.label : id;
+}
+
+// Fetch the active provider's payload and rebuild everything derived
+// from it. Runs at boot and on every provider switch.
+function loadSource() {
+  return Promise.all([
+    fetch(dataPath('/index.json')).then((r) => r.json()),
+    fetch(dataPath('/search.json')).then((r) => r.json()),
+  ]).then(([idx, six]) => {
     IDX = idx.projects;
     DAILY = idx.daily;
     SIX = six;
+    // Everything below is indexed by position within the payload we just
+    // replaced. Per-session blobs are keyed "{pi}_{si}.json", so a
+    // leftover entry would resolve to a different session entirely.
+    for (const k of Object.keys(cache)) delete cache[k];
+    msgs = null;
+    flatMap = [];
     buildRouteIndex();
     populateModelFilter();
-    return applyPath();
+    renderSourceDrop();
+  });
+}
+
+// Load the manifest first: it names the provider to open on, and the app
+// can't fetch a payload before it knows which directory to read.
+fetch('/sources.json')
+  .then((r) => r.json())
+  .then((man) => {
+    SOURCES = man.sources || [];
+    SRC_DEFAULT = man.default;
+    const asked = new URLSearchParams(location.search).get('src');
+    src = knownSource(asked) ? asked : SRC_DEFAULT;
+    return loadSource();
   })
+  .then(() => applyPath())
   .then(() => render())
   .catch((e) => {
     M.innerHTML = errorState('failed to load index', String(e));
   });
+
+// Switch providers. Project and session indices are payload-local, so
+// there is no meaningful "same place" to land on in the other provider's
+// tree — the switch returns to the landing view rather than guessing.
+// Filters (date, model, search) are deliberately kept: they describe
+// what the user is looking for, not which log directory it lives in.
+function setSource(id) {
+  if (id === src || !knownSource(id)) return;
+  src = id;
+  view = 'projects';
+  prevView = null;
+  cp = null;
+  cs = null;
+  sel = -1;
+  dashScope = { kind: 'all' };
+  loadSource()
+    .then(() => render())
+    .catch((e) => {
+      M.innerHTML = errorState('failed to load ' + srcLabel(id), String(e));
+    });
+}
 
 // ── URL routing ──
 //
@@ -198,8 +279,15 @@ function buildPath() {
   if (view === 'search' && sq) return '/search?q=' + encodeURIComponent(sq);
   return '/';
 }
+// `?src=` is carried on every URL except the default provider's, so a
+// copied link reopens the provider it was taken from. Appended here (not
+// inside buildPath) so the search view's own `?q=` composes with it.
+function withSource(path) {
+  if (!src || src === SRC_DEFAULT) return path;
+  return path + (path.includes('?') ? '&' : '?') + 'src=' + encodeURIComponent(src);
+}
 function syncUrl() {
-  const path = buildPath();
+  const path = withSource(buildPath());
   const cur = location.pathname + location.search;
   if (cur !== path) history.pushState({}, '', path);
 }
@@ -241,7 +329,7 @@ async function applyPath() {
       view = 'messages';
       if (!cache[s.file]) {
         try {
-          const r = await fetch('/s/' + s.file);
+          const r = await fetch(dataPath('/s/' + s.file));
           cache[s.file] = await r.json();
         } catch (_e) {
           view = 'projects';
@@ -270,7 +358,16 @@ async function applyPath() {
   view = 'projects';
 }
 window.addEventListener('popstate', () => {
-  applyPath().then(() => render());
+  // Back/forward can cross a provider boundary (?src= differs). Swap the
+  // payload before resolving the path: slugs and session UUIDs only mean
+  // anything inside the provider whose index built them.
+  const asked = new URLSearchParams(location.search).get('src') || SRC_DEFAULT;
+  let pending = Promise.resolve();
+  if (asked !== src && knownSource(asked)) {
+    src = asked;
+    pending = loadSource();
+  }
+  pending.then(() => applyPath()).then(() => render());
 });
 
 // ── Unified table renderer ──
@@ -291,16 +388,22 @@ const UCOLS = [
 ];
 // tokenParts / costParts live in util.js.
 // Segmented button row used by the pie (model/tool) and histogram
-// (day/project/hour) toggles. Each entry is [value, label]; the
+// (day/project/hour) toggles. Each entry is [value, label, key]; the
 // button matching `current` gets the `on` modifier. `handler` is the
-// bare name of a globally-exposed setter (e.g. 'setPieMode').
+// bare name of a globally-exposed setter (e.g. 'setPieMode'). The key
+// rides in the tooltip so the binding is discoverable from the control
+// it drives, not only from the `?` overlay.
 function buildModeToggle(modes, current, handler) {
   return modes
     .map(
-      ([v, lbl]) =>
+      ([v, lbl, key]) =>
         '<button class="pbtn' +
         (current === v ? ' on' : '') +
-        '" onclick="' +
+        '" title="' +
+        esc(lbl) +
+        ' (' +
+        esc(key) +
+        ')" onclick="' +
         handler +
         "('" +
         v +
@@ -371,7 +474,11 @@ function buildTable(view, identLbl, rows, limit) {
   for (const r of visible) {
     const attrs =
       (r.click ? ' onclick="' + r.click + '"' : '') +
-      (r.dataModel ? ' data-model="' + esc(r.dataModel) + '"' : '');
+      (r.dataModel ? ' data-model="' + esc(r.dataModel) + '"' : '') +
+      // Session rows carry their (pi, si) so keyboard actions can reach
+      // the underlying session without re-deriving it from the onclick
+      // payload, which is a code string, not data.
+      (r.dataSess ? ' data-sess="' + esc(r.dataSess) + '"' : '');
     h += '<tr class="clickable"' + attrs + '>';
     for (const c of UCOLS) {
       const align = c.align === 'r' ? ' r' : '';
@@ -485,6 +592,38 @@ function renderModelDrop(root, opts) {
   h += '</div>';
   root.innerHTML = h;
 }
+// Single-select dropdown for the provider. Always rendered, even when
+// the machine only has one provider's logs — the control is what makes
+// multi-provider support discoverable, and a row reading "no sessions"
+// is more honest than a control that silently vanishes.
+// The provider the bundle opened with is marked so `reset`'s destination
+// is visible without pressing it.
+function renderSourceDrop() {
+  if (!SF) return;
+  let h =
+    '<button type="button" class="drop-btn">' +
+    esc(srcLabel(src)) +
+    '<span class="drop-arr">▾</span></button>';
+  h += '<div class="drop-menu hidden">';
+  for (const o of SOURCES) {
+    const note = o.sessions
+      ? o.sessions + (o.sessions === 1 ? ' session' : ' sessions')
+      : 'no sessions';
+    h +=
+      '<div class="drop-item' +
+      (o.id === src ? ' on' : '') +
+      '" data-v="' +
+      esc(o.id) +
+      '">' +
+      esc(o.label) +
+      '<span class="drop-note">' +
+      esc(note) +
+      (o.id === SRC_DEFAULT ? ' · default' : '') +
+      '</span></div>';
+  }
+  h += '</div>';
+  SF.innerHTML = h;
+}
 function modelLabel() {
   if (modelFilters.size === 0) return 'all models';
   if (modelFilters.size === 1) return [...modelFilters][0];
@@ -556,12 +695,20 @@ function resetAll() {
   compact = false;
   // Reset always returns the dashboard to its universal scope, even
   // if invoked from another view — so 'r' is the unconditional escape
-  // hatch back to "everything" no matter where you are.
+  // hatch back to "everything" from any view.
   dashScope = { kind: 'all' };
   // Reset table sort selections and dashboard expand caps back to the
   // factory defaults so 'r' is a true "back to baseline" key.
   Object.assign(sortState, freshSortState());
   Object.assign(dashLimit, freshDashLimit());
+  // Provider is part of that baseline: reset returns to the one `ccaudit
+  // web` opened with. Last, because setSource renders once its payload
+  // lands — rendering here first would paint the outgoing provider's
+  // list for a frame.
+  if (src !== SRC_DEFAULT && knownSource(SRC_DEFAULT)) {
+    setSource(SRC_DEFAULT);
+    return;
+  }
   render();
 }
 function inModel(s) {
@@ -677,10 +824,27 @@ document.addEventListener('keydown', (e) => {
     }
   }
   if (document.activeElement === S) return;
+  if (e.key === '?') {
+    toggleKeyHelp();
+    e.preventDefault();
+    return;
+  }
   if (e.key === 'q') {
     goBack();
     e.preventDefault();
     return;
+  }
+  // `c` copies the resume command for the session in hand — the same
+  // thing the resume button does, and the same key the TUI binds.
+  if (e.key === 'c') {
+    const s =
+      view === 'messages' && cp != null && cs != null ? IDX[cp].sessions[cs] : selectedRow();
+    if (s) {
+      navigator.clipboard.writeText(resumeCmd(s));
+      flashToast('copied ' + resumeCmd(s));
+      e.preventDefault();
+      return;
+    }
   }
   // Arrow navigation for list views
   const listView = view === 'projects' || view === 'sessions' || view === 'search';
@@ -697,14 +861,56 @@ document.addEventListener('keydown', (e) => {
       e.preventDefault();
       return;
     }
-    if (e.key === 'ArrowRight' || e.key === 'Enter') {
+    // g/G jump to the ends of the list, matching the TUI's move_top /
+    // move_bottom.
+    if (e.key === 'g') {
+      sel = 0;
+      updateSel();
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'G') {
+      sel = getRows().length - 1;
+      updateSel();
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'ArrowRight' || e.key === 'Enter' || e.key === 'l') {
       activateSel();
       e.preventDefault();
       return;
     }
   }
-  // left arrow = back
-  if (e.key === 'ArrowLeft') {
+  // Scrolling views (messages, dashboard) have no row selection, so the
+  // same motion keys drive the pane instead — matching the TUI, where
+  // j/k scroll and g/G jump to the ends in exactly these two views.
+  if (view === 'messages' || view === 'dash') {
+    if (e.key === 'ArrowDown' || e.key === 'j') {
+      M.scrollBy({ top: SCROLL_STEP });
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'ArrowUp' || e.key === 'k') {
+      M.scrollBy({ top: -SCROLL_STEP });
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'g') {
+      M.scrollTo({ top: 0 });
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'G') {
+      M.scrollTo({ top: M.scrollHeight });
+      e.preventDefault();
+      return;
+    }
+  }
+  // h / ← is back in every view, with no exceptions — the TUI binds it
+  // that way, and a motion key that means something else on one screen
+  // is worse than a shifted mnemonic. The dashboard's own toggles moved
+  // to H / L to make room.
+  if (e.key === 'ArrowLeft' || e.key === 'h') {
     goBack();
     e.preventDefault();
     return;
@@ -733,10 +939,15 @@ document.addEventListener('keydown', (e) => {
     e.preventDefault();
     return;
   }
-  // Dashboard keys: h/p/y cycle histogram mode, l toggles log/linear,
-  // m/t switch the pie between by-model and by-tool.
+  // Dashboard keys: y/p/H pick the histogram bucket, L toggles
+  // log/linear, m/t switch the pie between by-model and by-tool.
+  //
+  // Hour and log are shifted because plain h/l are motion keys
+  // everywhere else; shifting keeps both mnemonics intact where a third
+  // letter would have thrown them away. y (not d) is day because `d` is
+  // the dashboard toggle itself.
   if (view === 'dash') {
-    if (e.key === 'h') {
+    if (e.key === 'H') {
       setHistMode('hour');
       e.preventDefault();
       return;
@@ -751,7 +962,7 @@ document.addEventListener('keydown', (e) => {
       e.preventDefault();
       return;
     }
-    if (e.key === 'l') {
+    if (e.key === 'L') {
       toggleHistLog();
       e.preventDefault();
       return;
@@ -800,6 +1011,77 @@ function updateSel() {
 function activateSel() {
   const rows = getRows();
   if (sel >= 0 && sel < rows.length) rows[sel].click();
+}
+
+// Session behind the highlighted list row, or null when the row isn't a
+// session (project / model rollups) or nothing is highlighted.
+function selectedRow() {
+  const rows = getRows();
+  if (sel < 0 || sel >= rows.length) return null;
+  const key = rows[sel].getAttribute('data-sess');
+  if (!key) return null;
+  const [pi, si] = key.split(':').map(Number);
+  return (IDX[pi] && IDX[pi].sessions[si]) || null;
+}
+
+// Transient confirmation for keyboard actions that produce no visible
+// change. The button-driven equivalents relabel themselves ("copied!"),
+// but a keypress has no button to relabel.
+let toastTimer = null;
+function flashToast(text) {
+  let t = $('#toast');
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'toast';
+    document.body.appendChild(t);
+  }
+  t.textContent = text;
+  t.classList.add('on');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('on'), 1600);
+}
+
+// Key reference. The TUI prints its bindings in the status bar; the web
+// has no equivalent strip, so `?` puts the same information one keypress
+// away instead of leaving every binding undiscoverable.
+const KEY_HELP = [
+  ['Navigate', 'j / k / ↑ / ↓', 'move the selection, or scroll'],
+  ['', 'g / G', 'first / last row, or top / bottom'],
+  ['', 'l / → / enter', 'open the selected row'],
+  ['', 'h / ← / q / esc', 'back'],
+  ['Find', '/', 'focus search'],
+  ['', 'n / N', 'next / previous match in a session'],
+  ['Act', 'c', 'copy the resume command'],
+  ['', 'd', 'toggle the dashboard (scoped to the current view)'],
+  ['', 'r', 'reset filters, sort, scope, and provider'],
+  ['Dashboard', 'y / p / H', 'histogram by day / project / hour'],
+  ['', 'L', 'toggle log scale'],
+  ['', 'm / t', 'pie by model / by tool'],
+];
+function toggleKeyHelp() {
+  const open = $('#keyhelp');
+  if (open) {
+    open.remove();
+    return;
+  }
+  let h =
+    '<div class="kh-box"><div class="kh-title">keys<span class="kh-esc">? to close</span></div>';
+  for (const [group, keys, what] of KEY_HELP) {
+    h +=
+      '<div class="kh-row"><span class="kh-grp">' +
+      esc(group) +
+      '</span><span class="kh-key">' +
+      esc(keys) +
+      '</span><span class="kh-what">' +
+      esc(what) +
+      '</span></div>';
+  }
+  h += '</div>';
+  const el = document.createElement('div');
+  el.id = 'keyhelp';
+  el.innerHTML = h;
+  el.addEventListener('click', () => el.remove());
+  document.body.appendChild(el);
 }
 
 function goBack() {
@@ -1298,6 +1580,7 @@ function rSessions() {
       breakdown: tp,
       costBreakdown: costParts(s),
       click: 'oS(' + i + ')',
+      dataSess: cp + ':' + i,
     };
   });
   M.innerHTML = buildTable('sessions', 'Sessions', rows);
@@ -1339,6 +1622,7 @@ function rSearch() {
       breakdown: tp,
       costBreakdown: costParts(r.s),
       click: 'oSR(' + r.pi + ',' + r.si + ')',
+      dataSess: r.pi + ':' + r.si,
     };
   });
   M.innerHTML = buildTable('search', 'Results', rows);
@@ -1361,7 +1645,7 @@ async function oSR(pi, si) {
   M.innerHTML = loadingState();
   B.className = '';
   try {
-    const r = await fetch('/s/' + s.file);
+    const r = await fetch(dataPath('/s/' + s.file));
     msgs = await r.json();
     cache[s.file] = msgs;
     render();
@@ -1386,7 +1670,7 @@ async function oS(i) {
   M.innerHTML = loadingState();
   B.className = '';
   try {
-    const r = await fetch('/s/' + s.file);
+    const r = await fetch(dataPath('/s/' + s.file));
     msgs = await r.json();
     cache[s.file] = msgs;
     render();
@@ -1510,19 +1794,11 @@ function rMessages() {
     '" title="merge adjacent same-kind"><input type="checkbox" ' +
     (compact ? 'checked' : '') +
     ' onchange="toggleCompact()">compact</label>';
-  // Button order groups the primaries (you/ai) first, then the
+  // Button order groups the primaries (user/ai) first, then the
   // interactive tooling (tool/think), and parks the two "noise" kinds
   // (result/sys) together on the right.
   ['User', 'Assistant', 'ToolUse', 'Thinking', 'ToolResult', 'System'].forEach((k) => {
     const on = showKinds.has(k) ? 'on' : '';
-    const labels = {
-      User: 'you',
-      Assistant: 'ai',
-      ToolUse: 'tool',
-      ToolResult: 'result',
-      Thinking: 'think',
-      System: 'sys',
-    };
     h +=
       '<button class="fbtn ' +
       on +
@@ -1531,7 +1807,7 @@ function rMessages() {
       '" onclick="toggleKind(\'' +
       k +
       '\')">' +
-      labels[k] +
+      KIND_LABELS[k] +
       '</button>';
   });
   h += '</div></div>';
@@ -1635,11 +1911,7 @@ function renderGroupHtml(grp, ctx) {
       System: 'tg-s',
     }[first.kind] || 'tg-s';
   const lb =
-    first.kind === 'ToolUse'
-      ? first.tool_name || 'tool'
-      : { User: 'you', Assistant: 'ai', Thinking: 'think', System: 'sys', ToolResult: 'result' }[
-          first.kind
-        ] || first.kind;
+    first.kind === 'ToolUse' ? first.tool_name || 'tool' : KIND_LABELS[first.kind] || first.kind;
   const dm = first.kind === 'ToolResult' || first.kind === 'System' ? ' dim' : '';
   const tkSum = grp.reduce((a, x) => a + (x.tokens ? x.tokens.input + x.tokens.output : 0), 0);
   const tk = tkSum ? '<span class="msg-tk">' + ft(tkSum) + '</span>' : '';
@@ -2157,8 +2429,8 @@ function rDash() {
     '<div class="chart-panel pie-panel"><div class="panel-head"><div class="pie-toggle">' +
     buildModeToggle(
       [
-        ['model', 'model'],
-        ['tool', 'tool'],
+        ['model', 'model', 'm'],
+        ['tool', 'tool', 't'],
       ],
       pieMode,
       'setPieMode'
@@ -2170,9 +2442,9 @@ function rDash() {
     '<div class="chart-panel hist-panel"><div class="panel-head"><h3>tokens by</h3><div class="hist-toggle">';
   h += buildModeToggle(
     [
-      ['day', 'day'],
-      ['project', 'project'],
-      ['hour', 'hour'],
+      ['day', 'day', 'y'],
+      ['project', 'project', 'p'],
+      ['hour', 'hour', 'H'],
     ],
     histMode,
     'setHistMode'
@@ -2300,7 +2572,7 @@ function prefetchSessions(rows) {
     const file = s.file;
     if (cache[file] || prefetchInFlight.has(file)) continue;
     prefetchInFlight.add(file);
-    fetch('/s/' + file)
+    fetch(dataPath('/s/' + file))
       .then((res) => res.json())
       .then((m) => {
         cache[file] = m;
@@ -2778,7 +3050,7 @@ function buildHist(data, mode, cats) {
   // Hour mode buckets by UTC (matches the day/heatmap keys) — say so.
   const prefix = mode === 'hour' ? 'avg/day · UTC · ' : '';
   const toggle =
-    '<button class="pbtn hist-log-toggle" onclick="toggleHistLog()" title="toggle log/linear scale">' +
+    '<button class="pbtn hist-log-toggle" onclick="toggleHistLog()" title="toggle log/linear scale (L)">' +
     prefix +
     scalePart +
     '</button>';
@@ -2949,6 +3221,8 @@ document.addEventListener('click', (e) => {
       if (kind === 'detail') {
         detail = v;
         render();
+      } else if (kind === 'source') {
+        setSource(v);
       }
     }
     return;
