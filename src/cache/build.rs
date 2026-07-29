@@ -234,8 +234,21 @@ pub fn write_cache(b: &BuiltCache, path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("db.tmp");
-    let mut f = fs::File::create(&tmp)?;
+    // Per-process tmp name: two concurrent rebuilds (statusline poll +
+    // interactive run) sharing one tmp path would truncate each other
+    // mid-write and could rename interleaved bytes into place. The rename
+    // stays atomic; last writer wins with a self-consistent file.
+    let tmp = path.with_extension(format!("db.tmp.{}", std::process::id()));
+    let result = write_cache_to(b, &tmp).and_then(|()| fs::rename(&tmp, path));
+    if result.is_err() {
+        // Don't leak the tmp file on a failed write/rename.
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn write_cache_to(b: &BuiltCache, tmp: &Path) -> std::io::Result<()> {
+    let mut f = fs::File::create(tmp)?;
 
     let header = Header {
         magic: MAGIC,
@@ -260,8 +273,6 @@ pub fn write_cache(b: &BuiltCache, path: &Path) -> std::io::Result<()> {
     f.write_all(&b.strings)?;
 
     f.sync_all()?;
-    drop(f);
-    fs::rename(&tmp, path)?;
     Ok(())
 }
 

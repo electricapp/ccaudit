@@ -2,9 +2,8 @@
 // `benches/bench.rs` benchmark (run via `cargo bench`) both consume the
 // modules through this crate so internal paths stay one source of truth.
 //
-// Nothing here adds or hides API surface — `pub mod` mirrors what the
-// binary previously declared via `mod ...;`. `#[allow(...)]` annotations
-// are preserved verbatim from the binary's original module declarations.
+// Nothing here adds or hides API surface — the facade only exposes the
+// module tree to the binary and benches.
 
 pub mod cache;
 pub mod cli;

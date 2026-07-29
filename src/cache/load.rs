@@ -157,6 +157,23 @@ fn try_load_mmap<S: Source + ?Sized>(source: &S) -> Option<memmap2::Mmap> {
 }
 
 fn try_hot_path<S: Source + ?Sized>(source: &S, sources: &[SourceFile]) -> Option<LoadedCache> {
+    // PreAgg costs are frozen at build time, so a prices.json newer than
+    // the .db (dropped in manually — a path the refresh-prices error text
+    // recommends) must invalidate the cache even though every JSONL
+    // fingerprint still matches. `refresh-prices` itself deletes the .db,
+    // but a hand-copied file doesn't.
+    if let (Some(db_path), Some(prices_path)) =
+        (source.cache_path(), crate::source::prices::cache_path())
+    {
+        if let (Ok(db_meta), Ok(prices_meta)) = (fs::metadata(&db_path), fs::metadata(&prices_path))
+        {
+            if let (Ok(db_mtime), Ok(prices_mtime)) = (db_meta.modified(), prices_meta.modified()) {
+                if prices_mtime > db_mtime {
+                    return None;
+                }
+            }
+        }
+    }
     let mmap = try_load_mmap(source)?;
     let cache = cache_from_mmap(mmap)?;
     if !validate(cache.sessions(), sources) {
@@ -466,7 +483,11 @@ fn read_string_vec(bytes: &[u8], mut pos: usize) -> Option<(Vec<String>, usize)>
     }
     let count = u32::from_le_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?) as usize;
     pos += 4;
-    let mut out = Vec::with_capacity(count);
+    // Cap the pre-allocation by what the remaining bytes could possibly
+    // hold (each entry needs ≥2 bytes for its length prefix): a corrupt
+    // count must fail the per-entry bounds checks below, not abort the
+    // process with a multi-GB allocation request.
+    let mut out = Vec::with_capacity(count.min(bytes.len().saturating_sub(pos) / 2));
     for _ in 0..count {
         if pos + 2 > bytes.len() {
             return None;

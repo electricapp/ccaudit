@@ -7,16 +7,13 @@ use crate::cli::Options;
 use crate::source::Source;
 
 // Writes the one-line status bar summary to stdout.
-#[allow(clippy::print_stdout)]
-pub fn print<S: Source + ?Sized>(cache: &LoadedCache, opts: &Options, source: &S) {
+pub fn print<S: Source + ?Sized>(
+    cache: &LoadedCache,
+    opts: &Options,
+    source: &S,
+) -> std::io::Result<()> {
     let today = current_day(opts.tz_offset_secs);
-    let project_filter_id = opts.project.as_deref().and_then(|name| {
-        cache
-            .projects
-            .iter()
-            .position(|p| p == name)
-            .map(|i| i as u16)
-    });
+    let project_filter_id = crate::cache::resolve_project_filter(cache, opts.project.as_deref());
 
     let mut input = 0u64;
     let mut output = 0u64;
@@ -76,12 +73,16 @@ pub fn print<S: Source + ?Sized>(cache: &LoadedCache, opts: &Options, source: &S
         .unwrap_or(0.0);
 
     let (dim, reset, yellow) = (super::fmt::dim(), super::fmt::reset(), super::fmt::yellow());
-    println!(
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    writeln!(
+        lock,
         "{dim}today{reset} {} tok {yellow}{}{reset} · {dim}5h{reset} {yellow}{}{reset}",
         format_number(total),
         format_cost(cost),
         format_cost(active_cost),
-    );
+    )
 }
 
 fn current_day(tz_offset: i32) -> i32 {

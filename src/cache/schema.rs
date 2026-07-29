@@ -38,7 +38,9 @@
 use bytemuck::{Pod, Zeroable};
 
 pub const MAGIC: u32 = 0x4343_5547; // "CCUG"
-pub const VERSION: u32 = 0;
+// Version history (a mismatch forces one full rebuild):
+//   v1: preaggs include usage from tool_use-only assistant lines.
+pub const VERSION: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]

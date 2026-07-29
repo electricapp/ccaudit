@@ -241,9 +241,9 @@ pub fn generate(projects: &[Project], cache: &LoadedCache, out_dir: &Path) -> st
     // Parallel: load each session's `.msgs` blob once, derive everything
     // that needs message content (tokenized search words, hourly
     // breakdown, tool-use histogram), stream the per-session JSON to
-    // disk, then drop the messages. The session-list path no longer
-    // keeps message content in memory, so this is the only place that
-    // touches `.msgs` during web generate.
+    // disk, then drop the messages. This is the only place that touches
+    // `.msgs` during web generate — the session-list path must never
+    // hold message content in memory.
     struct PerSession {
         words: FxHashSet<String>,
         hourly: Vec<[u64; 5]>,

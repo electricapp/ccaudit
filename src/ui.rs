@@ -13,10 +13,12 @@ use ratatui::widgets::{
     ScrollbarState,
 };
 use rustc_hash::FxHashMap;
+use std::borrow::Cow;
 use std::time::Duration;
 
 // Pre-allocated spaces slab; slice out any indent width up to 64 chars
-// with no runtime allocation. Used by render_messages on every redraw.
+// with no runtime allocation. Used by build_message_lines when the
+// message line cache is (re)built; wider pads fall back to allocation.
 const SPACES: &str = "                                                                ";
 
 #[derive(PartialEq)]
@@ -38,6 +40,10 @@ pub enum PostAction {
     OpenWeb,
 }
 
+// Independent one-off UI flags (search mode, detail pane, quit,
+// deferred load) — a state enum would force invalid combinations apart
+// that are genuinely orthogonal here.
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     projects: Vec<Project>,
     searcher: Searcher,
@@ -48,6 +54,18 @@ pub struct App {
     session_state: ListState,
     message_scroll: u16,
     message_max_scroll: u16,
+    // Rendered lines for the open session, keyed on (project, session,
+    // width). Message content is immutable once loaded, so rebuilding
+    // the whole buffer per keystroke would be O(session content) for a
+    // viewport of ~one screen; a resize changes the width key and
+    // forces a rebuild.
+    message_lines: Vec<Line<'static>>,
+    message_lines_key: Option<(usize, usize, u16)>,
+    // Set when Enter opens a session whose messages aren't in memory.
+    // The load can block (cache-miss → full JSONL parse), so `run`
+    // paints one "loading" frame first, then loads and repaints —
+    // loading inside the key handler freezes the UI with no feedback.
+    pending_load: bool,
     selected_project: Option<usize>,
     selected_session: Option<usize>,
     filtered_projects: Vec<usize>,
@@ -263,6 +281,9 @@ impl App {
             session_state: ListState::default(),
             message_scroll: 0,
             message_max_scroll: 0,
+            message_lines: Vec::new(),
+            message_lines_key: None,
+            pending_load: false,
             selected_project: None,
             selected_session: None,
             filtered_projects: filtered,
@@ -282,18 +303,33 @@ impl App {
     ) -> std::io::Result<()> {
         // Draw once up front, then redraw only after an event was
         // actually received and handled. Nothing in this UI is
-        // time-based, so blocking on input until something happens
-        // avoids the old ~20fps idle rebuild+redraw of the whole session.
+        // time-based, so blocking on input makes idle cost zero — a
+        // timed loop repaints the whole session ~20×/s for nothing.
         let _ = terminal.draw(|f| self.render(f))?;
         while !self.quit {
             if event::poll(Duration::from_millis(250))? {
-                if let Event::Key(key) = event::read()? {
-                    // Windows reports both Press and Release; act on
-                    // Press only so each keystroke fires once.
-                    if key.kind == KeyEventKind::Press {
-                        self.handle_key(key);
-                        let _ = terminal.draw(|f| self.render(f))?;
+                match event::read()? {
+                    Event::Key(key) => {
+                        // Windows reports both Press and Release; act on
+                        // Press only so each keystroke fires once.
+                        if key.kind == KeyEventKind::Press {
+                            self.handle_key(key);
+                        }
                     }
+                    Event::Paste(text) => self.handle_paste(&text),
+                    // Resize (and everything else) falls through to the
+                    // redraw below — ratatui only autoresizes inside
+                    // `draw`, so skipping it left a stale clipped frame
+                    // until the next keypress.
+                    _ => {}
+                }
+                let _ = terminal.draw(|f| self.render(f))?;
+                // Deferred session load: the frame above showed the
+                // "loading" placeholder; now do the blocking work and
+                // repaint with the content.
+                if self.pending_load {
+                    self.load_selected_session();
+                    let _ = terminal.draw(|f| self.render(f))?;
                 }
             }
         }
@@ -321,7 +357,9 @@ impl App {
                     let _ = self.search_query.pop();
                     self.update_filter();
                 }
-                KeyCode::Char(c) => {
+                // Control chords (Ctrl+U, ...) still arrive as Char;
+                // don't insert the literal letter into the query.
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.search_query.push(c);
                     self.update_filter();
                 }
@@ -334,17 +372,9 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => match self.view {
                 View::Projects => self.quit = true,
                 View::Dashboard => self.view = View::Projects,
-                View::Sessions => {
-                    self.view = View::Projects;
-                    self.selected_project = None;
-                    self.search_query.clear();
-                    self.update_filter();
-                }
-                View::Messages => {
-                    self.view = View::Sessions;
-                    self.selected_session = None;
-                    self.message_scroll = 0;
-                }
+                // Same semantics as `h`/Left — keep the message-eviction
+                // logic in back() the single exit path from a session.
+                View::Sessions | View::Messages => self.back(),
             },
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.quit = true;
@@ -409,6 +439,16 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    // Bracketed paste: text goes into the search query when one is being
+    // typed; anywhere else it is dropped so pasted characters are never
+    // interpreted as commands ('q' quit, 'c' resume, ...).
+    fn handle_paste(&mut self, text: &str) {
+        if self.searching {
+            self.search_query.push_str(text);
+            self.update_filter();
         }
     }
 
@@ -538,7 +578,24 @@ impl App {
             return;
         };
         // Lazy-load messages — only the session the user opened pays
-        // the deserialize cost.
+        // the deserialize cost. The load itself is deferred to `run`
+        // (see `pending_load`) so a frame with the loading placeholder
+        // reaches the terminal before any blocking parse.
+        self.pending_load = self
+            .projects
+            .get(pi)
+            .and_then(|p| p.sessions.get(si))
+            .is_some_and(|s| s.messages.is_empty());
+        self.selected_session = Some(si);
+        self.view = View::Messages;
+        self.message_scroll = 0;
+    }
+
+    fn load_selected_session(&mut self) {
+        self.pending_load = false;
+        let (Some(pi), Some(si)) = (self.selected_project, self.selected_session) else {
+            return;
+        };
         if let Some(s) = self
             .projects
             .get_mut(pi)
@@ -549,9 +606,6 @@ impl App {
                 let _ = parse::ensure_messages_loaded(s, &path);
             }
         }
-        self.selected_session = Some(si);
-        self.view = View::Messages;
-        self.message_scroll = 0;
     }
 
     fn back(&mut self) {
@@ -566,6 +620,21 @@ impl App {
             }
             View::Messages => {
                 self.view = View::Sessions;
+                // Evict the message blob and its rendered-line cache —
+                // both reload cheaply from the .msgs cache on re-entry,
+                // and keeping every visited session's messages resident
+                // grew without bound over a long browse.
+                if let Some(si) = self.selected_session {
+                    if let Some(s) = self
+                        .selected_project
+                        .and_then(|pi| self.projects.get_mut(pi))
+                        .and_then(|p| p.sessions.get_mut(si))
+                    {
+                        s.messages = Vec::new();
+                    }
+                }
+                self.message_lines = Vec::new();
+                self.message_lines_key = None;
                 self.selected_session = None;
                 self.message_scroll = 0;
             }
@@ -592,9 +661,8 @@ impl App {
     fn update_filter(&mut self) {
         // Disjoint-field borrows (edition 2024): we read
         // self.search_query / self.searcher / self.projects while
-        // writing self.filtered_projects / self.filtered_sessions.
-        // No clone needed — previously we cloned the query on every
-        // keystroke.
+        // writing self.filtered_projects / self.filtered_sessions —
+        // no query clone per keystroke.
         match self.view {
             View::Projects => {
                 if self.search_query.is_empty() {
@@ -712,9 +780,11 @@ impl App {
             ),
         };
 
+        // Display width, not byte len — project names can be non-ASCII
+        // and byte counting left the right-hand hints short of the edge.
         let padding_len = (area.width as usize)
-            .saturating_sub(left.len())
-            .saturating_sub(right.len());
+            .saturating_sub(unicode_width::UnicodeWidthStr::width(left.as_str()))
+            .saturating_sub(unicode_width::UnicodeWidthStr::width(right.as_str()));
         let bg = Style::default().bg(style::tui(style::BG2));
         let full_bar = Line::from(vec![
             Span::styled(left, bg.fg(style::tui(style::FG))),
@@ -890,100 +960,59 @@ impl App {
             return;
         };
 
-        let session = &self.projects[pi].sessions[si];
-        let mut lines: Vec<Line> = Vec::new();
-
-        // Build the separator once per frame — it's identical for every
-        // user message on this area.width, so rebuilding per message was
-        // pure waste on long sessions at 20fps.
-        let separator: String = "─".repeat(area.width as usize);
-        let separator_style = Style::default().fg(style::tui(style::SEPARATOR));
-
-        for msg in &session.messages {
-            // Tag colors read from the shared `style` tokens — same
-            // palette the web `.tg-*` CSS uses, so colors match across
-            // TUI and web for each message kind.
-            let (tag, tag_color) = match msg.kind {
-                MessageKind::User => ("YOU", style::tui(style::K_USER)),
-                MessageKind::Assistant => ("AI ", style::tui(style::K_ASSISTANT)),
-                MessageKind::ToolUse => (">>>", style::tui(style::K_TOOLUSE)),
-                MessageKind::ToolResult => ("<<<", style::tui(style::K_TOOLRESULT)),
-                MessageKind::Thinking => ("...", style::tui(style::K_THINKING)),
-                MessageKind::System => ("SYS", style::tui(style::K_SYSTEM)),
-            };
-
-            if msg.kind == MessageKind::User {
-                lines.push(Line::from(Span::styled(
-                    separator.as_str(),
-                    separator_style,
-                )));
-            }
-
-            // Tag is rendered on the RIGHT of the first line (matches
-            // the web's msg-meta convention — "who" on the right, body
-            // left). Continuation lines are full-width with no indent
-            // since there's no left prefix to align under.
-            let tag_text = match &msg.kind {
-                MessageKind::ToolUse => {
-                    let tool = msg.tool_name.as_deref().unwrap_or("tool");
-                    format!(" {tool} ")
-                }
-                _ => format!(" {tag} "),
-            };
-            let tag_w = tag_text.chars().count();
-            let body_color = if msg.kind == MessageKind::ToolResult {
-                style::tui(style::FG3)
-            } else {
-                style::tui(style::FG)
-            };
-            let aw = area.width as usize;
-            // 1 leading space + content + fill + tag (fixed right-edge)
-            let content_w = aw.saturating_sub(tag_w + 2);
-
-            let mut iter = msg.content.lines();
-            if let Some(first) = iter.next() {
-                let body = truncate_line(first, content_w);
-                let pad = content_w.saturating_sub(body.chars().count());
-                let spaces: &'static str = &SPACES[..pad.min(SPACES.len())];
-                lines.push(Line::from(vec![
-                    Span::styled(format!(" {body}"), Style::default().fg(body_color)),
-                    Span::raw(spaces),
-                    Span::styled(tag_text, Style::default().fg(tag_color)),
-                ]));
-            }
-            for line in iter.by_ref().take(20) {
-                lines.push(Line::from(Span::styled(
-                    format!(" {}", truncate_line(line, aw.saturating_sub(1))),
-                    Style::default().fg(body_color),
-                )));
-            }
-            let extra = iter.count();
-            if extra > 0 {
-                lines.push(Line::from(Span::styled(
-                    format!(" ... ({extra} more lines)"),
-                    Style::default().fg(style::tui(style::FG3)),
-                )));
-            }
+        // Messages not in memory yet: show the placeholder and bail
+        // before the line cache is built — caching the empty message
+        // list under this (session, width) key would serve a blank
+        // view after the load completes.
+        if self.pending_load {
+            let placeholder = Paragraph::new(Line::from(Span::styled(
+                " loading session…",
+                Style::default().fg(style::tui(style::FG3)),
+            )));
+            f.render_widget(placeholder, area);
+            return;
         }
 
-        let total_lines = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-        self.message_max_scroll = total_lines.saturating_sub(area.height);
+        // Message content is immutable once loaded, so the full line
+        // buffer is built once per (session, width) instead of on every
+        // keystroke; per frame we clone only the visible window below.
+        let key = (pi, si, area.width);
+        if self.message_lines_key != Some(key) {
+            self.message_lines = build_message_lines(&self.projects[pi].sessions[si], area.width);
+            self.message_lines_key = Some(key);
+        }
 
-        let title = session.display_name();
+        // The Block's top title consumes one inner row even with
+        // Borders::NONE, so the text viewport is one line shorter than
+        // `area` — computing max scroll from area.height made the last
+        // line unreachable.
+        let visible = area.height.saturating_sub(1);
+        // Paragraph/scroll offsets are u16: sessions rendering more than
+        // 65535 lines saturate here and the tail is unreachable — a
+        // ratatui API limit we accept.
+        let total_lines = u16::try_from(self.message_lines.len()).unwrap_or(u16::MAX);
+        self.message_max_scroll = total_lines.saturating_sub(visible);
+        // Re-clamp: growing the terminal shrinks the max and would
+        // otherwise strand the offset past the end of the content.
+        self.message_scroll = self.message_scroll.min(self.message_max_scroll);
+
+        let title = self.projects[pi].sessions[si].display_name();
         // Boundary-safe truncation — `title` is arbitrary user text, so
         // slicing raw bytes (`&title[..57]`) panicked when byte 57 fell
         // mid-codepoint. `truncate_line` truncates on a char boundary and
         // appends "..." itself when over the cap.
         let truncated_title = format!(" {} ", truncate_line(title, 60));
 
-        let paragraph = Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::NONE)
-                    .title(truncated_title)
-                    .title_style(Style::default().fg(style::tui(style::FG3))),
-            )
-            .scroll((self.message_scroll, 0));
+        let start = self.message_scroll as usize;
+        let end = (start + visible as usize).min(self.message_lines.len());
+        let window: Vec<Line<'static>> = self.message_lines[start..end].to_vec();
+
+        let paragraph = Paragraph::new(window).block(
+            Block::default()
+                .borders(Borders::NONE)
+                .title(truncated_title)
+                .title_style(Style::default().fg(style::tui(style::FG3))),
+        );
 
         f.render_widget(paragraph, area);
 
@@ -1063,8 +1092,8 @@ impl App {
         // Stats row 2 — same cell grid as row 1 so columns line up.
         let mut row2: Vec<Span> = Vec::new();
         // `format_number` (underscored thousands, same as web/CLI) —
-        // not the old K/M abbreviation, which dropped the thousands
-        // separator inside the mantissa and read as a bare "12884.5M".
+        // a K/M abbreviation drops the thousands separator inside the
+        // mantissa and reads as a bare "12884.5M".
         row2.extend(cell("Input", format_number(total_input), val));
         row2.extend(cell("Output", format_number(total_output), val));
         row2.extend(cell("Cache-W", format_number(total_cache_w), val));
@@ -1163,8 +1192,10 @@ impl App {
             ));
         }
 
-        let total_lines = lines.len() as u16;
+        let total_lines = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         self.dash_max_scroll = total_lines.saturating_sub(area.height);
+        // Re-clamp so a resize can't strand the offset past the content.
+        self.dash_scroll = self.dash_scroll.min(self.dash_max_scroll);
 
         let paragraph = Paragraph::new(lines)
             .block(Block::default().borders(Borders::NONE))
@@ -1184,6 +1215,93 @@ impl App {
             );
         }
     }
+}
+
+// Build the full rendered line buffer for one session at `width`
+// columns. Called from render_messages only when its (session, width)
+// cache key changes — everything here is build-time cost, not per-frame.
+fn build_message_lines(session: &parse::Session, width: u16) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let aw = width as usize;
+
+    // Identical for every user message at this width; cloned per use so
+    // the cached lines own their text.
+    let separator: String = "─".repeat(aw);
+    let separator_style = Style::default().fg(style::tui(style::SEPARATOR));
+
+    for msg in &session.messages {
+        // Tag colors read from the shared `style` tokens — same
+        // palette the web `.tg-*` CSS uses, so colors match across
+        // TUI and web for each message kind.
+        let (tag, tag_color) = match msg.kind {
+            MessageKind::User => ("YOU", style::tui(style::K_USER)),
+            MessageKind::Assistant => ("AI ", style::tui(style::K_ASSISTANT)),
+            MessageKind::ToolUse => (">>>", style::tui(style::K_TOOLUSE)),
+            MessageKind::ToolResult => ("<<<", style::tui(style::K_TOOLRESULT)),
+            MessageKind::Thinking => ("...", style::tui(style::K_THINKING)),
+            MessageKind::System => ("SYS", style::tui(style::K_SYSTEM)),
+        };
+
+        if msg.kind == MessageKind::User {
+            lines.push(Line::from(Span::styled(separator.clone(), separator_style)));
+        }
+
+        // Tag is rendered on the RIGHT of the first line (matches
+        // the web's msg-meta convention — "who" on the right, body
+        // left). Continuation lines are full-width with no indent
+        // since there's no left prefix to align under.
+        let tag_text = match &msg.kind {
+            MessageKind::ToolUse => {
+                let tool = msg.tool_name.as_deref().unwrap_or("tool");
+                format!(" {tool} ")
+            }
+            _ => format!(" {tag} "),
+        };
+        let tag_w = unicode_width::UnicodeWidthStr::width(tag_text.as_str());
+        let body_color = if msg.kind == MessageKind::ToolResult {
+            style::tui(style::FG3)
+        } else {
+            style::tui(style::FG)
+        };
+        // 1 leading space + content + fill + tag (fixed right-edge)
+        let content_w = aw.saturating_sub(tag_w + 2);
+
+        let mut iter = msg.content.lines();
+        if let Some(first) = iter.next() {
+            let body = truncate_line(first, content_w);
+            // Display width, not chars().count() — wide chars (CJK,
+            // emoji) otherwise over-pad and push the tag off-screen.
+            let pad =
+                content_w.saturating_sub(unicode_width::UnicodeWidthStr::width(body.as_str()));
+            let spaces: Cow<'static, str> = if pad <= SPACES.len() {
+                Cow::Borrowed(&SPACES[..pad])
+            } else {
+                // Terminals wider than the slab (~64 + tag cols) —
+                // allocate instead of clamping the tag mid-line.
+                Cow::Owned(" ".repeat(pad))
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {body}"), Style::default().fg(body_color)),
+                Span::raw(spaces),
+                Span::styled(tag_text, Style::default().fg(tag_color)),
+            ]));
+        }
+        for line in iter.by_ref().take(20) {
+            lines.push(Line::from(Span::styled(
+                format!(" {}", truncate_line(line, aw.saturating_sub(1))),
+                Style::default().fg(body_color),
+            )));
+        }
+        let extra = iter.count();
+        if extra > 0 {
+            lines.push(Line::from(Span::styled(
+                format!(" ... ({extra} more lines)"),
+                Style::default().fg(style::tui(style::FG3)),
+            )));
+        }
+    }
+
+    lines
 }
 
 // Pad or truncate a string to an exact display width. Truncation uses
@@ -1390,17 +1508,27 @@ fn unified_row_line(
     ])
 }
 
+// Truncate to a display-width budget, appending "..." when over. Width,
+// not byte length: comparing `s.len()` to a cell budget over-truncated
+// CJK/emoji text and threw off right-edge padding math downstream.
 fn truncate_line(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if unicode_width::UnicodeWidthStr::width(s) <= max {
         return s.to_string();
     }
     if max <= 3 {
         return ".".repeat(max);
     }
     let target = max - 3;
-    let mut end = target;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + cw > target {
+            break;
+        }
+        out.push(c);
+        used += cw;
     }
-    format!("{}...", &s[..end])
+    out.push_str("...");
+    out
 }

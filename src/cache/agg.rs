@@ -269,13 +269,7 @@ pub fn aggregate<S: Source + ?Sized>(
         return aggregate_from_preaggs(cache, bucket, opts, breakdown);
     }
 
-    let project_filter_id = opts.project.and_then(|name| {
-        cache
-            .projects
-            .iter()
-            .position(|p| p == name)
-            .map(|i| i as u16)
-    });
+    let project_filter_id = resolve_project_filter(cache, opts.project);
 
     let sessions_s = cache.sessions();
     let lines_s = cache.lines();
@@ -299,9 +293,13 @@ pub fn aggregate<S: Source + ?Sized>(
     // in natural order is the same as sorting by `started_at`. Skipping
     // the per-call sort saves ~1ms on 100+ session corpora.
     for sess in sessions_s {
-        if project_filter_id.is_some() && Some(sess.project_id) != project_filter_id {
-            continue;
-        }
+        // The project filter is applied per-line AFTER the dedup insert
+        // (see below) — skipping whole sessions here would leave their
+        // msg_ids unclaimed, letting a message duplicated into another
+        // project be counted there. Same dedup-before-filter rule the
+        // date filter follows and build-time preagg dedup uses.
+        let project_matches =
+            project_filter_id.is_none() || Some(sess.project_id) == project_filter_id;
         let line_range =
             sess.line_start as usize..(sess.line_start as usize + sess.line_count as usize);
         let fallback_model_id = sess.session_model_id;
@@ -312,13 +310,17 @@ pub fn aggregate<S: Source + ?Sized>(
             .iter()
             .enumerate()
         {
-            // Cross-session dedup FIRST, before the date filter — claim
+            // Cross-session dedup FIRST, before any filter — claim
             // each message at its earliest occurrence regardless of the
             // window. This matches the build-time preagg dedup (which runs
             // before any filtering); filtering first would let a message
-            // whose earliest copy falls outside --since/--until reappear
-            // and be counted on a later in-window duplicate.
+            // whose earliest copy falls outside --since/--until (or in a
+            // filtered-out project) reappear and be counted on a later
+            // in-window duplicate.
             if (line.flags & 1) != 0 && !seen.insert(line.msg_id_hash) {
+                continue;
+            }
+            if !project_matches {
                 continue;
             }
             let line_global_idx = sess.line_start as usize + local_i;
@@ -401,6 +403,31 @@ pub fn aggregate<S: Source + ?Sized>(
     out
 }
 
+/// Resolve a `--project` value to its intern id for filtering.
+///
+/// Accepts the stored slash form (`code/beta`) and the ccusage-stem form
+/// the `session` report displays (`code-beta`), so a label copied from
+/// our own output round-trips. A name that matches nothing resolves to
+/// the impossible id `u16::MAX`: the filter then matches zero sessions,
+/// rather than silently disabling itself and presenting global totals
+/// as if they were project-scoped. (`main` additionally rejects unknown
+/// names up front with a proper error.)
+pub fn resolve_project_filter(cache: &LoadedCache, project: Option<&str>) -> Option<u16> {
+    let name = project?;
+    let id = cache
+        .projects
+        .iter()
+        .position(|p| p == name)
+        .or_else(|| {
+            cache
+                .projects
+                .iter()
+                .position(|p| crate::report::fmt::ccusage_stem(p) == name)
+        })
+        .map_or(u16::MAX, |i| i as u16);
+    Some(id)
+}
+
 // Fast path: Day/Month rollup in UTC. Sums over the pre-aggregated table
 // directly. No dedup hashset, no per-line touches, no TZ shifts.
 fn aggregate_from_preaggs(
@@ -409,13 +436,7 @@ fn aggregate_from_preaggs(
     opts: &FilterOpts,
     breakdown: bool,
 ) -> FxHashMap<BreakdownKey, BucketUsage> {
-    let project_filter_id = opts.project.and_then(|name| {
-        cache
-            .projects
-            .iter()
-            .position(|p| p == name)
-            .map(|i| i as u16)
-    });
+    let project_filter_id = resolve_project_filter(cache, opts.project);
 
     // Pre-size: a typical daily/monthly rollup has ~30–60 entries; cap
     // at a generous 128 to avoid over-allocating when queries return

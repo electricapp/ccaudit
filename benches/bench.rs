@@ -1,6 +1,8 @@
 // Synthetic-corpus bench. No dependency on `~/.claude/projects` — every
-// run materializes a deterministic JSONL fixture in a tempdir, points
-// `HOME` at it, and exercises the actual user-facing code paths.
+// run materializes a deterministic JSONL fixture in a tempdir and swaps
+// it in behind a fixed `$HOME` (set once at startup; per-corpus swaps
+// are a `.claude` symlink, not env mutation), exercising the actual
+// user-facing code paths.
 //
 // This is a `[[bench]]` target (harness = false) at benches/bench.rs.
 //
@@ -65,6 +67,12 @@ use std::time::{Duration, Instant};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
+    // ALL environment mutation happens here, before any corpus work —
+    // the first `load_all_projects`/`cache::load` call spawns rayon's
+    // global thread pool, and `env::set_var` with live threads is a data
+    // race (the reason it's `unsafe` in the 2024 edition). Per-corpus
+    // isolation later is pure filesystem work (see `point_home_at`).
+    //
     // Silence the stderr build banners from web::generate / parse cache
     // — the bench invokes them hundreds of times and the noise scrolls
     // the actual results table off-screen. Leave alone if the caller
@@ -76,6 +84,7 @@ fn main() {
             std::env::set_var("CCAUDIT_QUIET", "1");
         }
     }
+    init_home_once();
 
     let runs = env_usize("BENCH_RUNS", 7);
     let sizes = parse_sizes();
@@ -101,7 +110,7 @@ fn main() {
 
     for size in &sizes {
         let tmp = tempfile::tempdir().expect("tempdir");
-        redirect_home(tmp.path());
+        point_home_at(tmp.path());
         let projects_dir = tmp.path().join(".claude").join("projects");
         let cache_dir = tmp.path().join(".claude").join("ccaudit-cache");
         fs::create_dir_all(&projects_dir).unwrap();
@@ -136,7 +145,7 @@ fn main() {
     // Microbenches use a fresh independent corpus they control fully.
     {
         let tmp = tempfile::tempdir().expect("tempdir");
-        redirect_home(tmp.path());
+        point_home_at(tmp.path());
         run_micro(runs, tmp.path(), &mut all);
         println!();
     }
@@ -224,6 +233,26 @@ fn time<F: FnMut()>(runs: usize, mut f: F) -> Vec<Duration> {
         .collect()
 }
 
+/// Like [`time`], but runs `setup` UNTIMED before every invocation of
+/// `f` (warmups included). Benches that need per-iteration state reset
+/// (delete the cache files, remove the output dir) use this so the
+/// timer covers only the operation — deleting a few thousand cache
+/// files is filesystem work that would otherwise pollute the number.
+fn time_with_setup<S: FnMut(), F: FnMut()>(runs: usize, mut setup: S, mut f: F) -> Vec<Duration> {
+    setup();
+    f();
+    setup();
+    f();
+    (0..runs)
+        .map(|_| {
+            setup();
+            let t = Instant::now();
+            f();
+            t.elapsed()
+        })
+        .collect()
+}
+
 fn record(out: &mut Vec<Measurement>, name: &str, samples: Vec<Duration>) {
     out.push(Measurement {
         name: name.to_string(),
@@ -303,11 +332,15 @@ fn run_macro(
 ) {
     let src = source::pick(source::SourceKind::ClaudeCode);
 
-    // parse cold: clear all per-session caches + .db, full reparse from JSONL
-    let s = time(runs, || {
-        clear_dir_keep(cache_dir);
-        let _ = parse::load_all_projects(src);
-    });
+    // parse cold: clear all per-session caches + .db (untimed setup),
+    // then measure only the full reparse from JSONL.
+    let s = time_with_setup(
+        runs,
+        || clear_dir_keep(cache_dir),
+        || {
+            let _ = parse::load_all_projects(src);
+        },
+    );
     record_with_throughput(
         out,
         &fmt_name(group, "parse cold"),
@@ -354,11 +387,17 @@ fn run_macro(
         total_msgs as u64,
     );
 
-    // cache::load cold rebuild — wipe just the .db, keep per-session caches
-    let s = time(runs, || {
-        let _ = fs::remove_file(cache_dir.join("claude-code.db"));
-        let _ = cache::load(src);
-    });
+    // cache::load cold rebuild — wipe just the .db (untimed setup), keep
+    // per-session caches; measure only the rebuild.
+    let s = time_with_setup(
+        runs,
+        || {
+            let _ = fs::remove_file(cache_dir.join("claude-code.db"));
+        },
+        || {
+            let _ = cache::load(src);
+        },
+    );
     record_with_throughput(
         out,
         &fmt_name(group, "cache rebuild"),
@@ -393,14 +432,21 @@ fn run_macro(
     record(out, &fmt_name(group, "agg session (live)"), s);
 
     // web::generate full pipeline (only built with the `web` feature).
+    // The output dir is removed in untimed setup so the measurement is
+    // generation only, not `remove_dir_all` of the previous run.
     #[cfg(feature = "web")]
     {
         let parsed = parse::load_all_projects(src);
         let web_out = cache_dir.parent().unwrap().join("web-out");
-        let s = time(runs, || {
-            let _ = fs::remove_dir_all(&web_out);
-            web::generate(&parsed, &cached, &web_out).unwrap();
-        });
+        let s = time_with_setup(
+            runs,
+            || {
+                let _ = fs::remove_dir_all(&web_out);
+            },
+            || {
+                web::generate(&parsed, &cached, &web_out).unwrap();
+            },
+        );
         record(out, &fmt_name(group, "web::generate"), s);
     }
 }
@@ -718,15 +764,42 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 // `parse::load_all_projects` and `cache::load` resolve their data dirs via
-// `dirs::home_dir()`, which reads `$HOME` on Unix. Setting it before any
-// thread is spawned (we're single-threaded at this point) is sound.
-fn redirect_home(p: &Path) {
-    // SAFETY: called once per corpus at startup; no other threads exist yet.
+// `dirs::home_dir()`, which reads `$HOME` on Unix.
+//
+// $HOME is mutated exactly once, at the top of `main` before anything
+// spawns a thread — the first macro bench starts rayon's global pool,
+// and calling `env::set_var` after that races every `getenv` on those
+// threads (the UB that made `set_var` unsafe in the 2024 edition). Each
+// corpus is then swapped in by repointing the `.claude` symlink inside
+// this fixed home: a filesystem mutation, safe at any point.
+static HOME_ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+
+fn init_home_once() {
+    let root = HOME_ROOT.get_or_init(|| tempfile::tempdir().expect("home-root tempdir"));
+    // SAFETY: called at the top of main(), before any threads exist.
     unsafe {
-        std::env::set_var("HOME", p);
+        std::env::set_var("HOME", root.path());
     }
     #[cfg(windows)]
+    // SAFETY: same single-threaded point as above.
     unsafe {
-        std::env::set_var("USERPROFILE", p);
+        std::env::set_var("USERPROFILE", root.path());
     }
+}
+
+/// Point `$HOME/.claude` at `<corpus>/.claude` (creating the target if
+/// needed). No env mutation — see `HOME_ROOT`.
+fn point_home_at(corpus: &Path) {
+    let root = HOME_ROOT
+        .get()
+        .expect("init_home_once() must run before point_home_at");
+    let link = root.path().join(".claude");
+    // A symlink is unlinked like a file; ignore "didn't exist yet".
+    let _ = fs::remove_file(&link);
+    let target = corpus.join(".claude");
+    fs::create_dir_all(&target).expect("corpus .claude dir");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).expect("symlink $HOME/.claude");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&target, &link).expect("symlink $HOME/.claude");
 }

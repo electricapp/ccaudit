@@ -66,8 +66,10 @@
 
   // ── fc (currency) ──
   suite('fc — cost formatter', () => {
-    it('tiny costs collapse to <$0.01', () => eq(fc(0), '<$0.01'));
+    it('zero renders $0.00, matching the CLI', () => eq(fc(0), '$0.00'));
+    it('tiny costs collapse to <$0.01', () => eq(fc(0.005), '<$0.01'));
     it('just under threshold still collapses', () => eq(fc(0.009), '<$0.01'));
+    it('negative costs keep the sign, matching the CLI', () => eq(fc(-5.05), '-$5.05'));
     it('cents render with two digits', () => eq(fc(0.05), '$0.05'));
     it('round dollars keep the .00', () => eq(fc(42), '$42.00'));
     it('thousands get the underscore separator', () => eq(fc(1234.5), '$1_234.50'));

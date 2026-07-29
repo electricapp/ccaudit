@@ -6,9 +6,10 @@
 // Fixture layout per test: one or two projects, each with a single
 // session containing assistant lines at known timestamps.
 //
-//   opus: $5/M in, $25/M out, $10/M cache-write, $0.50/M cache-read
-//   Line A: 1000 in + 2000 out + 0 cw + 0 cr   → $0.055
-//   Line B: 500 in + 500 out + 1000 cw + 10000 cr → $0.023
+//   opus: $5/M in, $25/M out, $6.25/M cache-write, $0.50/M cache-read
+//   Line A: 1000 in + 2000 out + 0 cw + 0 cr      → $0.0550
+//   Line B: 500 in + 500 out + 10000 cw + 1000 cr → $0.0780
+//   Total                                          $0.1330
 
 // Tests use `.unwrap()`, index slicing, and integer literals freely —
 // the usual clippy warnings would fight the test-writing style, so the
@@ -37,6 +38,22 @@ fn require_success(out: &Output, ctx: &str) {
         read_stdout(out),
         read_stderr(out)
     );
+}
+
+/// Usage errors must exit with code 2 exactly — `!success()` alone would
+/// also accept a panic/abort (exit 101 / signal), which is how a crash in
+/// input handling once slipped past "invalid input exits nonzero" tests.
+/// Returns stderr so callers can pin the message.
+fn require_usage_error(out: &Output, ctx: &str) -> String {
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{ctx}: expected clean usage error (exit 2), got exit={:?}\nSTDOUT:\n{}\nSTDERR:\n{}",
+        out.status.code(),
+        read_stdout(out),
+        read_stderr(out)
+    );
+    read_stderr(out)
 }
 
 fn setup_single_project(h: &Harness) {
@@ -263,7 +280,7 @@ fn session_groups_by_project_like_ccusage() {
 
 #[test]
 fn session_table_is_aligned_when_display_name_has_newline() {
-    // Defensive: a user message containing a literal newline used to
+    // Defensive: a user message containing a literal newline must not
     // split the cell and shred the box-drawing alignment. Verify every
     // row is the same width.
     let h = Harness::new();
@@ -320,13 +337,19 @@ fn session_table_is_aligned_when_display_name_has_newline() {
         .filter(|l| l.matches('│').count() >= 8 || l.matches('┼').count() >= 7)
         .map(|l| strip_ansi(l).chars().count())
         .collect();
-    if let Some(&first) = widths.first() {
-        for (i, &w) in widths.iter().enumerate() {
-            assert_eq!(
-                w, first,
-                "row {i} width {w} != expected {first}; full output:\n{stdout}"
-            );
-        }
+    // The filter must actually match table rows — otherwise this test is
+    // vacuously green (it once asserted nothing when the glyph filter
+    // missed, which would also hide a renderer that stopped drawing rows).
+    assert!(
+        !widths.is_empty(),
+        "no table rows matched the box-glyph filter; full output:\n{stdout}"
+    );
+    let first = widths[0];
+    for (i, &w) in widths.iter().enumerate() {
+        assert_eq!(
+            w, first,
+            "row {i} width {w} != expected {first}; full output:\n{stdout}"
+        );
     }
 }
 
@@ -383,25 +406,24 @@ fn cost_limit_dollar_prefix_is_accepted() {
 #[test]
 fn cost_limit_rejected_on_non_blocks() {
     // --cost-limit is blocks-only. Silently ignoring it on other
-    // commands used to confuse users who expected it to do something;
-    // now we reject it up front.
+    // commands reads as "it did something" — reject it up front.
     let h = Harness::new();
     setup_single_project(&h);
     let out = h.run(&["--cost-limit", "1"]);
-    assert!(!out.status.success(), "daily --cost-limit should error");
+    require_usage_error(&out, "daily --cost-limit should error");
     let out = h.run(&["session", "--cost-limit", "1"]);
-    assert!(!out.status.success(), "session --cost-limit should error");
+    require_usage_error(&out, "session --cost-limit should error");
 }
 
 #[test]
 fn cost_limit_invalid_exits_nonzero() {
     let h = Harness::new();
     let out = h.run(&["blocks", "--cost-limit", "abc"]);
-    assert!(!out.status.success());
+    require_usage_error(&out, "non-numeric limit");
     let out = h.run(&["blocks", "--cost-limit", "0"]);
-    assert!(!out.status.success(), "zero limit should be rejected");
+    require_usage_error(&out, "zero limit should be rejected");
     let out = h.run(&["blocks", "--cost-limit", "-5"]);
-    assert!(!out.status.success(), "negative limit should be rejected");
+    require_usage_error(&out, "negative limit should be rejected");
 }
 
 #[test]
@@ -723,11 +745,10 @@ fn legacy_double_dash_tui_errors_as_unknown_flag() {
     // the unknown-flag arm, not silently dispatch to TUI.
     let h = Harness::new();
     let out = h.run(&["--tui"]);
-    assert!(!out.status.success());
-    let combined = format!("{}{}", read_stdout(&out), read_stderr(&out));
+    let stderr = require_usage_error(&out, "--tui");
     assert!(
-        combined.contains("unknown flag: --tui"),
-        "expected unknown-flag error, got: {combined}"
+        stderr.contains("unknown flag: --tui"),
+        "expected unknown-flag error, got: {stderr}"
     );
 }
 
@@ -737,11 +758,10 @@ fn tui_rejects_global_filters_in_phase_a() {
     // worse than a clear error pointing at the gap.
     let h = Harness::new();
     let out = h.run(&["tui", "--project", "alpha"]);
-    assert!(!out.status.success());
-    let combined = format!("{}{}", read_stdout(&out), read_stderr(&out));
+    let stderr = require_usage_error(&out, "tui --project");
     assert!(
-        combined.contains("--project is not yet honored by `tui`"),
-        "expected phase-A rejection, got: {combined}"
+        stderr.contains("--project is not yet honored by `tui`"),
+        "expected phase-A rejection, got: {stderr}"
     );
 }
 
@@ -749,11 +769,10 @@ fn tui_rejects_global_filters_in_phase_a() {
 fn statusline_rejects_report_only_carbon() {
     let h = Harness::new();
     let out = h.run(&["statusline", "--carbon"]);
-    assert!(!out.status.success());
-    let combined = format!("{}{}", read_stdout(&out), read_stderr(&out));
+    let stderr = require_usage_error(&out, "statusline --carbon");
     assert!(
-        combined.contains("--carbon only applies to"),
-        "expected report-only rejection, got: {combined}"
+        stderr.contains("--carbon only applies to"),
+        "expected report-only rejection, got: {stderr}"
     );
 }
 
@@ -761,7 +780,7 @@ fn statusline_rejects_report_only_carbon() {
 fn invalid_flag_exits_nonzero() {
     let h = Harness::new();
     let out = h.run(&["--this-flag-does-not-exist"]);
-    assert!(!out.status.success());
+    require_usage_error(&out, "--this-flag-does-not-exist");
 }
 
 #[test]
@@ -781,9 +800,8 @@ fn source_flag_accepts_claude_aliases() {
 fn unknown_source_exits_nonzero() {
     let h = Harness::new();
     let out = h.run(&["--source", "totally-not-a-source"]);
-    assert!(!out.status.success());
-    let combined = format!("{}{}", read_stdout(&out), read_stderr(&out));
-    assert!(combined.contains("unknown source"));
+    let stderr = require_usage_error(&out, "--source totally-not-a-source");
+    assert!(stderr.contains("unknown source"));
 }
 
 #[test]
@@ -885,4 +903,199 @@ fn ccaudit_lazy_skips_scan() {
     let v: Value = serde_json::from_str(&read_stdout(&fresh)).unwrap();
     let rows = v["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 3);
+}
+
+// ── Regression: hardened arg parsing + filters (2026-07 audit) ──
+
+#[test]
+fn timezone_multibyte_offset_is_clean_usage_error() {
+    // `+€0` is 4 bytes after the sign with no ':' — a byte-indexed
+    // `split_at(2)` lands on a non-char boundary and aborts (SIGABRT,
+    // exit 134 under panic=abort). Must be an ordinary usage error.
+    let h = Harness::new();
+    let out = h.run(&["daily", "--timezone", "+€0"]);
+    let stderr = require_usage_error(&out, "--timezone +€0");
+    assert!(stderr.contains("bad offset"), "got: {stderr}");
+}
+
+#[test]
+fn unknown_project_is_rejected() {
+    let h = Harness::new();
+    setup_two_projects(&h);
+    let out = h.run(&["daily", "--json", "--project", "no-such-project"]);
+    let stderr = require_usage_error(&out, "--project no-such-project");
+    assert!(stderr.contains("unknown project"), "got: {stderr}");
+    // Worse than a wrong exit code would be the filter silently
+    // disabling itself and printing GLOBAL totals as if they were
+    // project-scoped. No report may reach stdout.
+    assert!(
+        read_stdout(&out).trim().is_empty(),
+        "report leaked to stdout despite unknown project:\n{}",
+        read_stdout(&out)
+    );
+}
+
+#[test]
+fn project_filter_accepts_stem_display_form() {
+    // `ccaudit session` displays ccusage-stem labels ("code-beta"); the
+    // label our own output shows must round-trip into --project and
+    // select exactly that project, not silently match nothing.
+    let h = Harness::new();
+    setup_two_projects(&h);
+
+    let out = h.run(&["session", "--json"]);
+    require_success(&out, "session --json");
+    let v: Value = serde_json::from_str(&read_stdout(&out)).unwrap();
+    let labels: Vec<&str> = v["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["key"].as_str().unwrap())
+        .collect();
+    assert!(labels.contains(&"code-beta"), "labels: {labels:?}");
+
+    let out = h.run(&["daily", "--json", "--project", "code-beta"]);
+    require_success(&out, "--project code-beta (stem form)");
+    let v: Value = serde_json::from_str(&read_stdout(&out)).unwrap();
+    // Beta only: 100 in / 200 out — not the global 1600/2700.
+    assert_eq!(v["totals"]["input"], 100);
+    assert_eq!(v["totals"]["output"], 200);
+}
+
+#[test]
+fn project_filter_slash_and_stem_forms_agree() {
+    let h = Harness::new();
+    setup_two_projects(&h);
+    let slash = h.run(&["daily", "--json", "--project", "code/beta"]);
+    let stem = h.run(&["daily", "--json", "--project", "code-beta"]);
+    require_success(&slash, "--project code/beta");
+    require_success(&stem, "--project code-beta");
+    assert_eq!(
+        read_stdout(&slash),
+        read_stdout(&stem),
+        "stored form and displayed stem form must select the same rows"
+    );
+}
+
+#[test]
+fn value_flag_refuses_flag_shaped_value() {
+    // `--project --json` must not swallow `--json` as the project name —
+    // that drops the JSON request AND (via the unknown-name hole) the
+    // filter. Must be a usage error naming the missing value.
+    let h = Harness::new();
+    setup_single_project(&h);
+    let out = h.run(&["daily", "--project", "--json"]);
+    let stderr = require_usage_error(&out, "daily --project --json");
+    assert!(stderr.contains("missing value"), "got: {stderr}");
+    assert!(
+        read_stdout(&out).trim().is_empty(),
+        "nothing may render on a parse error"
+    );
+}
+
+#[test]
+fn equals_form_matches_space_form() {
+    let h = Harness::new();
+    setup_single_project(&h);
+    let spaced = h.run(&["daily", "--json", "--since", "20260402"]);
+    let equals = h.run(&["daily", "--json", "--since=20260402"]);
+    require_success(&spaced, "--since 20260402");
+    require_success(&equals, "--since=20260402");
+    assert_eq!(
+        read_stdout(&spaced),
+        read_stdout(&equals),
+        "`--since=v` must behave exactly like `--since v`"
+    );
+    // Sanity: the filter really applied (only the 2026-04-02 row).
+    let v: Value = serde_json::from_str(&read_stdout(&equals)).unwrap();
+    let rows = v["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["key"], "2026-04-02");
+}
+
+#[test]
+fn since_after_until_is_rejected() {
+    // A transposed range must error, not render an empty report with
+    // exit 0.
+    let h = Harness::new();
+    setup_single_project(&h);
+    let out = h.run(&["daily", "--since", "20260501", "--until", "20260101"]);
+    let stderr = require_usage_error(&out, "--since after --until");
+    assert!(stderr.contains("range matches nothing"), "got: {stderr}");
+}
+
+#[test]
+fn blocks_live_and_recent_are_mutually_exclusive() {
+    // --live pins the view to the active block, so honoring --recent is
+    // impossible — accepting it silently would just drop it.
+    let h = Harness::new();
+    let out = h.run(&["blocks", "--live", "--recent"]);
+    let stderr = require_usage_error(&out, "blocks --live --recent");
+    assert!(stderr.contains("mutually exclusive"), "got: {stderr}");
+}
+
+#[test]
+fn timezone_offset_shifts_day_bucketing() {
+    // 23:30Z on Apr 1 is 08:30 on Apr 2 at +09:00 — the row must move to
+    // the next local day. A non-UTC offset also forces the per-line
+    // (slow) aggregation path, which was previously untested end-to-end.
+    let h = Harness::new();
+    h.write_jsonl(
+        "-Users-test-code-tz",
+        "sess_tz",
+        &[
+            &user_line("late night", "2026-04-01T23:29:00.000Z"),
+            &assistant_line(&AssistantLine {
+                msg_id: "msg_TZ",
+                model: "claude-opus-4-7",
+                iso_ts: "2026-04-01T23:30:00.000Z",
+                input: 100,
+                output: 100,
+                cache_read: 0,
+                cache_create: 0,
+                text: "night owl",
+            }),
+        ],
+    );
+
+    let utc = h.run(&["daily", "--json"]);
+    require_success(&utc, "daily UTC");
+    let v: Value = serde_json::from_str(&read_stdout(&utc)).unwrap();
+    assert_eq!(v["rows"][0]["key"], "2026-04-01", "UTC bucketing");
+
+    let tokyo = h.run(&["daily", "--json", "--timezone", "+09:00"]);
+    require_success(&tokyo, "daily +09:00");
+    let v: Value = serde_json::from_str(&read_stdout(&tokyo)).unwrap();
+    assert_eq!(v["timezone"], "+09:00");
+    let rows = v["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["key"], "2026-04-02",
+        "+09:00 must shift a 23:30Z line to the next local day"
+    );
+}
+
+#[test]
+fn locale_flag_validates_instead_of_silently_ignoring() {
+    // `--locale` must never parse-and-ignore: lean builds explain the
+    // missing feature, full builds reject unknown locales instead of
+    // falling back to POSIX. Tests compile with the same feature set as
+    // the binary, so pick the expectation per build.
+    let h = Harness::new();
+    setup_single_project(&h);
+    if cfg!(feature = "locale") {
+        let out = h.run(&["daily", "--locale", "klingon"]);
+        let stderr = require_usage_error(&out, "--locale klingon");
+        assert!(stderr.contains("unknown locale"), "got: {stderr}");
+
+        let out = h.run(&["daily", "--locale", "ja_JP"]);
+        require_success(&out, "--locale ja_JP");
+    } else {
+        let out = h.run(&["daily", "--locale", "ja_JP"]);
+        let stderr = require_usage_error(&out, "--locale on lean build");
+        assert!(
+            stderr.contains("`locale` feature"),
+            "lean build must point at the missing feature, got: {stderr}"
+        );
+    }
 }

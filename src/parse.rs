@@ -84,6 +84,13 @@ pub struct Session {
     pub cost_cache_read: f64,
     #[serde(skip)]
     pub cost_cache_create: f64,
+    /// (mtime, size) captured BEFORE the JSONL was mapped. `save_to_cache`
+    /// must stamp the cache with this, not a fresh stat: a live session can
+    /// be appended between parse and save, and fingerprinting afterwards
+    /// would mark stale content as fresh — permanently, if the session then
+    /// goes idle.
+    #[serde(skip)]
+    pub fingerprint: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,8 +131,8 @@ pub struct TokenUsage {
 //
 // The split exists because cold TUI startup (and `web --no-serve`'s
 // projects-list render) only needs the header; reading the messages
-// blob for every session just to call `.messages.len()` was the hot
-// cost on warm runs.
+// blob for every session just to call `.messages.len()` dominates
+// warm runs.
 
 fn cache_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("ccaudit-cache"))
@@ -146,8 +153,13 @@ fn cache_key(path: &Path) -> String {
 }
 
 // Bumped whenever Session header or Message struct changes shape, OR
-// when the on-disk encoding changes.
-const CACHE_VERSION: u8 = 0;
+// when the on-disk encoding changes, OR when parser behavior changes
+// what a Session contains (a stale blob would otherwise stay "fresh"
+// forever since invalidation is fingerprint-based).
+//   v1: tool_use parts with unmodeled inputs are kept, user block-array
+//       text is MessageKind::User, id-less multi-part lines carry usage
+//       on the first part only.
+const CACHE_VERSION: u8 = 1;
 
 #[derive(Serialize, Deserialize)]
 struct CacheMeta {
@@ -239,7 +251,10 @@ fn save_to_cache(path: &Path, session: &Session) {
     let Some(dir) = cache_dir() else { return };
     let _ = fs::create_dir_all(&dir);
     let key = cache_key(path);
-    let Some(fp) = file_fingerprint(path) else {
+    // Prefer the fingerprint captured before the parse mmap'd the file
+    // (see `Session::fingerprint`); a fresh stat here would attribute
+    // concurrently-appended bytes to content that predates them.
+    let Some(fp) = session.fingerprint.or_else(|| file_fingerprint(path)) else {
         return;
     };
     // Write header + messages first, then meta last — meta is the
@@ -260,29 +275,20 @@ fn save_to_cache(path: &Path, session: &Session) {
     }
 }
 
-// JSON parser switch. Default uses serde_json on the immutable mmap'd
-// slice; with `--features simd-json`, the slice is copied into a mutable
-// buffer that simd-json's SIMD-accelerated parser scribbles in place.
-// The copy is cheap relative to the parse cost on lines >100 bytes.
-#[cfg(not(feature = "simd-json"))]
-fn json_from_slice<T: for<'de> Deserialize<'de>>(line: &[u8]) -> Option<T> {
-    serde_json::from_slice(line).ok()
-}
-
-#[cfg(feature = "simd-json")]
-fn json_from_slice<T: for<'de> Deserialize<'de>>(line: &[u8]) -> Option<T> {
-    let mut buf = line.to_vec();
-    simd_json::serde::from_slice(&mut buf).ok()
-}
-
 // ── JSONL deserialization types ──
 
+// `msg_type` / `subtype` / `timestamp` are matched or parsed and then
+// dropped, so they borrow from the line slice (`Cow` still tolerates
+// escaped strings, which must allocate). `cwd` and the `RawMessage`
+// fields are stored beyond the line's lifetime and stay owned.
 #[derive(Deserialize)]
-struct RawLine {
-    #[serde(rename = "type")]
-    msg_type: Option<String>,
-    subtype: Option<String>,
-    timestamp: Option<String>,
+struct RawLine<'a> {
+    #[serde(rename = "type", borrow)]
+    msg_type: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow)]
+    subtype: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow)]
+    timestamp: Option<std::borrow::Cow<'a, str>>,
     message: Option<RawMessage>,
     #[serde(rename = "durationMs")]
     duration_ms: Option<u64>,
@@ -358,26 +364,38 @@ struct ToolInput {
 
 // ── Parsing helpers ──
 
-#[allow(clippy::indexing_slicing)] // indices are bounds-checked by b.len() >= 20
 fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
     // Fast path for "2026-03-30T14:10:41.157Z" format (fixed layout).
     // Gated on a trailing 'Z' so a timestamp carrying a numeric offset
     // ("…+02:00") is NOT misread as UTC — it falls through to chrono's
     // full parser, which honors the offset. Claude Code / Codex always
     // emit the Z form, so the fast path still covers every real line.
-    let b = s.as_bytes();
-    if b.len() >= 20 && b[4] == b'-' && b[7] == b'-' && b[10] == b'T' && b.last() == Some(&b'Z') {
-        let year = i32::try_from(fast_parse_u32(&b[0..4])?).ok()?;
-        let month = fast_parse_u32(&b[5..7])?;
-        let day = fast_parse_u32(&b[8..10])?;
-        let hour = fast_parse_u32(&b[11..13])?;
-        let min = fast_parse_u32(&b[14..16])?;
-        let sec = fast_parse_u32(&b[17..19])?;
-        let ndt = chrono::NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, min, sec)?;
-        return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+    // Any fast-path failure (including shapes chrono accepts but this
+    // layout doesn't, e.g. a leap-second ":60") falls through rather
+    // than rejecting the line outright.
+    fast_parse_timestamp(s.as_bytes()).or_else(|| s.parse::<DateTime<Utc>>().ok())
+}
+
+#[allow(clippy::indexing_slicing)] // indices are bounds-checked by b.len() >= 20
+fn fast_parse_timestamp(b: &[u8]) -> Option<DateTime<Utc>> {
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b.last() != Some(&b'Z')
+    {
+        return None;
     }
-    // Fallback
-    s.parse::<DateTime<Utc>>().ok()
+    let year = i32::try_from(fast_parse_u32(&b[0..4])?).ok()?;
+    let month = fast_parse_u32(&b[5..7])?;
+    let day = fast_parse_u32(&b[8..10])?;
+    let hour = fast_parse_u32(&b[11..13])?;
+    let min = fast_parse_u32(&b[14..16])?;
+    let sec = fast_parse_u32(&b[17..19])?;
+    let ndt = chrono::NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, min, sec)?;
+    Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc))
 }
 
 fn fast_parse_u32(b: &[u8]) -> Option<u32> {
@@ -407,15 +425,26 @@ fn truncate_str(mut s: String, max_bytes: usize) -> String {
     s
 }
 
-fn extract_text_content(content: RawContent) -> Vec<(MessageKind, String, Option<String>)> {
+fn extract_text_content(
+    content: RawContent,
+    from_user: bool,
+) -> Vec<(MessageKind, String, Option<String>)> {
+    // Text carries the kind of the line it came from: a `text` block on a
+    // `type:"user"` line is the user's prompt (block-array form shows up
+    // whenever the prompt has attachments), not assistant output.
+    let text_kind = if from_user {
+        MessageKind::User
+    } else {
+        MessageKind::Assistant
+    };
     match content {
-        RawContent::Text(s) => vec![(MessageKind::User, s, None)],
+        RawContent::Text(s) => vec![(text_kind, s, None)],
         RawContent::Blocks(blocks) => {
             let mut out = Vec::with_capacity(blocks.len());
             for b in blocks {
                 match b {
                     RawBlock::Text { text } if !text.is_empty() => {
-                        out.push((MessageKind::Assistant, text, None));
+                        out.push((text_kind.clone(), text, None));
                     }
                     RawBlock::Thinking { thinking } if !thinking.is_empty() => {
                         out.push((MessageKind::Thinking, thinking, None));
@@ -524,7 +553,18 @@ fn parse_one_line(line: &[u8]) -> Option<ParsedLine> {
         return None;
     }
 
-    let raw: RawLine = json_from_slice(line)?;
+    // JSON parser switch. Default deserializes straight off the immutable
+    // mmap'd slice (RawLine's Cow fields borrow from it); with
+    // `--features simd-json`, the slice is copied into a mutable buffer
+    // that simd-json's SIMD-accelerated parser scribbles in place — the
+    // borrows then point into that local buffer, which outlives `raw`.
+    #[cfg(feature = "simd-json")]
+    let mut simd_buf = line.to_vec();
+    #[cfg(feature = "simd-json")]
+    let raw: RawLine = simd_json::serde::from_slice(&mut simd_buf).ok()?;
+    #[cfg(not(feature = "simd-json"))]
+    let raw: RawLine = serde_json::from_slice(line).ok()?;
+
     let ts = raw.timestamp.as_deref().and_then(parse_timestamp);
     let msg_type = raw.msg_type.as_deref().unwrap_or("");
     let cwd = raw.cwd.filter(|s| !s.is_empty());
@@ -533,7 +573,7 @@ fn parse_one_line(line: &[u8]) -> Option<ParsedLine> {
         "user" => {
             let msg = raw.message?;
             let content = msg.content?;
-            let parts = extract_text_content(content);
+            let parts = extract_text_content(content, true);
             Some(ParsedLine {
                 kind: LineParsed::User { parts },
                 timestamp: ts,
@@ -543,7 +583,7 @@ fn parse_one_line(line: &[u8]) -> Option<ParsedLine> {
         "assistant" => {
             let msg = raw.message?;
             let content = msg.content?;
-            let parts = extract_text_content(content);
+            let parts = extract_text_content(content, false);
             let tokens = msg.usage.as_ref().map(|u| TokenUsage {
                 input: u.input_tokens.unwrap_or(0),
                 output: u.output_tokens.unwrap_or(0),
@@ -605,6 +645,12 @@ struct SessionBuilder {
     model: Option<String>,
     turn_count: usize,
     cwd: Option<String>,
+    // FNV hash of the last assistant line's message_id whose usage was
+    // added to the totals. Messages streamed as several JSONL lines repeat
+    // the same id and usage on each line; counting every line would
+    // double/triple the totals (`to_parsed_session` coalesces by the same
+    // consecutive-id rule).
+    last_usage_id_hash: Option<u64>,
 }
 
 impl SessionBuilder {
@@ -623,6 +669,7 @@ impl SessionBuilder {
             model: None,
             turn_count: 0,
             cwd: None,
+            last_usage_id_hash: None,
         }
     }
 
@@ -633,11 +680,17 @@ impl SessionBuilder {
         }
         match parsed.kind {
             LineParsed::User { parts } => {
+                // A "user" line whose parts are all tool_results is the
+                // harness returning tool output, not a human turn.
+                let mut is_human_turn = false;
                 for (kind, text, tool_name) in parts {
-                    if kind == MessageKind::User && self.first_user_msg.is_none() {
-                        // Slice-truncate so a 50KB paste doesn't get
-                        // cloned just to throw away 49.8KB of it.
-                        self.first_user_msg = Some(truncated_copy(&text, 200));
+                    if kind == MessageKind::User {
+                        is_human_turn = true;
+                        if self.first_user_msg.is_none() {
+                            // Slice-truncate so a 50KB paste doesn't get
+                            // cloned just to throw away 49.8KB of it.
+                            self.first_user_msg = Some(truncated_copy(&text, 200));
+                        }
                     }
                     if kind == MessageKind::ToolResult && text.is_empty() {
                         continue;
@@ -652,7 +705,9 @@ impl SessionBuilder {
                         message_id: None,
                     });
                 }
-                self.turn_count += 1;
+                if is_human_turn {
+                    self.turn_count += 1;
+                }
             }
             LineParsed::Assistant {
                 parts,
@@ -663,35 +718,73 @@ impl SessionBuilder {
                 if self.model.is_none() {
                     self.model.clone_from(&msg_model);
                 }
+                // Add usage once per API call, not once per JSONL line:
+                // consecutive lines sharing a message_id are one streamed
+                // message with the usage repeated on each line.
+                let id_hash = message_id
+                    .as_deref()
+                    .map(|id| crate::source::fnv1a(id.as_bytes()));
+                let is_repeat = id_hash.is_some() && id_hash == self.last_usage_id_hash;
                 if let Some(ref t) = tokens {
-                    self.total_input += t.input;
-                    self.total_output += t.output;
-                    self.total_cache_read += t.cache_read;
-                    self.total_cache_create += t.cache_create;
+                    if !is_repeat {
+                        self.total_input += t.input;
+                        self.total_output += t.output;
+                        self.total_cache_read += t.cache_read;
+                        self.total_cache_create += t.cache_create;
+                    }
                 }
-                // Peek-ahead trick: clone msg_model / message_id for
-                // every non-empty part except the last, where we move.
-                // For the typical single-part assistant line this lands
-                // on `is_last` immediately and skips all string clones.
+                self.last_usage_id_hash = id_hash;
+                // Keep tool_use parts even when their rendered input is
+                // empty (unmodeled tools) — dropping them drops the
+                // line's token usage from `to_parsed_session` entirely.
+                // Id-less lines get usage on the FIRST part only, since
+                // downstream dedup can't coalesce parts without an id.
+                let mut usage_left = tokens;
                 let mut iter = parts
                     .into_iter()
-                    .filter(|(_, t, _)| !t.is_empty())
+                    .filter(|(k, t, _)| *k == MessageKind::ToolUse || !t.is_empty())
                     .peekable();
+                // Peek-ahead trick: clone msg_model / message_id for
+                // every part except the last, where we move. For the
+                // typical single-part assistant line this lands on
+                // `is_last` immediately and skips all string clones.
+                let mut pushed_any = false;
                 while let Some((kind, text, tool_name)) = iter.next() {
+                    pushed_any = true;
                     let is_last = iter.peek().is_none();
                     let (m, mid) = if is_last {
                         (msg_model.take(), message_id.take())
                     } else {
                         (msg_model.clone(), message_id.clone())
                     };
+                    let part_tokens = if mid.is_some() {
+                        tokens
+                    } else {
+                        usage_left.take()
+                    };
                     self.messages.push(Message {
                         timestamp: ts,
                         kind,
                         content: text,
-                        tokens,
+                        tokens: part_tokens,
                         tool_name,
                         model: m,
                         message_id: mid,
+                    });
+                }
+                // A line whose blocks are all unmodeled (redacted_thinking,
+                // image-only, server tools) still bills tokens — record an
+                // empty placeholder so the usage survives into
+                // `to_parsed_session` instead of vanishing from aggregates.
+                if !pushed_any && tokens.is_some() {
+                    self.messages.push(Message {
+                        timestamp: ts,
+                        kind: MessageKind::Assistant,
+                        content: String::new(),
+                        tokens,
+                        tool_name: None,
+                        model: msg_model.take(),
+                        message_id: message_id.take(),
                     });
                 }
             }
@@ -729,15 +822,48 @@ fn truncated_copy(s: &str, max_bytes: usize) -> String {
     out
 }
 
-#[allow(clippy::indexing_slicing)]
+/// Parse a session, treating a readable file with no messages as `None`.
+///
+/// The TUI/web project tree uses this so contentless sessions don't
+/// clutter listings. The cache layer must use `parse_session_allow_empty`
+/// instead — see the `Source::parse_session` contract.
 pub fn parse_session(path: &Path) -> Option<Session> {
+    parse_session_allow_empty(path).filter(|s| !s.messages.is_empty())
+}
+
+/// Like `parse_session`, but a readable file with zero parseable messages
+/// yields `Some(empty Session)` rather than `None`.
+///
+/// The aggregation cache validates by matching its session count against
+/// the scanned-file count, so returning `None` for a file that keeps
+/// being scanned would force a full rebuild on every run.
+#[allow(clippy::indexing_slicing)]
+pub fn parse_session_allow_empty(path: &Path) -> Option<Session> {
+    // Fingerprint BEFORE mapping: an append racing the parse must leave
+    // the cache entry stale (old fingerprint, old content), never stamp
+    // the new (mtime,size) onto content that predates it.
+    let fingerprint = file_fingerprint(path)?;
+    if fingerprint.1 == 0 {
+        // Zero-byte file: readable but empty (mmap would reject a
+        // zero-length map anyway).
+        return Some(build_session(
+            path,
+            SessionBuilder::with_capacity(0),
+            fingerprint,
+        ));
+    }
     let file = fs::File::open(path).ok()?;
-    // SAFETY: read-only mmap, file not modified during parse
+    // SAFETY: read-only map. Concurrent appends are benign — the mapping
+    // length is fixed at map time. A truncation mid-parse would SIGBUS;
+    // Claude Code session files are append-only in practice, so this is
+    // accepted rather than paying a defensive full read.
     #[allow(unsafe_code)]
     let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
-    let data = &*mmap;
-    if data.is_empty() {
-        return None;
+    let mut data = &*mmap;
+    // Strip a UTF-8 BOM (files round-tripped through editors add one) so
+    // the first line's JSON parse doesn't silently fail.
+    if data.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        data = &data[3..];
     }
 
     // ≤10MB: fused single-pass loop. memchr_iter yields line ends, we
@@ -781,6 +907,10 @@ pub fn parse_session(path: &Path) -> Option<Session> {
             }
         }
     }
+    Some(build_session(path, b, fingerprint))
+}
+
+fn build_session(path: &Path, b: SessionBuilder, fingerprint: (u64, u64)) -> Session {
     let SessionBuilder {
         messages,
         summary,
@@ -792,11 +922,8 @@ pub fn parse_session(path: &Path) -> Option<Session> {
         model,
         turn_count,
         cwd,
+        ..
     } = b;
-
-    if messages.is_empty() {
-        return None;
-    }
 
     let started_at = messages.first().and_then(|m| m.timestamp);
     let ended_at = messages.last().and_then(|m| m.timestamp);
@@ -809,7 +936,7 @@ pub fn parse_session(path: &Path) -> Option<Session> {
 
     let msg_count = u32::try_from(messages.len()).unwrap_or(u32::MAX);
 
-    Some(Session {
+    Session {
         id,
         file_path: path.to_path_buf(),
         messages,
@@ -830,7 +957,8 @@ pub fn parse_session(path: &Path) -> Option<Session> {
         cost_output: 0.0,
         cost_cache_read: 0.0,
         cost_cache_create: 0.0,
-    })
+        fingerprint: Some(fingerprint),
+    }
 }
 
 // ── Top-level loader (TUI/web/--json) ──
@@ -847,38 +975,22 @@ pub fn parse_session(path: &Path) -> Option<Session> {
 // With CCAUDIT_PROF set, prints a one-line cache hit/miss summary to
 // stderr so the user can tell cold runs from warm ones. Silent otherwise
 // to keep TUI/web invocations clean.
-#[allow(clippy::print_stderr)]
 pub fn load_all_projects<S: crate::source::Source + ?Sized>(source: &S) -> Vec<Project> {
-    let projects_dir = match dirs::home_dir() {
-        Some(h) => h.join(".claude").join("projects"),
-        None => return vec![],
-    };
+    load_all_projects_with_cache(source).0
+}
 
-    if !projects_dir.exists() {
-        return vec![];
-    }
-
-    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new(); // (project_dir, jsonl_file)
-    if let Ok(entries) = fs::read_dir(&projects_dir) {
-        for entry in entries.flatten() {
-            let dir = entry.path();
-            if !dir.is_dir() {
-                continue;
-            }
-            if let Ok(sub) = fs::read_dir(&dir) {
-                for f in sub.flatten() {
-                    let p = f.path();
-                    // Only top-level JSONL files (skip subagent dirs, plugin dirs, etc.)
-                    if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                        files.push((dir.clone(), p));
-                    }
-                }
-            }
-        }
-    }
-
+/// `load_all_projects`, also handing back the aggregation cache it built
+/// internally — callers that need both (the web generator) would
+/// otherwise pay a second full scan + validate pass.
+#[allow(clippy::print_stderr)]
+pub fn load_all_projects_with_cache<S: crate::source::Source + ?Sized>(
+    source: &S,
+) -> (Vec<Project>, crate::cache::LoadedCache) {
+    // One scan_sources() pass covers both this file list and the cache
+    // load below (and gets the darwin bulk-scan path for free).
+    let files = source.scan_sources();
     if files.is_empty() {
-        return vec![];
+        return (vec![], crate::cache::load(source));
     }
 
     // Canonical aggregation cache — owns token/cost totals + last-active
@@ -896,30 +1008,42 @@ pub fn load_all_projects<S: crate::source::Source + ?Sized>(source: &S) -> Vec<P
     }
     let parsed: Vec<ParsedFile> = files
         .par_iter()
-        .filter_map(|(dir, file)| {
-            let path_hash = crate::source::path_hash(file);
+        .filter_map(|src| {
+            let file = &src.path;
+            let dir = file.parent()?.to_path_buf();
+            let path_hash = src.path_hash;
             // Header-only fast path — skips deserializing the messages
             // blob, which is what made warm cold-starts expensive.
             if let Some(mut session) = try_load_cached_header(file) {
+                // Contentless sessions live in the cache (the aggregation
+                // layer needs their count) but have nothing to list.
+                if session.msg_count == 0 {
+                    return None;
+                }
                 session.file_path.clone_from(file);
                 let _ = cache_hits.fetch_add(1, Ordering::Relaxed);
                 return Some(ParsedFile {
-                    dir: dir.clone(),
+                    dir,
                     path_hash,
                     session,
                 });
             }
             let _ = cache_misses.fetch_add(1, Ordering::Relaxed);
             // Cache miss: full parse, then split-write so subsequent runs
-            // hit the header-only path above.
-            let session = parse_session(file)?;
+            // hit the header-only path above. Empty sessions are cached
+            // (so the next run's header path skips them cheaply) but not
+            // listed.
+            let session = parse_session_allow_empty(file)?;
             save_to_cache(file, &session);
+            if session.messages.is_empty() {
+                return None;
+            }
             // Keep header in memory but drop messages — consumers that need
             // them will re-read from `.msgs`.
             let mut header_only = session;
             header_only.messages = Vec::new();
             Some(ParsedFile {
-                dir: dir.clone(),
+                dir,
                 path_hash,
                 session: header_only,
             })
@@ -1001,7 +1125,7 @@ pub fn load_all_projects<S: crate::source::Source + ?Sized>(source: &S) -> Vec<P
         .collect();
 
     projects.sort_by_key(|p| std::cmp::Reverse(p.last_active));
-    projects
+    (projects, cache)
 }
 
 impl Session {

@@ -11,15 +11,18 @@ pub fn serve(dir: &Path, port: u16) -> std::io::Result<()> {
     let listener = TcpListener::bind(&addr)?;
     eprintln!("serving at http://{addr}");
 
+    // `spawn` (not `status`): don't block the accept loop on the opener —
+    // some launchers (notably xdg-open with a foreground browser) don't
+    // return until the browser exits, which would leave the server deaf.
     let url = format!("http://{addr}");
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(&url).status();
+    let _ = std::process::Command::new("open").arg(&url).spawn();
     #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open").arg(&url).status();
+    let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
     #[cfg(target_os = "windows")]
     let _ = std::process::Command::new("cmd")
         .args(["/c", "start", &url])
-        .status();
+        .spawn();
 
     let dir = dir.to_path_buf();
     for stream in listener.incoming() {
@@ -35,14 +38,34 @@ pub fn serve(dir: &Path, port: u16) -> std::io::Result<()> {
     Ok(())
 }
 
-#[allow(clippy::indexing_slicing)] // n is bounded by buf.len() from read()
+/// Max bytes of request head we'll buffer before giving up on finding
+/// the end of headers. Generous for a static-file GET; anything larger
+/// is parsed from what we have (worst case: 404).
+const MAX_REQUEST_HEAD: usize = 8192;
+
+#[allow(clippy::indexing_slicing)] // n is bounded by chunk.len() from read()
 fn handle_request(stream: &mut (impl Read + Write), dir: &Path) {
-    let mut buf = [0u8; 4096];
-    let n = match stream.read(&mut buf) {
-        Ok(n) if n > 0 => n,
-        _ => return,
-    };
-    let request = String::from_utf8_lossy(&buf[..n]);
+    // Read until end-of-headers (`\r\n\r\n`) or the cap — a request line
+    // split across TCP segments must not be mis-parsed from the first
+    // chunk alone. The caller's read timeout still bounds how long a
+    // slow client can drip-feed.
+    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() >= MAX_REQUEST_HEAD || buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+        }
+    }
+    if buf.is_empty() {
+        return;
+    }
+    let request = String::from_utf8_lossy(&buf);
 
     let request_line = request.lines().next().unwrap_or("");
     // HEAD must return the same status line + headers (incl. Content-Length)

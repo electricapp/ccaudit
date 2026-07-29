@@ -988,8 +988,8 @@ function doSearch(query) {
     if (!hits) {
       hits = new Set(posting);
     } else {
-      // Intersect in place — iterate the smaller set, delete what's
-      // not in the larger. Avoids the old spread-filter-spread dance.
+      // Intersect in place — iterate the smaller set, keep what's in
+      // the larger. No intermediate arrays.
       const other = new Set(posting);
       const [small, big] = hits.size <= other.size ? [hits, other] : [other, hits];
       const next = new Set();
@@ -1147,9 +1147,8 @@ function render() {
   else if (view === 'search') rSearch();
   else if (view === 'dash') rDash();
   else rMessages();
-  // Restore scroll on intra-view re-renders. View functions used to
-  // unconditionally `M.scrollTop=0` — they no longer do; this is the
-  // single source of truth.
+  // Restore scroll on intra-view re-renders. This is the single place
+  // allowed to touch M.scrollTop — view functions must not reset it.
   M.scrollTop = savedScroll;
   lastRenderedView = view;
   updateCrumbs();
@@ -1462,13 +1461,16 @@ function rMessages() {
   h += '<div class="filters">';
   // Resume copies `claude -r <id>` to the clipboard. Lives just left
   // of the detail dropdown so the "act on this session" affordance is
-  // grouped with the other session controls.
+  // grouped with the other session controls. The id rides in a data
+  // attribute and the copy happens in the delegated click handler —
+  // an inline onclick would put the id in a JS-string context, where
+  // HTML-escaping alone can't stop a crafted id breaking out.
   h +=
     '<button class="pbtn resume" title="copy `claude -r ' +
     esc(s.id) +
-    '`" onclick="navigator.clipboard.writeText(\'claude -r ' +
+    '`" data-resume="' +
     esc(s.id) +
-    "');this.textContent='copied!'\">resume</button>";
+    '">resume</button>';
   // Custom dropdown (matches site theme, no OS popup).
   h += '<div class="drop" data-drop="detail" title="detail level">';
   h +=
@@ -1905,7 +1907,10 @@ function computeDashAgg() {
         for (const r of rows) sessTok += r[1] + r[2] + r[3] + r[4];
         const costPerTok = sessTok > 0 ? tcost / sessTok : 0;
         for (const r of rows) {
-          const hour = new Date(r[0] * 1000).getHours();
+          // UTC hour — the heatmap/day buckets key on UTC days (same
+          // as DAILY and the CLI), so the hour chart must match or the
+          // dashboard panels disagree about where tokens landed.
+          const hour = new Date(r[0] * 1000).getUTCHours();
           const b = byHour[hour];
           b.input += r[1];
           b.output += r[2];
@@ -2291,11 +2296,15 @@ function prefetchSessions(rows) {
 }
 
 function buildHeatmap(byDay, maxTokens) {
+  // Grid is anchored to UTC midnights: byDay keys are UTC day strings
+  // (DAILY rows / started_at prefixes), so the cell keys must be UTC
+  // too — local midnight would shift every key by a day for UTC+
+  // viewers and silently drop the current UTC day's activity.
   const today = new Date();
   const dayMs = 86400000;
   const end = new Date(today);
-  end.setHours(0, 0, 0, 0);
-  const startOff = end.getDay();
+  end.setUTCHours(0, 0, 0, 0);
+  const startOff = end.getUTCDay();
   const start = new Date(end.getTime() - (52 * 7 + startOff) * dayMs);
 
   // Fall back to scanning byDay if caller didn't pre-compute the max.
@@ -2749,7 +2758,8 @@ function buildHist(data, mode, cats) {
     })
     .join('');
   const scalePart = histLog ? 'log₁₀ · ≥1K' : 'linear';
-  const prefix = mode === 'hour' ? 'avg/day · ' : '';
+  // Hour mode buckets by UTC (matches the day/heatmap keys) — say so.
+  const prefix = mode === 'hour' ? 'avg/day · UTC · ' : '';
   const toggle =
     '<button class="pbtn hist-log-toggle" onclick="toggleHistLog()" title="toggle log/linear scale">' +
     prefix +
@@ -2805,12 +2815,24 @@ document.addEventListener('mouseout', (e) => {
 });
 
 // Single delegated click handler:
-//   1. Dropdown button → toggle its menu (close any others).
-//   2. Dropdown item → select, update label, dispatch by data-drop id.
-//   3. Elsewhere → close any open menus.
-//   4. Heatmap day / pie slice → apply filter.
+//   1. Resume button → copy `claude -r <id>` to the clipboard.
+//   2. Dropdown button → toggle its menu (close any others).
+//   3. Dropdown item → select, update label, dispatch by data-drop id.
+//   4. Elsewhere → close any open menus.
+//   5. Heatmap day / pie slice → apply filter.
 document.addEventListener('click', (e) => {
   if (!e.target.closest) return;
+
+  // Resume button: the session id is read back from the data attribute
+  // (getAttribute entity-decodes, and it's never eval'd), so a hostile
+  // session id can't escape into script.
+  const rb = e.target.closest('[data-resume]');
+  if (rb) {
+    navigator.clipboard.writeText('claude -r ' + rb.getAttribute('data-resume'));
+    rb.textContent = 'copied!';
+    e.stopPropagation();
+    return;
+  }
 
   // Session message viewer: a sticky header row above the messages has
   // three click-to-sort cells (date/who/tokens). Click toggles direction

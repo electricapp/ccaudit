@@ -82,6 +82,11 @@ fn main() {
             }
         },
         cli::Cmd::Tui => {
+            // The TUI/web session browser renders Claude Code transcripts;
+            // other providers only feed the usage reports today. Silently
+            // proceeding would show Claude sessions costed against the
+            // wrong provider's cache ($0.00 everywhere).
+            reject_non_claude_browser(&opts, "tui");
             #[cfg(feature = "tui")]
             {
                 let projects = parse::load_all_projects(source::pick(opts.source));
@@ -116,6 +121,7 @@ fn main() {
             }
         }
         cli::Cmd::Web => {
+            reject_non_claude_browser(&opts, "web");
             #[cfg(feature = "web")]
             {
                 run_web_cmd(&opts);
@@ -150,10 +156,31 @@ fn main() {
             }
             let cache = cache::load(source);
             let t_load = t0.elapsed();
-            report::render(&cache, &opts, source);
+            // Reject a --project that matches nothing (typo, or a stem
+            // form from another provider) up front: rendering the
+            // unfiltered — or silently empty — totals under the user's
+            // filter would misrepresent the data.
+            if let Some(name) = opts.project.as_deref() {
+                if cache::resolve_project_filter(&cache, Some(name)) == Some(u16::MAX) {
+                    eprintln!("error: unknown project {name:?}");
+                    eprintln!("Run `ccaudit session` to list project names.");
+                    process::exit(2);
+                }
+            }
+            let render_result = report::render(&cache, &opts, source);
             let t_render = t0.elapsed().saturating_sub(t_load);
             if tprof {
                 eprintln!("load={t_load:?}  render={t_render:?}");
+            }
+            if let Err(e) = render_result {
+                // `| head` closing the pipe is a normal exit, not an
+                // error. Anything else (ENOSPC, closed fd) must not
+                // report success while producing no output.
+                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    process::exit(0);
+                }
+                eprintln!("error: failed to write report: {e}");
+                process::exit(1);
             }
             // Skip destructors: we only allocated for this run and the OS
             // reclaims everything on exit. Avoids mimalloc's teardown
@@ -163,11 +190,29 @@ fn main() {
     }
 }
 
+/// Exit 2 when `--source` names a provider the TUI/web browser can't
+/// render. No-op for Claude Code (the default).
+#[allow(clippy::print_stderr)]
+fn reject_non_claude_browser(opts: &cli::Options, cmd: &str) {
+    if opts.source != source::SourceKind::ClaudeCode {
+        eprintln!(
+            "error: `{cmd}` only supports --source claude-code (usage reports support every source)"
+        );
+        process::exit(2);
+    }
+}
+
 #[cfg(feature = "tui")]
 fn run_tui(projects: Vec<parse::Project>) -> std::io::Result<Option<ui::PostAction>> {
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+    // Bracketed paste: without it a paste arrives as individual
+    // keypresses, and stray 'q'/'c'/'o' characters execute as commands.
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableBracketedPaste
+    )?;
 
     // Restore the terminal on panic. With `panic = "abort"` there is no
     // unwind, so the straight-line teardown below never runs on a panic;
@@ -176,7 +221,11 @@ fn run_tui(projects: Vec<parse::Project>) -> std::io::Result<Option<ui::PostActi
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let mut out = std::io::stdout();
-        let _ = crossterm::execute!(out, crossterm::terminal::LeaveAlternateScreen);
+        let _ = crossterm::execute!(
+            out,
+            crossterm::event::DisableBracketedPaste,
+            crossterm::terminal::LeaveAlternateScreen
+        );
         let _ = crossterm::terminal::disable_raw_mode();
         default_hook(info);
     }));
@@ -190,6 +239,7 @@ fn run_tui(projects: Vec<parse::Project>) -> std::io::Result<Option<ui::PostActi
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
         terminal.backend_mut(),
+        crossterm::event::DisableBracketedPaste,
         crossterm::terminal::LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -231,12 +281,13 @@ fn resume_session(id: &str) {
 #[allow(clippy::print_stderr)]
 fn run_web_cmd(opts: &cli::Options) {
     let source = source::pick(opts.source);
-    let projects = parse::load_all_projects(source);
-    // `cache` is the same aggregation substrate the CLI usage reports use
-    // (daily/monthly/blocks). Web now emits its daily rollup from this
-    // shared cache rather than re-deriving it from session totals, so the
+    // One load: `cache` is the same aggregation substrate the CLI usage
+    // reports use (daily/monthly/blocks), and `load_all_projects` already
+    // builds it internally — returning it avoids a second full
+    // scan+validate pass. Web emits its daily rollup from this shared
+    // cache rather than re-deriving it from session totals, so the
     // heatmap bucketing matches the usage table — no cross-midnight drift.
-    let cache = cache::load(source);
+    let (projects, cache) = parse::load_all_projects_with_cache(source);
     let out_dir = opts
         .out_dir
         .as_deref()
@@ -327,7 +378,10 @@ fn run_blocks_live(source: &'static dyn source::Source, opts: &cli::Options) -> 
             let stdout = std::io::stdout();
             let _ = stdout.lock().write_all(b"\x1b[H\x1b[2J");
         }
-        report::render(&cache, &o, source);
+        if report::render(&cache, &o, source).is_err() {
+            // Broken pipe or dead terminal — stop refreshing.
+            process::exit(0);
+        }
         // Use write_all (not println!) so a broken pipe (`| head`) exits
         // cleanly instead of panicking on the next write.
         let stdout = std::io::stdout();
