@@ -45,8 +45,10 @@ impl Source for Codex {
     }
 
     fn price(&self, model: Option<&str>) -> &Pricing {
-        if let Some(lookup) = super::prices::get() {
-            if let Some(name) = model {
+        // `model` first so `price(None)` never forces the LiteLLM table
+        // load — see the matching note in `ClaudeCode::price`.
+        if let Some(name) = model {
+            if let Some(lookup) = super::prices::get() {
                 let candidates = openai_name_candidates(name);
                 if let Some(p) = lookup.lookup(&candidates) {
                     return p;

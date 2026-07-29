@@ -27,6 +27,54 @@ function ft(n) {
   return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, '_');
 }
 
+// Split a string into searchable terms. MUST match `tokenize_into` in
+// src/web.rs — divergence shows up as a query that silently matches
+// nothing. Cases pinned in test.js. Kept: >=3 chars containing a letter;
+// >=2 if any char is non-ASCII; all-digit runs of 2-6 chars.
+function tokenize(text) {
+  const out = [];
+  for (const run of String(text || '')
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}_]+/u)) {
+    if (!run) continue;
+    const chars = [...run];
+    const n = chars.length;
+    const hasLetter = /\p{L}/u.test(run);
+    const nonAscii = chars.some((c) => c.codePointAt(0) > 127);
+    const keep = hasLetter ? n >= 3 || (nonAscii && n >= 2) : n >= 2 && n <= 6 && /^\d+$/.test(run);
+    if (keep) out.push(run);
+  }
+  return out;
+}
+
+// Index of the first element >= x in a sorted array.
+function lowerBound(arr, x) {
+  let lo = 0,
+    hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (arr[mid] < x) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+// POSIX single-quote a shell word — project paths contain spaces.
+function shq(p) {
+  return "'" + String(p == null ? '' : p).replace(/'/g, "'\\''") + "'";
+}
+
+// Shell command that resumes a session. `claude -r` resolves against the
+// project derived from the shell's cwd, so another project's session
+// needs a `cd` first; and a subagent transcript isn't resumable itself —
+// `resume_id` carries its parent's id.
+function resumeCmd(s) {
+  const id = (s && (s.resume_id || s.id)) || '';
+  const base = 'claude -r ' + id;
+  const cwd = s && s.cwd;
+  return cwd ? 'cd ' + shq(cwd) + ' && ' + base : base;
+}
+
 // Currency formatter — mirrors Rust `write_cost` (report/fmt.rs)
 // exactly so CLI and web agree visibly: "<$0.01" only for tiny
 // *positive* values, "$0.00" for zero, "-$X.YY" for negatives.

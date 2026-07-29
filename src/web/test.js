@@ -204,6 +204,64 @@
       eq(hl('<x>foo</x>', 'foo'), '&lt;x&gt;<span class="hl">foo</span>&lt;/x&gt;'));
   });
 
+  // ── tokenize (shared contract with src/web.rs `tokenize_into`) ──
+  //
+  // The Rust indexer and this client tokenizer must agree exactly: the
+  // index only ever contains terms the indexer emitted, so a query the
+  // client tokenizes differently silently matches nothing. The mirrored
+  // Rust assertions live in `tokenize_matches_js_contract` (src/web.rs).
+  suite('tokenize', () => {
+    it('keeps 3+ char words, lowercased', () =>
+      eq(tokenize('Hello World').join(','), 'hello,world'));
+    it('drops 1-2 char latin words', () => eq(tokenize('a be the').join(','), 'the'));
+    it('splits on punctuation and keeps underscores', () =>
+      eq(tokenize('foo_bar, baz-qux').join(','), 'foo_bar,baz,qux'));
+    it('keeps 2-6 digit numbers', () => eq(tokenize('404 2026 8080').join(','), '404,2026,8080'));
+    it('drops long digit runs', () => eq(tokenize('1234567 12345678').join(','), ''));
+    it('drops single digits', () => eq(tokenize('7').join(','), ''));
+    it('keeps 2-char non-ascii words', () => eq(tokenize('日本').join(','), '日本'));
+    it('keeps accented latin', () => eq(tokenize('café').join(','), 'café'));
+    it('alphanumeric words survive', () => eq(tokenize('oauth2 utf8').join(','), 'oauth2,utf8'));
+    it('empty and nullish are safe', () => {
+      eq(tokenize('').join(','), '');
+      eq(tokenize(null).join(','), '');
+    });
+  });
+
+  // ── lowerBound ──
+  suite('lowerBound', () => {
+    const a = ['ant', 'bat', 'bee', 'cow'];
+    it('finds first >= x', () => eq(String(lowerBound(a, 'bat')), '1'));
+    it('finds insertion point for absent key', () => eq(String(lowerBound(a, 'bad')), '1'));
+    it('returns 0 before everything', () => eq(String(lowerBound(a, 'aaa')), '0'));
+    it('returns length past everything', () => eq(String(lowerBound(a, 'zzz')), '4'));
+    it('prefix scan finds the whole bee/bat range', () => {
+      const start = lowerBound(a, 'b');
+      const hit = [];
+      for (let i = start; i < a.length && a[i].startsWith('b'); i++) hit.push(a[i]);
+      eq(hit.join(','), 'bat,bee');
+    });
+  });
+
+  // ── resumeCmd / shq ──
+  suite('resumeCmd', () => {
+    it('cds into the session cwd', () =>
+      eq(
+        resumeCmd({ id: 'abc', cwd: '/Users/me/code/x' }),
+        "cd '/Users/me/code/x' && claude -r abc"
+      ));
+    it('prefers resume_id (subagent resumes its parent)', () =>
+      eq(
+        resumeCmd({ id: 'agent-9', resume_id: 'parent-1', cwd: '/w' }),
+        "cd '/w' && claude -r parent-1"
+      ));
+    it('omits cd when no cwd is recorded', () => eq(resumeCmd({ id: 'abc' }), 'claude -r abc'));
+    it('quotes paths containing spaces', () =>
+      eq(resumeCmd({ id: 'i', cwd: '/a b/c' }), "cd '/a b/c' && claude -r i"));
+    it('escapes embedded single quotes', () =>
+      eq(resumeCmd({ id: 'i', cwd: "/a'b" }), "cd '/a'\\''b' && claude -r i"));
+  });
+
   // ── Render summary ──
   const total = pass + fail;
   summary.textContent = `${pass}/${total} passed` + (fail ? ` · ${fail} FAILED` : '');

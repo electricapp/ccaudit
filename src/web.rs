@@ -22,6 +22,13 @@ struct IndexProject<'a> {
 #[derive(Serialize)]
 struct IndexSession<'a> {
     id: &'a str,
+    /// Conversation id `claude -r` can actually resume — a subagent
+    /// transcript resumes its parent, not itself.
+    resume_id: String,
+    /// Session's recorded working directory. `claude -r` resolves against
+    /// the project derived from the shell's cwd, so the copied command has
+    /// to `cd` there first or it won't find the conversation.
+    cwd: Option<&'a str>,
     summary: Option<&'a str>,
     first_user_msg: Option<&'a str>,
     total_input_tokens: u64,
@@ -272,6 +279,15 @@ pub fn generate(projects: &[Project], cache: &LoadedCache, out_dir: &Path) -> st
                     _ => {}
                 }
             }
+            // `summary` is the title the UI shows and never appears in
+            // `messages`, so without this a word from a session's visible
+            // title couldn't find it.
+            if let Some(s) = session.summary.as_deref() {
+                tokenize_into(s, &mut words);
+            }
+            // Whole id, not tokenized: a UUID would split into five hex
+            // chunks, none of which a pasted id prefix-matches.
+            let _ = words.insert(session.id.to_lowercase());
             Ok(PerSession {
                 words,
                 hourly: build_hourly_from(&messages),
@@ -309,6 +325,9 @@ pub fn generate(projects: &[Project], cache: &LoadedCache, out_dir: &Path) -> st
                     per_session_words.push(ps.words);
                     IndexSession {
                         id: &session.id,
+                        resume_id: crate::source::claude_code::resume_target_of(&session.file_path)
+                            .unwrap_or_else(|| session.id.clone()),
+                        cwd: session.cwd.as_deref(),
                         summary: session.summary.as_deref(),
                         first_user_msg: session.first_user_msg.as_deref(),
                         total_input_tokens: session.total_input_tokens,
@@ -428,27 +447,41 @@ pub fn generate(projects: &[Project], cache: &LoadedCache, out_dir: &Path) -> st
     Ok(())
 }
 
+/// Split `text` into searchable terms. Must match the client's
+/// `tokenize()` exactly — a term one side emits and the other doesn't is
+/// a silently unmatchable query. Cases pinned in `src/web/test.js`.
+///
+/// Kept: ≥3 chars containing a letter; ≥2 when any char is non-ASCII
+/// (CJK words are short); all-digit runs of 2–6 chars (`404`, `2026`),
+/// bounded so hex blobs don't flood the vocabulary.
 fn tokenize_into(text: &str, out: &mut FxHashSet<String>) {
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Find start of token: must begin with ascii alpha
-        if bytes[i].is_ascii_alphabetic() {
-            let start = i;
-            i += 1;
-            // Continue with alphanumeric or underscore
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
-            }
-            let len = i - start;
-            if len >= 3 {
-                // Safe: we only matched ASCII bytes
-                let word = text[start..i].to_ascii_lowercase();
-                let _ = out.insert(word);
-            }
-        } else {
-            i += 1;
+    let mut cur = String::new();
+    for c in text.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            cur.extend(c.to_lowercase());
+        } else if !cur.is_empty() {
+            keep_term(&mut cur, out);
         }
+    }
+    if !cur.is_empty() {
+        keep_term(&mut cur, out);
+    }
+}
+
+// Applies the keep-rule then clears the buffer for the next run.
+fn keep_term(cur: &mut String, out: &mut FxHashSet<String>) {
+    let n = cur.chars().count();
+    let has_letter = cur.chars().any(char::is_alphabetic);
+    let non_ascii = !cur.is_ascii();
+    let keep = if has_letter {
+        n >= 3 || (non_ascii && n >= 2)
+    } else {
+        (2..=6).contains(&n) && cur.chars().all(|c| c.is_ascii_digit())
+    };
+    if keep {
+        let _ = out.insert(std::mem::take(cur));
+    } else {
+        cur.clear();
     }
 }
 
@@ -460,3 +493,41 @@ const TOKEN_MARKER: &str = "/* TOKENS */";
 // see `src/web/test.html`.
 const UTIL: &str = include_str!("web/util.js");
 const JS: &str = include_str!("web/app.js");
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn toks(s: &str) -> Vec<String> {
+        let mut set = FxHashSet::default();
+        tokenize_into(s, &mut set);
+        let mut v: Vec<String> = set.into_iter().collect();
+        v.sort();
+        v
+    }
+
+    /// Mirror of the `tokenize` suite in `src/web/test.js` so drift fails
+    /// a build instead of quietly degrading search.
+    #[test]
+    fn tokenize_matches_js_contract() {
+        assert_eq!(toks("Hello World"), ["hello", "world"]);
+        assert_eq!(toks("a be the"), ["the"]);
+        assert_eq!(toks("foo_bar, baz-qux"), ["baz", "foo_bar", "qux"]);
+        assert_eq!(toks("404 2026 8080"), ["2026", "404", "8080"]);
+        assert!(toks("1234567 12345678").is_empty());
+        assert!(toks("7").is_empty());
+        assert_eq!(toks("日本"), ["日本"]);
+        assert_eq!(toks("café"), ["café"]);
+        assert_eq!(toks("oauth2 utf8"), ["oauth2", "utf8"]);
+        assert!(toks("").is_empty());
+    }
+
+    #[test]
+    fn tokenize_lowercases_and_splits_on_non_word_chars() {
+        assert_eq!(
+            toks("ERROR:  Timeout\n\tretry"),
+            ["error", "retry", "timeout"]
+        );
+    }
+}

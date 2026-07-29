@@ -251,43 +251,58 @@ pub fn default_cache_path(id: &str) -> Option<PathBuf> {
     })
 }
 
+/// Max directory depth below `logs_dir` for a session file.
+///
+/// Claude Code nests subagent transcripts at `<project>/<uuid>/subagents/
+/// agent-*.jsonl` (depth 4) and workflow agents at depth 6. 8 clears both
+/// with headroom, and bounds the walk against symlink cycles.
+pub const MAX_SCAN_DEPTH: usize = 8;
+
 /// Portable `logs_dir` walk.
 ///
-/// Readdir the outer directory, then for each subdir readdir + stat
-/// every `*.jsonl` (~1 stat syscall per file). Used as the default
-/// `scan_sources` implementation; providers with a faster platform-
-/// specific path (see `ClaudeCode`'s macOS bulk-scan) override.
+/// Recurses to [`MAX_SCAN_DEPTH`], collecting every `*.jsonl` with its
+/// (mtime, size) fingerprint. Platform-specific overrides must match this
+/// traversal or the two disagree on which sessions exist.
 pub fn default_scan(dir: &Path) -> Vec<SourceFile> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return vec![];
-    };
     let mut out: Vec<SourceFile> = Vec::with_capacity(256);
-    for e in entries.flatten() {
-        let d = e.path();
-        let Ok(sub) = fs::read_dir(&d) else { continue };
-        for f in sub.flatten() {
-            let p = f.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Ok(meta) = f.metadata() else { continue };
-            if !meta.is_file() {
-                continue;
-            }
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_secs());
-            out.push(SourceFile {
-                path_hash: path_hash(&p),
-                path: p,
-                mtime,
-                size: meta.len(),
-            });
-        }
-    }
+    scan_dir_recursive(dir, MAX_SCAN_DEPTH, &mut out);
     out
+}
+
+fn scan_dir_recursive(dir: &Path, depth_left: usize, out: &mut Vec<SourceFile>) {
+    if depth_left == 0 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        // metadata() follows symlinks, so symlinked project dirs stay
+        // traversable.
+        let Ok(meta) = e.metadata() else { continue };
+        if meta.is_dir() {
+            scan_dir_recursive(&p, depth_left - 1, out);
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        out.push(SourceFile {
+            path_hash: path_hash(&p),
+            path: p,
+            mtime,
+            size: meta.len(),
+        });
+    }
 }
 
 // ── Source registry ──

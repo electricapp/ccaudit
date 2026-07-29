@@ -579,13 +579,12 @@ function buildFlatMap() {
 
 S.addEventListener('input', (e) => {
   q = e.target.value.toLowerCase();
-  // Global search at 2+ chars when in projects/sessions/search view
+  // Switch on length alone, not on "did it match": gating on hits left an
+  // unmatchable query showing the previous list with no feedback, so the
+  // box read as broken. rSearch explains an empty result.
   if (q.length >= 2 && view !== 'messages') {
-    const res = doSearch(q);
-    if (res.length || view === 'search') {
-      sq = q;
-      view = 'search';
-    }
+    sq = q;
+    view = 'search';
   } else if (view === 'search' && q.length < 2) {
     view = prevView || 'projects';
     sq = '';
@@ -960,10 +959,26 @@ function hlCode(text) {
 }
 
 // --- Search engine ---
-function tokenize(text) {
-  const r = [];
-  const m = text.toLowerCase().match(/[a-z][a-z0-9_]{2,}/g);
-  return m || r;
+//
+// `tokenize` lives in util.js next to its contract with the Rust indexer.
+
+// Vocabulary sorted once for prefix lookups. Scanning every key per
+// keystroke was O(vocabulary) — ~23k comparisons plus a full posting-list
+// union, growing with history, on nearly every keystroke.
+let sixKeysCache = null;
+function sixKeys() {
+  if (!sixKeysCache) sixKeysCache = Object.keys(SIX.w).sort();
+  return sixKeysCache;
+}
+
+// Union of every posting list whose word starts with `term`.
+function prefixPostings(term) {
+  const keys = sixKeys();
+  const merged = new Set();
+  for (let i = lowerBound(keys, term); i < keys.length && keys[i].startsWith(term); i++) {
+    for (const id of SIX.w[keys[i]]) merged.add(id);
+  }
+  return merged.size ? [...merged] : null;
 }
 
 function doSearch(query) {
@@ -977,13 +992,7 @@ function doSearch(query) {
     const isLast = ti === terms.length - 1;
     let posting = SIX.w[term];
     // Prefix match for last (partial) term
-    if (!posting && isLast) {
-      const merged = new Set();
-      for (const w in SIX.w) {
-        if (w.startsWith(term)) for (const id of SIX.w[w]) merged.add(id);
-      }
-      if (merged.size) posting = [...merged];
-    }
+    if (!posting && isLast) posting = prefixPostings(term);
     if (!posting || !posting.length) return [];
     if (!hits) {
       hits = new Set(posting);
@@ -1296,6 +1305,15 @@ function rSessions() {
 
 // --- Search results view ---
 function rSearch() {
+  // A non-empty query can carry no indexable term (one letter, all
+  // punctuation). "no matches" would imply we searched.
+  if (!tokenize(sq).length) {
+    M.innerHTML = emptyState(
+      'nothing to search for',
+      'Terms need 3+ characters — 2 for non-Latin scripts, or a 2-6 digit number.'
+    );
+    return;
+  }
   const all = doSearch(sq);
   const res = all.filter((r) => inDate(r.s.started_at) && inModel(r.s));
   if (!res.length) {
@@ -1459,17 +1477,16 @@ function rMessages() {
       ' matches &mdash; <kbd>n</kbd>/<kbd>N</kbd> to jump</span>';
   }
   h += '<div class="filters">';
-  // Resume copies `claude -r <id>` to the clipboard. Lives just left
-  // of the detail dropdown so the "act on this session" affordance is
-  // grouped with the other session controls. The id rides in a data
-  // attribute and the copy happens in the delegated click handler —
-  // an inline onclick would put the id in a JS-string context, where
-  // HTML-escaping alone can't stop a crafted id breaking out.
+  // Resume copies the command to the clipboard. It rides in a data
+  // attribute read by the delegated click handler — an inline onclick
+  // would put it in a JS-string context, where HTML-escaping alone can't
+  // stop a crafted id breaking out.
+  const rcmd = resumeCmd(s);
   h +=
-    '<button class="pbtn resume" title="copy `claude -r ' +
-    esc(s.id) +
+    '<button class="pbtn resume" title="copy `' +
+    esc(rcmd) +
     '`" data-resume="' +
-    esc(s.id) +
+    esc(rcmd) +
     '">resume</button>';
   // Custom dropdown (matches site theme, no OS popup).
   h += '<div class="drop" data-drop="detail" title="detail level">';
@@ -2823,12 +2840,12 @@ document.addEventListener('mouseout', (e) => {
 document.addEventListener('click', (e) => {
   if (!e.target.closest) return;
 
-  // Resume button: the session id is read back from the data attribute
+  // Resume button: the command is read back from the data attribute
   // (getAttribute entity-decodes, and it's never eval'd), so a hostile
   // session id can't escape into script.
   const rb = e.target.closest('[data-resume]');
   if (rb) {
-    navigator.clipboard.writeText('claude -r ' + rb.getAttribute('data-resume'));
+    navigator.clipboard.writeText(rb.getAttribute('data-resume'));
     rb.textContent = 'copied!';
     e.stopPropagation();
     return;

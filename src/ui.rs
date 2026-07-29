@@ -36,7 +36,12 @@ enum View {
 /// quits cleanly and `main.rs` runs the action after terminal teardown,
 /// so the new process inherits a clean stdio.
 pub enum PostAction {
-    Resume(String),
+    /// Resume `id` in Claude Code from `cwd` — `claude -r` resolves against
+    /// the project derived from the current directory.
+    Resume {
+        id: String,
+        cwd: Option<String>,
+    },
     OpenWeb,
 }
 
@@ -369,6 +374,13 @@ impl App {
         }
 
         match key.code {
+            // A committed filter (typed, then Enter) hides the input box
+            // but keeps the list narrowed — clear it before quitting or
+            // stepping back.
+            KeyCode::Char('q') | KeyCode::Esc if !self.search_query.is_empty() => {
+                self.search_query.clear();
+                self.update_filter();
+            }
             KeyCode::Char('q') | KeyCode::Esc => match self.view {
                 View::Projects => self.quit = true,
                 View::Dashboard => self.view = View::Projects,
@@ -383,8 +395,8 @@ impl App {
             // session in Claude Code. Handed off to main.rs after the
             // TUI tears down so `claude` gets a clean terminal.
             KeyCode::Char('c') => {
-                if let Some(id) = self.current_session_id() {
-                    self.post_action = Some(PostAction::Resume(id));
+                if let Some((id, cwd)) = self.current_resume_target() {
+                    self.post_action = Some(PostAction::Resume { id, cwd });
                     self.quit = true;
                 }
             }
@@ -411,6 +423,9 @@ impl App {
             KeyCode::Char('/') if matches!(self.view, View::Projects | View::Sessions) => {
                 self.searching = true;
                 self.search_query.clear();
+                // Without this the previous query's filtered list stays on
+                // screen under an empty search box until the next keystroke.
+                self.update_filter();
             }
             KeyCode::Char('j') | KeyCode::Down => self.move_down(),
             KeyCode::Char('k') | KeyCode::Up => self.move_up(),
@@ -641,21 +656,27 @@ impl App {
         }
     }
 
-    fn current_session_id(&self) -> Option<String> {
-        match self.view {
+    /// `(conversation_id, cwd)` for the highlighted session. The id is the
+    /// resumable conversation, which for a subagent transcript is its
+    /// parent — see `claude_code::resume_target_of`.
+    fn current_resume_target(&self) -> Option<(String, Option<String>)> {
+        let session = match self.view {
             View::Sessions => {
                 let pi = self.selected_project?;
                 let i = self.session_state.selected()?;
                 let &si = self.filtered_sessions.get(i)?;
-                Some(self.projects[pi].sessions[si].id.clone())
+                self.projects.get(pi)?.sessions.get(si)?
             }
             View::Messages => {
                 let pi = self.selected_project?;
                 let si = self.selected_session?;
-                Some(self.projects[pi].sessions[si].id.clone())
+                self.projects.get(pi)?.sessions.get(si)?
             }
-            _ => None,
-        }
+            _ => return None,
+        };
+        let id = crate::source::claude_code::resume_target_of(&session.file_path)
+            .unwrap_or_else(|| session.id.clone());
+        Some((id, session.cwd.clone()))
     }
 
     fn update_filter(&mut self) {
@@ -721,6 +742,26 @@ impl App {
         self.render_statusbar(f, chunks[1]);
     }
 
+    /// Status-bar segment for an active filter, e.g. ` | filter "auth" 3/91`.
+    /// Enter leaves search mode but keeps the query, so without this the
+    /// only evidence of the filter is missing rows.
+    fn filter_note(&self) -> String {
+        if self.search_query.is_empty() {
+            return String::new();
+        }
+        let (shown, total) = match self.view {
+            View::Projects => (self.filtered_projects.len(), self.projects.len()),
+            View::Sessions => (
+                self.filtered_sessions.len(),
+                self.selected_project
+                    .and_then(|pi| self.projects.get(pi))
+                    .map_or(0, |p| p.sessions.len()),
+            ),
+            View::Messages | View::Dashboard => return String::new(),
+        };
+        format!(" | filter {:?} {shown}/{total}", self.search_query)
+    }
+
     fn render_statusbar(&self, f: &mut Frame, area: Rect) {
         // Status bar repaints on every key. The dashboard struct holds the
         // global totals (computed once in App::new) so we don't re-walk
@@ -728,10 +769,11 @@ impl App {
         let (left, right) = match self.view {
             View::Projects => (
                 format!(
-                    " {} projects | {} sessions | {}",
+                    " {} projects | {} sessions | {}{}",
                     self.projects.len(),
                     format_number(self.dashboard.total_sessions as u64),
                     format_cost(self.dashboard.total_cost),
+                    self.filter_note(),
                 ),
                 String::from(
                     "j/k nav | / search | enter select | o open web | d dashboard | q quit ",
@@ -742,10 +784,11 @@ impl App {
                     let p = &self.projects[pi];
                     (
                         format!(
-                            " {} | {} sessions | {}",
+                            " {} | {} sessions | {}{}",
                             p.name,
                             format_number(p.sessions.len() as u64),
                             format_cost(p.total_cost),
+                            self.filter_note(),
                         ),
                         String::from(
                             "j/k nav | / search | enter view | tab detail | c resume | o web | esc back ",

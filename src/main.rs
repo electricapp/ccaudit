@@ -91,8 +91,8 @@ fn main() {
             {
                 let projects = parse::load_all_projects(source::pick(opts.source));
                 match run_tui(projects) {
-                    Ok(Some(ui::PostAction::Resume(id))) => {
-                        resume_session(&id);
+                    Ok(Some(ui::PostAction::Resume { id, cwd })) => {
+                        resume_session(&id, cwd.as_deref());
                     }
                     Ok(Some(ui::PostAction::OpenWeb)) => {
                         #[cfg(feature = "web")]
@@ -161,7 +161,9 @@ fn main() {
             // unfiltered — or silently empty — totals under the user's
             // filter would misrepresent the data.
             if let Some(name) = opts.project.as_deref() {
-                if cache::resolve_project_filter(&cache, Some(name)) == Some(u16::MAX) {
+                if cache::resolve_project_filter(&cache, Some(name))
+                    == cache::ProjectFilter::NoMatch
+                {
                     eprintln!("error: unknown project {name:?}");
                     eprintln!("Run `ccaudit session` to list project names.");
                     process::exit(2);
@@ -251,22 +253,33 @@ fn run_tui(projects: Vec<parse::Project>) -> std::io::Result<Option<ui::PostActi
 #[cfg(feature = "tui")]
 // Writes an exec-failed error to stderr before exiting non-zero.
 #[allow(clippy::print_stderr)]
-fn resume_session(id: &str) {
+fn resume_session(id: &str, cwd: Option<&str>) {
     use std::process::Command;
-    // Replace our process with `claude -r <id>` on Unix so the user's
-    // shell ends up talking to Claude directly. Falls back to spawn+wait
+    let mut cmd = Command::new("claude");
+    let _ = cmd.args(["-r", id]);
+    // `claude -r` resolves the conversation under the project derived from
+    // the working directory, so resuming any other project's session needs
+    // a chdir first. A recorded cwd that no longer exists is skipped —
+    // chdir would fail and blame `claude` rather than the stale path.
+    if let Some(dir) = cwd {
+        if std::path::Path::new(dir).is_dir() {
+            let _ = cmd.current_dir(dir);
+        } else {
+            eprintln!("note: {dir} no longer exists; resuming from the current directory");
+        }
+    }
+    // exec on Unix so the user's shell talks to Claude directly; spawn+wait
     // elsewhere. If `claude` isn't on PATH the exec fails and we print.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let err = Command::new("claude").args(["-r", id]).exec();
+        let err = cmd.exec();
         eprintln!("failed to exec claude: {err}");
         process::exit(1);
     }
     #[cfg(not(unix))]
     {
-        let status = Command::new("claude").args(["-r", id]).status();
-        match status {
+        match cmd.status() {
             Ok(s) => process::exit(s.code().unwrap_or(0)),
             Err(e) => {
                 eprintln!("failed to run claude: {e}");

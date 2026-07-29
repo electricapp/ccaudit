@@ -21,11 +21,20 @@ pub struct BuiltCache {
 }
 
 pub fn build<S: Source + ?Sized>(mut parsed: Vec<ParsedSession>, source: &S) -> BuiltCache {
+    // u16::MAX is the "unknown model" / "no project" sentinel, so a table
+    // holds at most that many real entries. Past it `len() as u16` wraps
+    // onto ids already in use, mispricing every line that referenced them;
+    // folding onto the sentinel prices via the provider fallback instead.
+    const INTERN_LIMIT: usize = u16::MAX as usize;
+
     let mut model_table: Vec<String> = Vec::new();
     let mut model_index: FxHashMap<String, u16> = FxHashMap::default();
     let mut intern_model = |s: &str| -> u16 {
         if let Some(&id) = model_index.get(s) {
             return id;
+        }
+        if model_table.len() >= INTERN_LIMIT {
+            return u16::MAX;
         }
         let id = model_table.len() as u16;
         model_table.push(s.to_string());
@@ -38,6 +47,9 @@ pub fn build<S: Source + ?Sized>(mut parsed: Vec<ParsedSession>, source: &S) -> 
     let mut intern_project = |s: &str| -> u16 {
         if let Some(&id) = project_index.get(s) {
             return id;
+        }
+        if project_table.len() >= INTERN_LIMIT {
+            return u16::MAX;
         }
         let id = project_table.len() as u16;
         project_table.push(s.to_string());

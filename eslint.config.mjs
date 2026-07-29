@@ -35,6 +35,10 @@ export default [
         costParts: 'readonly',
         tokTip: 'readonly',
         costTip: 'readonly',
+        tokenize: 'readonly',
+        lowerBound: 'readonly',
+        shq: 'readonly',
+        resumeCmd: 'readonly',
       },
     },
     rules: {

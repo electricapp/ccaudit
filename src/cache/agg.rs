@@ -298,8 +298,7 @@ pub fn aggregate<S: Source + ?Sized>(
         // msg_ids unclaimed, letting a message duplicated into another
         // project be counted there. Same dedup-before-filter rule the
         // date filter follows and build-time preagg dedup uses.
-        let project_matches =
-            project_filter_id.is_none() || Some(sess.project_id) == project_filter_id;
+        let project_matches = project_filter_id.matches(sess.project_id);
         let line_range =
             sess.line_start as usize..(sess.line_start as usize + sess.line_count as usize);
         let fallback_model_id = sess.session_model_id;
@@ -403,18 +402,43 @@ pub fn aggregate<S: Source + ?Sized>(
     out
 }
 
-/// Resolve a `--project` value to its intern id for filtering.
+/// Outcome of resolving `--project NAME`.
+///
+/// `Option<u16>` can't express this: `u16::MAX` is a real stored
+/// `project_id` ("no project concept"), so reusing it as "matched
+/// nothing" made an unknown `--project` match exactly those sessions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectFilter {
+    /// No `--project` was given — every session matches.
+    All,
+    /// The name resolved to this interned project id.
+    Only(u16),
+    /// Matched no known project → nothing matches. Deliberately not
+    /// "everything": global totals under a project filter misreport.
+    /// (`main` also rejects unknown names up front.)
+    NoMatch,
+}
+
+impl ProjectFilter {
+    pub const fn matches(self, project_id: u16) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(id) => project_id == id,
+            Self::NoMatch => false,
+        }
+    }
+}
+
+/// Resolve a `--project` value for filtering.
 ///
 /// Accepts the stored slash form (`code/beta`) and the ccusage-stem form
 /// the `session` report displays (`code-beta`), so a label copied from
-/// our own output round-trips. A name that matches nothing resolves to
-/// the impossible id `u16::MAX`: the filter then matches zero sessions,
-/// rather than silently disabling itself and presenting global totals
-/// as if they were project-scoped. (`main` additionally rejects unknown
-/// names up front with a proper error.)
-pub fn resolve_project_filter(cache: &LoadedCache, project: Option<&str>) -> Option<u16> {
-    let name = project?;
-    let id = cache
+/// our own output round-trips.
+pub fn resolve_project_filter(cache: &LoadedCache, project: Option<&str>) -> ProjectFilter {
+    let Some(name) = project else {
+        return ProjectFilter::All;
+    };
+    cache
         .projects
         .iter()
         .position(|p| p == name)
@@ -424,8 +448,8 @@ pub fn resolve_project_filter(cache: &LoadedCache, project: Option<&str>) -> Opt
                 .iter()
                 .position(|p| crate::report::fmt::ccusage_stem(p) == name)
         })
-        .map_or(u16::MAX, |i| i as u16);
-    Some(id)
+        .and_then(|i| u16::try_from(i).ok())
+        .map_or(ProjectFilter::NoMatch, ProjectFilter::Only)
 }
 
 // Fast path: Day/Month rollup in UTC. Sums over the pre-aggregated table
@@ -455,7 +479,7 @@ fn aggregate_from_preaggs(
                 continue;
             }
         }
-        if project_filter_id.is_some() && Some(p.project_id) != project_filter_id {
+        if !project_filter_id.matches(p.project_id) {
             continue;
         }
 

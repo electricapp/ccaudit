@@ -26,7 +26,7 @@ pub fn print<S: Source + ?Sized>(
             if p.day != today {
                 continue;
             }
-            if project_filter_id.is_some() && Some(p.project_id) != project_filter_id {
+            if !project_filter_id.matches(p.project_id) {
                 continue;
             }
             input += u64::from(p.input);
@@ -54,6 +54,11 @@ pub fn print<S: Source + ?Sized>(
     let total = input + output + cc + cr;
 
     let block_filter = FilterOpts {
+        // Only the active block is shown and a block spans at most
+        // BLOCK_SECS, so nothing older than yesterday can land in it.
+        // Block bucketing is per-line, so without this bound the status
+        // bar re-walks the whole history on every poll.
+        since_day: Some(today - 1),
         project: opts.project.as_deref(),
         tz_offset_secs: opts.tz_offset_secs,
         ..Default::default()

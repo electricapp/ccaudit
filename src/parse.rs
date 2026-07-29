@@ -1010,7 +1010,13 @@ pub fn load_all_projects_with_cache<S: crate::source::Source + ?Sized>(
         .par_iter()
         .filter_map(|src| {
             let file = &src.path;
-            let dir = file.parent()?.to_path_buf();
+            // Group by the project directory, not the file's immediate
+            // parent: subagent transcripts live at
+            // `<project>/<uuid>/subagents/agent-*.jsonl`, and bucketing
+            // those by `parent()` would invent a `subagents` project per
+            // conversation instead of folding them into the real one.
+            let dir = crate::source::claude_code::project_root_of(file)
+                .or_else(|| file.parent().map(Path::to_path_buf))?;
             let path_hash = src.path_hash;
             // Header-only fast path — skips deserializing the messages
             // blob, which is what made warm cold-starts expensive.

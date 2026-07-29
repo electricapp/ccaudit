@@ -45,6 +45,21 @@ impl Harness {
         path
     }
 
+    /// Write a JSONL file at `<project>/<rel>`, creating intermediate dirs.
+    ///
+    /// Claude Code nests subagent transcripts below the project dir
+    /// (`<uuid>/subagents/agent-*.jsonl`), and deeper still for workflow
+    /// agents. Tests use this to pin that those files are scanned.
+    #[allow(dead_code)]
+    pub fn write_jsonl_nested(&self, slug: &str, rel: &str, lines: &[&str]) -> PathBuf {
+        let path = self.project_dir(slug).join(rel);
+        std::fs::create_dir_all(path.parent().expect("nested path has a parent"))
+            .expect("mk nested dir");
+        let body = lines.join("\n") + "\n";
+        std::fs::write(&path, body).expect("write nested jsonl");
+        path
+    }
+
     /// Invoke the binary built by `cargo build --release`.
     pub fn run(&self, args: &[&str]) -> Output {
         self.base_cmd().args(args).output().expect("spawn ccaudit")
@@ -116,6 +131,9 @@ fn cargo_root() -> PathBuf {
 // Small helpers so individual tests stay readable instead of drowning in
 // raw escape sequences.
 
+// Each test binary compiles `mod common` from scratch, so a helper only
+// some of them use reads as dead code in the others.
+#[allow(dead_code)]
 pub fn summary_line(text: &str) -> String {
     let v = serde_json::json!({
         "type": "summary",

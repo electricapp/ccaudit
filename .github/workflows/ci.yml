@@ -73,6 +73,55 @@ jobs:
       - name: test
         run: cargo test --release --all-features
 
+  # ── Declared toolchain, minimal image ──
+  # Compiles the crate in a bare `rust:<msrv>-slim-bookworm` container: no
+  # rustup step, no runner-preinstalled build tooling. That makes it both
+  # the cheapest lane and the one that catches what the fat ubuntu runner
+  # masks — a new dep needing a system library that only happens to be
+  # present on the GitHub image (mimalloc, for one, compiles C here).
+  #
+  # Digest-pinned like every action in this repo; the tag comment is the
+  # human-readable version. Bump both together with `rust-version`.
+  # `check`, not clippy: lint names and defaults shift between releases,
+  # so this lane asserts the crate *compiles* on the declared toolchain —
+  # the lint gate is the `rust` job above.
+  toolchain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container:
+      image: rust@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177602ccf6eab326d778ee777 # rust:1.97-slim-bookworm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The image tag and Cargo.toml's `rust-version` are two independent
+      # declarations of the same fact. Fail loudly when they drift instead
+      # of quietly testing a version we don't claim to support.
+      - name: Assert image matches the declared rust-version
+        run: |
+          set -eu
+          WANT=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          GOT=$(rustc --version | cut -d' ' -f2)
+          echo "Cargo.toml rust-version=$WANT, image rustc=$GOT"
+          case "$GOT" in
+            "$WANT"|"$WANT".*) ;;
+            *) echo "::error::container rustc $GOT does not satisfy rust-version $WANT"; exit 1 ;;
+          esac
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-toolchain-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-toolchain-
+
+      - name: check (all features, all targets)
+        run: cargo check --locked --all-features --all-targets
+
   # ── Web assets: prettier + eslint + stylelint + JS unit tests ──
   web:
     runs-on: ubuntu-24.04

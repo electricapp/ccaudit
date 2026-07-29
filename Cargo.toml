@@ -2,6 +2,12 @@
 name = "ccaudit"
 version = "0.1.0"
 edition = "2024"
+# Declared minimum supported Rust (org standard §3), enforced by CI's
+# `toolchain` job. Set to current stable rather than the technical floor
+# (transitive deps compile as far back as 1.88) — ccaudit ships prebuilt
+# binaries and tracks stable, so there's no older-compiler audience to
+# hold the codebase back for.
+rust-version = "1.97"
 description = "Fast Claude Code log viewer — CLI + TUI + web. Token usage, cost, and full conversation history."
 license = "MIT"
 readme = "README.md"

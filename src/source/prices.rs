@@ -14,6 +14,7 @@
 
 use super::{Pricing, SourceKind};
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -46,9 +47,10 @@ pub struct PricesLookup {
     // Keyed by the raw LiteLLM model name. Provider impls decide how to
     // match (exact / prefix / substring).
     entries: HashMap<String, Pricing>,
-    // Lowercase copy of each key for case-insensitive substring match
-    // (mirrors ccusage's fallback step).
-    lower_keys: Vec<(String, String)>, // (lower, original)
+    // Lowercased key + rate for the case-insensitive substring fallback.
+    // Inlining Pricing (32 bytes, Copy) saves ~3k key clones at load and a
+    // second hash lookup per fallback hit.
+    lower_keys: Vec<(String, Pricing)>,
 }
 
 impl PricesLookup {
@@ -69,16 +71,21 @@ impl PricesLookup {
         }
         let name = candidates.first()?;
         let lower = name.to_ascii_lowercase();
-        let mut best: Option<(usize, &str)> = None;
-        for (k_lower, k) in &self.lower_keys {
+        let mut best: Option<(usize, &Pricing)> = None;
+        for (k_lower, pricing) in &self.lower_keys {
+            // Cheap reject before the boundary scan: a key longer than the
+            // haystack can't be a substring of it.
+            if k_lower.len() > lower.len() {
+                continue;
+            }
             if contains_at_boundary(&lower, k_lower) {
                 let len = k_lower.len();
                 if best.is_none_or(|(b, _)| len > b) {
-                    best = Some((len, k.as_str()));
+                    best = Some((len, pricing));
                 }
             }
         }
-        best.and_then(|(_, k)| self.entries.get(k))
+        best.map(|(_, p)| p)
     }
 }
 
@@ -141,12 +148,18 @@ fn load() -> Option<PricesLookup> {
 }
 
 fn parse(bytes: &[u8]) -> Result<PricesLookup, String> {
-    let raw: HashMap<String, serde_json::Value> =
+    // Capture each model's body as an unparsed span and deserialize only
+    // the four cost fields. A `serde_json::Value` tree for all ~3k models
+    // cost ~2 ms on every command that prices a line — worst on
+    // `statusline`, which polls. RawValue borrows straight out of `bytes`.
+    let raw: HashMap<&str, &RawValue> =
         serde_json::from_slice(bytes).map_err(|e| format!("parse prices.json: {e}"))?;
 
     let mut entries: HashMap<String, Pricing> = HashMap::with_capacity(raw.len());
     for (name, value) in raw {
-        let Ok(e) = serde_json::from_value::<LiteLLMEntry>(value) else {
+        // Non-object values (LiteLLM's `sample_spec` stub) aren't rate
+        // entries — skip rather than failing the whole file.
+        let Ok(e) = serde_json::from_str::<LiteLLMEntry>(value.get()) else {
             continue;
         };
         // We need at least input + output to price anything meaningfully.
@@ -166,11 +179,11 @@ fn parse(bytes: &[u8]) -> Result<PricesLookup, String> {
                 .map(|c| c * 1_000_000.0)
                 .unwrap_or(in_c * 1_000_000.0 * 0.1),
         };
-        let _ = entries.insert(name, p);
+        let _ = entries.insert(name.to_string(), p);
     }
-    let lower_keys: Vec<(String, String)> = entries
-        .keys()
-        .map(|k| (k.to_ascii_lowercase(), k.clone()))
+    let lower_keys: Vec<(String, Pricing)> = entries
+        .iter()
+        .map(|(k, p)| (k.to_ascii_lowercase(), *p))
         .collect();
     Ok(PricesLookup {
         entries,
@@ -275,8 +288,8 @@ mod tests {
             );
         }
         let lower_keys = entries
-            .keys()
-            .map(|k| (k.to_ascii_lowercase(), k.clone()))
+            .iter()
+            .map(|(k, p)| (k.to_ascii_lowercase(), *p))
             .collect();
         PricesLookup {
             entries,

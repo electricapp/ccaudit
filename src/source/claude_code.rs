@@ -73,8 +73,11 @@ impl Source for ClaudeCode {
         //    a code change. Multiple name variants are tried (exact +
         //    `anthropic/` prefix + date-stripped form) to cover how
         //    LiteLLM tends to key Claude models.
-        if let Some(lookup) = super::prices::get() {
-            if let Some(name) = model {
+        // `model` first: `price(None)` has nothing to look up, and
+        // `prices::get()` would force the whole LiteLLM table to load just
+        // to fall through. `ModelRates::build` calls it on every run.
+        if let Some(name) = model {
+            if let Some(lookup) = super::prices::get() {
                 let (candidates, len) = claude_name_candidates(name);
                 #[allow(clippy::indexing_slicing)]
                 if let Some(p) = lookup.lookup(&candidates[..len]) {
@@ -205,6 +208,24 @@ pub fn prettify_project_name(raw: &str) -> String {
     super::prettify_user_path(&parts).unwrap_or_else(|| raw.to_string())
 }
 
+/// The project dir a session file belongs to.
+///
+/// The direct child of `~/.claude/projects` containing `path`, however
+/// deeply nested. `path.parent()` only works for the flat layout — a
+/// subagent transcript's parent is `subagents`, which would otherwise be
+/// read as the project name.
+pub fn project_root_of(path: &Path) -> Option<PathBuf> {
+    let root = logs_root()?;
+    let first = path.strip_prefix(root).ok()?.components().next()?;
+    Some(root.join(first))
+}
+
+// Runs once per scanned session; the logs root can't change mid-process.
+fn logs_root() -> Option<&'static Path> {
+    static ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| ClaudeCode.logs_dir()).as_deref()
+}
+
 fn project_name_for(path: &Path, cwd: Option<&str>) -> Option<String> {
     if let Some(c) = cwd {
         let pretty = super::prettify_cwd(c);
@@ -212,7 +233,11 @@ fn project_name_for(path: &Path, cwd: Option<&str>) -> Option<String> {
             return Some(pretty);
         }
     }
-    path.parent()
+    // Dash-encoded project dir name, resolved from the logs root so
+    // nested sessions still land on their real project.
+    project_root_of(path)
+        .as_deref()
+        .or_else(|| path.parent())
         .and_then(|p| p.file_name())
         .and_then(|s| s.to_str())
         .map(prettify_project_name)
@@ -224,6 +249,26 @@ fn session_id_for(path: &Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string()
+}
+
+/// The conversation id `claude -r` can resume for a session file.
+///
+/// A flat `<project>/<uuid>.jsonl` resumes as `<uuid>`. A subagent
+/// transcript isn't resumable itself — `claude` only knows its parent,
+/// whose id is the directory below the project root. `None` for paths
+/// outside the logs root; callers fall back to the file stem.
+pub fn resume_target_of(path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(logs_root()?).ok()?;
+    let mut comps = rel.components();
+    let _project_dir = comps.next()?;
+    let name = comps.next()?.as_os_str().to_str()?;
+    if comps.next().is_none() {
+        // Flat layout: this component is the session file itself.
+        Some(name.strip_suffix(".jsonl").unwrap_or(name).to_string())
+    } else {
+        // Nested: `name` is the parent conversation's directory.
+        Some(name.to_string())
+    }
 }
 
 // Single source for the session-display-name fallback chain. `Session::display_name`
@@ -296,45 +341,46 @@ fn to_parsed_session(path: &Path, src: &SourceFile, session: &Session) -> Parsed
 // `None` on any FFI error so the caller can retry with default_scan.
 #[cfg(target_os = "macos")]
 fn scan_with_bulk(dir: &Path) -> Option<Vec<SourceFile>> {
+    let mut out: Vec<SourceFile> = Vec::with_capacity(256);
+    bulk_scan_recursive(dir, super::MAX_SCAN_DEPTH, &mut out)?;
+    Some(out)
+}
+
+// Must match `default_scan`'s traversal: the cache validates by session
+// count, so a path only one scanner sees flips the cache between valid
+// and stale depending on CCAUDIT_BULK_SCAN. `None` on any FFI error so
+// the caller retries the whole tree portably.
+#[cfg(target_os = "macos")]
+fn bulk_scan_recursive(dir: &Path, depth_left: usize, out: &mut Vec<SourceFile>) -> Option<()> {
     use super::bulk_scan_darwin::scan as bulk_scan;
     use super::path_hash;
-    use std::fs;
 
-    // Outer directory: we only need subdir names, so readdir + d_type is
-    // already fine. Bulk-scanning the outer dir too would buy nothing.
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Some(vec![]);
-    };
-
-    let mut out: Vec<SourceFile> = Vec::with_capacity(256);
-    for e in entries.flatten() {
-        let subdir = e.path();
-        // `is_dir()` follows symlinks, matching default_scan's
-        // `fs::read_dir` — so a symlinked project dir is scanned the same
-        // way whether or not CCAUDIT_BULK_SCAN is set.
-        if !subdir.is_dir() {
+    if depth_left == 0 {
+        return Some(());
+    }
+    let items = bulk_scan(dir)?;
+    for item in items {
+        let p = dir.join(&item.name);
+        if !item.is_regular_file {
+            // getattrlistbulk reports the entry's own type, so a symlinked
+            // dir arrives as non-regular; is_dir() follows links.
+            if p.is_dir() {
+                bulk_scan_recursive(&p, depth_left - 1, out)?;
+            }
             continue;
         }
-        // One syscall for all entries in this subdir.
-        let items = bulk_scan(&subdir)?;
-        for item in items {
-            if !item.is_regular_file {
-                continue;
-            }
-            // Exact, case-sensitive ".jsonl" — identical to default_scan,
-            // so the bulk path can't include `FOO.JSONL` that the portable
-            // path would skip (or vice-versa).
-            if Path::new(&item.name).extension().and_then(|x| x.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let p = subdir.join(&item.name);
-            out.push(SourceFile {
-                path_hash: path_hash(&p),
-                path: p,
-                mtime: item.mtime_secs,
-                size: item.size,
-            });
+        // Exact, case-sensitive ".jsonl" — identical to default_scan,
+        // so the bulk path can't include `FOO.JSONL` that the portable
+        // path would skip (or vice-versa).
+        if Path::new(&item.name).extension().and_then(|x| x.to_str()) != Some("jsonl") {
+            continue;
         }
+        out.push(SourceFile {
+            path_hash: path_hash(&p),
+            path: p,
+            mtime: item.mtime_secs,
+            size: item.size,
+        });
     }
-    Some(out)
+    Some(())
 }
