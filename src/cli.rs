@@ -169,6 +169,18 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         ..Default::default()
     };
 
+    // Accept `--flag=value` by expanding it into `--flag value` before
+    // the match below — both spellings are common muscle memory. A
+    // boolean flag given `=value` then fails loudly as an unexpected
+    // argument instead of being misreported as an unknown flag.
+    let args: Vec<String> = args
+        .iter()
+        .flat_map(|a| match a.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => vec![f.to_string(), v.to_string()],
+            _ => vec![a.clone()],
+        })
+        .collect();
+
     // First positional token, if present, may be a subcommand.
     let mut i = 0usize;
     let mut cmd_explicit = false;
@@ -208,9 +220,16 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
     while i < args.len() {
         let a = args.get(i).map(String::as_str).unwrap_or("");
         let next = || -> Result<&str, String> {
-            args.get(i + 1)
-                .map(String::as_str)
-                .ok_or_else(|| format!("missing value for {a}"))
+            // A `--`-prefixed token is the next flag, not this flag's
+            // value: `ccaudit daily --project --json` must error, not
+            // swallow `--json` as the project name and drop the request.
+            match args.get(i + 1).map(String::as_str) {
+                None => Err(format!("missing value for {a}")),
+                Some(v) if v.starts_with("--") => Err(format!(
+                    "missing value for {a} (found the flag {v} instead)"
+                )),
+                Some(v) => Ok(v),
+            }
         };
         match a {
             "--help" | "-h" => {
@@ -390,6 +409,31 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         }
     }
 
+    if let (Some(s), Some(u)) = (o.since, o.until) {
+        if s > u {
+            return Err(
+                "--since is after --until — the range matches nothing (dates transposed?)"
+                    .to_string(),
+            );
+        }
+    }
+
+    // --locale is parsed unconditionally so lean builds can explain what
+    // to do instead of silently ignoring the flag.
+    #[cfg(not(feature = "locale"))]
+    if o.locale.is_some() {
+        return Err("--locale requires a build with the `locale` feature \
+             (e.g. `cargo install ccaudit --features full`)"
+            .to_string());
+    }
+    #[cfg(feature = "locale")]
+    if let Some(l) = o.locale.as_deref() {
+        let norm = l.replace('-', "_");
+        if chrono::Locale::try_from(norm.as_str()).is_err() {
+            return Err(format!("unknown locale {l:?} (expected e.g. en_US, ja_JP)"));
+        }
+    }
+
     // Help and `--version` bypass flag scoping — the user asked for one of
     // those, so honor it instead of erroring on an out-of-scope flag
     // (`ccaudit blocks --active --version` should print the version).
@@ -500,7 +544,7 @@ fn validate_flag_scopes(o: &Options) -> Result<(), String> {
     let report_flag = |name: &str| -> Result<(), String> {
         if !REPORT_CMDS.contains(&o.cmd) {
             Err(format!(
-                "{name} only applies to daily / monthly / session / blocks reports"
+                "{name} only applies to daily / weekly / monthly / session / blocks reports"
             ))
         } else {
             Ok(())
@@ -559,6 +603,14 @@ fn validate_flag_scopes(o: &Options) -> Result<(), String> {
     }
     if o.blocks_active && o.blocks_recent {
         return Err("--active and --recent are mutually exclusive".to_string());
+    }
+    if o.blocks_live && o.blocks_recent {
+        // `--live` pins the view to the active block; honoring --recent is
+        // impossible, so reject rather than silently dropping it.
+        return Err(
+            "--live and --recent are mutually exclusive (--live shows only the active block)"
+                .to_string(),
+        );
     }
 
     // Web-only.
@@ -674,7 +726,9 @@ fn parse_timezone(s: &str) -> Result<(i32, String), String> {
     };
     let (h, m) = if let Some((h, m)) = rest.split_once(':') {
         (h, m)
-    } else if rest.len() == 4 {
+    } else if rest.len() == 4 && rest.bytes().all(|b| b.is_ascii_digit()) {
+        // All-ASCII check first: `split_at(2)` on multibyte input (e.g.
+        // `+€0`, 4 bytes) would panic on a non-char-boundary.
         rest.split_at(2)
     } else {
         return Err(format!("bad offset {s:?}"));
@@ -726,18 +780,18 @@ pub fn print_help() {
     // skim; the two-space command/flag columns line up for scanning.
     println!("NAME:");
     println!("   ccaudit - fast Claude Code token usage analyzer");
-    println!("   version {}", version_core());
     println!();
     println!("USAGE:");
     println!("   ccaudit [COMMAND] [FLAGS]");
     println!();
+    println!("VERSION:");
+    println!("   {}", version_core());
+    println!();
     println!("DESCRIPTION:");
-    println!("   ccaudit reads your local ~/.claude logs and reports token");
-    println!("   usage + cost — daily, weekly, monthly, per session, or per");
-    println!("   5-hour billing block. A mmap'd binary cache keeps warm runs");
-    println!("   under ~5 ms — reports price from a local copy of LiteLLM's");
-    println!("   model prices instead of re-fetching every run. Update that");
-    println!("   copy online anytime with `ccaudit refresh-prices`.");
+    println!("   Token usage and cost reports for your local Claude Code logs —");
+    println!("   daily, weekly, monthly, per session, or per 5-hour billing block,");
+    println!("   as tables, JSON, an interactive TUI, or a web dashboard.");
+    println!("   Update model prices anytime with `ccaudit refresh-prices`.");
     println!();
     println!("COMMANDS:");
     println!("  daily           (default) daily token usage + cost");
@@ -976,7 +1030,11 @@ mod tests {
     #[test]
     fn plain_and_order_are_report_scoped() {
         assert!(parse_ok(&["daily", "--plain"]).plain);
-        assert!(parse_err(&["tui", "--plain"]).contains("daily / monthly"));
+        // Pin the full command list — every command named here honors
+        // these flags, and the message must not drift from REPORT_CMDS.
+        assert!(
+            parse_err(&["tui", "--plain"]).contains("daily / weekly / monthly / session / blocks")
+        );
     }
 
     #[test]

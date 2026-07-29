@@ -286,8 +286,8 @@ mod tests {
 
     #[test]
     fn gpt5_does_not_match_gpt5_mini() {
-        // The old `contains` both-ways logic returned gpt-5-mini's price
-        // for a lookup of `gpt-5`. Now the lookup must miss (no exact
+        // A both-ways `contains` match returns gpt-5-mini's price for a
+        // lookup of `gpt-5`. The lookup must miss instead (no exact
         // entry, no boundary-aligned substring match).
         let lk = mk_lookup(&["gpt-5-mini"]);
         assert!(lk.lookup(&["gpt-5".to_string()]).is_none());

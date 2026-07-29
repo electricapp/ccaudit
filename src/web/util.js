@@ -27,13 +27,18 @@ function ft(n) {
   return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, '_');
 }
 
-// Currency formatter. "<$0.01" for tiny values; otherwise
-// `$X_XXX.YY` with underscore grouping on the dollar portion.
+// Currency formatter — mirrors Rust `write_cost` (report/fmt.rs)
+// exactly so CLI and web agree visibly: "<$0.01" only for tiny
+// *positive* values, "$0.00" for zero, "-$X.YY" for negatives.
+// Cents-first (round once) to dodge fp formatting drift; underscore
+// grouping on the dollar portion.
 function fc(n) {
-  if (n < 0.01) return '<$0.01';
-  const s = n.toFixed(2);
-  const [dol, cents] = s.split('.');
-  return '$' + dol.replace(/\B(?=(\d{3})+(?!\d))/g, '_') + '.' + cents;
+  if (n > 0 && n < 0.01) return '<$0.01';
+  const cents = Math.round(n * 100);
+  const sign = cents < 0 ? '-$' : '$';
+  const abs = Math.abs(cents);
+  const dol = String(Math.floor(abs / 100)).replace(/\B(?=(\d{3})+(?!\d))/g, '_');
+  return sign + dol + '.' + String(abs % 100).padStart(2, '0');
 }
 
 // "Mon D HH:MM" date with the day right-padded by &nbsp; so single-

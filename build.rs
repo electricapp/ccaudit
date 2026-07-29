@@ -27,6 +27,12 @@ fn main() {
     // "no rerun-if directives → rerun every build" mode — which would
     // re-stamp the timestamp and recompile the whole crate on every build.
     println!("cargo:rerun-if-changed=build.rs");
+    // Re-stamp when sources change, not just on commit/checkout: watching
+    // only git refs bakes the timestamp of the last HEAD move into every
+    // rebuild of an edited tree, so a binary compiled today can report a
+    // week-old build time.
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=Cargo.toml");
     emit_git_rerun_paths();
 }
 

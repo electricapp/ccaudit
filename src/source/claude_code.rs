@@ -53,12 +53,16 @@ impl Source for ClaudeCode {
         if let Some(session) = parse::try_load_cached_full(&src.path) {
             return Some(to_parsed_session(&src.path, src, &session));
         }
-        let session = parse::parse_session(&src.path)?;
+        // allow_empty: a readable session with no billable lines must
+        // still yield `Some` — see the trait contract. A `None` for a
+        // file that keeps being scanned leaves the cache one session
+        // short of the scan count, failing validation and forcing a
+        // full rebuild on every run.
+        let session = parse::parse_session_allow_empty(&src.path)?;
         // Persist so the matching `try_load_cached_header` in
         // `load_all_projects`'s par_iter (which runs right after
-        // `cache::load`) finds a hot cache and skips its own parse,
-        // killing the cold-path double-parse that used to happen on
-        // every file.
+        // `cache::load`) finds a hot cache and skips its own parse —
+        // otherwise the cold path parses every file twice.
         parse::save_session_to_cache(&src.path, &session);
         Some(to_parsed_session(&src.path, src, &session))
     }
@@ -79,7 +83,12 @@ impl Source for ClaudeCode {
             }
         }
         // 2. Fall back to the hardcoded table (March 2026 prices).
+        //    Claude 3.x rates differ sharply from 4.x (3-opus is 3× the
+        //    4.x opus price), so match the generation before the family.
         match model.unwrap_or("") {
+            m if m.contains("3-opus") => &OPUS_3,
+            m if m.contains("3-5-haiku") => &HAIKU_3_5,
+            m if m.contains("3-haiku") => &HAIKU_3,
             m if m.contains("opus") => &OPUS,
             m if m.contains("haiku") => &HAIKU,
             _ => &SONNET,
@@ -162,6 +171,26 @@ const HAIKU: Pricing = Pricing {
     output: 5.0,
     cache_write: 1.25,
     cache_read: 0.10,
+};
+// Claude 3.x generations (legacy logs). Keys: claude-3-opus,
+// claude-3-5-haiku, claude-3-haiku in the same LiteLLM table.
+const OPUS_3: Pricing = Pricing {
+    input: 15.0,
+    output: 75.0,
+    cache_write: 18.75,
+    cache_read: 1.50,
+};
+const HAIKU_3_5: Pricing = Pricing {
+    input: 0.80,
+    output: 4.0,
+    cache_write: 1.0,
+    cache_read: 0.08,
+};
+const HAIKU_3: Pricing = Pricing {
+    input: 0.25,
+    output: 1.25,
+    cache_write: 0.30,
+    cache_read: 0.03,
 };
 
 // ── Claude Code-specific project name prettifier ──

@@ -346,6 +346,131 @@ fn all_synthetic_session_yields_zero() {
     assert!(web_daily.abs() < f64::EPSILON);
 }
 
+// ── Token accounting: unmodeled tools + id-less multi-part lines ──
+
+/// Assistant line whose ONLY content block is a `tool_use` for an
+/// unmodeled tool (no Bash/Read/... rendering — `format_tool_input`
+/// returns ""). The empty-text part must still carry the usage into
+/// aggregates — filtering it out drops the line's tokens entirely.
+fn assistant_line_tool_use_only(
+    msg_id: &str,
+    model: &str,
+    iso_ts: &str,
+    input: u64,
+    output: u64,
+) -> String {
+    let v = serde_json::json!({
+        "type": "assistant",
+        "timestamp": iso_ts,
+        "message": {
+            "id": msg_id,
+            "role": "assistant",
+            "model": model,
+            "content": [{
+                "type": "tool_use",
+                "name": "TodoWrite",
+                "input": { "todos": "[1] audit the parser" }
+            }],
+            "usage": {
+                "input_tokens": input,
+                "output_tokens": output,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0
+            }
+        }
+    });
+    v.to_string()
+}
+
+/// Id-less assistant line with TWO non-empty parts (text + thinking)
+/// sharing one usage block. Without a `message_id` downstream dedup can't
+/// coalesce the parts, so the parser must attach the usage to exactly
+/// one of them — attaching it to both doubles the line's tokens.
+fn assistant_line_no_id_two_parts(model: &str, iso_ts: &str, input: u64, output: u64) -> String {
+    let v = serde_json::json!({
+        "type": "assistant",
+        "timestamp": iso_ts,
+        "message": {
+            "role": "assistant",
+            "model": model,
+            "content": [
+                { "type": "text", "text": "part one (visible reply)" },
+                { "type": "thinking", "thinking": "part two (reasoning)" }
+            ],
+            "usage": {
+                "input_tokens": input,
+                "output_tokens": output,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0
+            }
+        }
+    });
+    v.to_string()
+}
+
+#[test]
+fn unmodeled_tool_use_and_idless_multipart_usage_count_exactly_once() {
+    // (a) 111/222 on a TodoWrite-only line: must be counted (not dropped).
+    // (b) 333/444 on an id-less two-part line: must be counted ONCE (not
+    //     once per part).
+    // Expected daily totals: input 444, output 666 — from exactly 2 API calls.
+    let h = Harness::new();
+    h.write_jsonl(
+        "-Users-test-code-accounting",
+        "sess_accounting",
+        &[
+            &user_line("do the todos", "2026-04-01T10:00:00.000Z"),
+            &assistant_line_tool_use_only(
+                "msg_todo_1",
+                "claude-opus-4-7",
+                "2026-04-01T10:00:01.000Z",
+                111,
+                222,
+            ),
+            &assistant_line_no_id_two_parts(
+                "claude-opus-4-7",
+                "2026-04-01T10:00:02.000Z",
+                333,
+                444,
+            ),
+        ],
+    );
+
+    let out = h.run(&["daily", "--json"]);
+    require_success(&out, "daily --json (accounting fixture)");
+    let v: Value = serde_json::from_str(&read_stdout(&out)).expect("valid JSON");
+
+    assert_eq!(
+        v["totals"]["input"], 444,
+        "input must be 111 (tool_use-only) + 333 (id-less, once): {}",
+        v["totals"]
+    );
+    assert_eq!(
+        v["totals"]["output"], 666,
+        "output must be 222 + 444: {}",
+        v["totals"]
+    );
+    // Two billable API calls — a dropped tool_use line would leave 1, a
+    // per-part double count would leave 3.
+    let rows = v["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["api_calls"], 2);
+
+    // opus rates: (444×$5 + 666×$25) / 1e6 = $0.01887.
+    let cost = v["totals"]["cost_usd"].as_f64().unwrap();
+    assert!(
+        (cost - 0.01887).abs() < 1e-9,
+        "expected $0.01887, got {cost}"
+    );
+
+    // Uniformity: the session view must land on the same number.
+    let session_cost = cli_total_cost(&h, "session");
+    assert!(
+        (session_cost - cost).abs() < 1e-9,
+        "session ${session_cost} ≠ daily ${cost}"
+    );
+}
+
 #[test]
 fn very_long_content_doesnt_break_parser() {
     let h = Harness::new();

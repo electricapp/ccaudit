@@ -11,6 +11,7 @@ use super::{
 };
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -142,29 +143,26 @@ fn scan_yyyy_mm_dd(root: &Path, out: &mut Vec<SourceFile>) {
 
 // ── Parser ──
 //
-// Minimal subset of Codex's RolloutItem schema. Each line is a typed
-// `RolloutLine` whose `body` is a tag-discriminated enum, so serde
-// parses the payload into the right variant in a single pass — no
-// `serde_json::Value` re-walk per line. Unknown variants land in
-// `Other` so a Codex CLI version bump that adds new ones doesn't break
-// parsing.
+// Minimal subset of Codex's RolloutItem schema. Each line's `payload`
+// is captured as a raw, unparsed span and only deserialized for the
+// line types we act on — a `#[serde(flatten)]` or tagged-enum shape
+// here would force serde to buffer every line's full payload tree
+// (large ignored `response_item` bodies included) into owned
+// allocations before the tag dispatch could run. Unknown types skip
+// their payload entirely, so a Codex CLI version bump that adds new
+// ones doesn't break parsing.
 
 #[derive(Deserialize)]
-struct RolloutLine {
+struct RolloutLine<'a> {
     timestamp: DateTime<Utc>,
-    #[serde(flatten)]
-    body: RolloutBody,
+    #[serde(rename = "type", borrow)]
+    kind: Cow<'a, str>,
+    #[serde(borrow)]
+    payload: Option<&'a RawValue>,
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
-enum RolloutBody {
-    SessionMeta(SessionMetaPayload),
-    TurnContext(TurnContextPayload),
-    ResponseItem(ResponseItemPayload),
-    EventMsg(EventMsgPayload),
-    #[serde(other)]
-    Other,
+fn payload_as<T: serde::de::DeserializeOwned>(payload: Option<&RawValue>) -> Option<T> {
+    payload.and_then(|r| serde_json::from_str(r.get()).ok())
 }
 
 #[derive(Deserialize)]
@@ -253,15 +251,21 @@ fn parse_codex_session(src: &SourceFile) -> Option<ParsedSession> {
         let Ok(line) = serde_json::from_slice::<RolloutLine>(raw) else {
             continue;
         };
-        match line.body {
-            RolloutBody::SessionMeta(p) => {
+        match line.kind.as_ref() {
+            "session_meta" => {
+                let Some(p) = payload_as::<SessionMetaPayload>(line.payload) else {
+                    continue;
+                };
                 session_id = p.id;
                 cwd = p.cwd;
                 if started_at.is_none() {
                     started_at = Some(line.timestamp);
                 }
             }
-            RolloutBody::TurnContext(p) => {
+            "turn_context" => {
+                let Some(p) = payload_as::<TurnContextPayload>(line.payload) else {
+                    continue;
+                };
                 if let Some(m) = p.model {
                     if session_model.is_none() {
                         session_model = Some(m.clone());
@@ -275,7 +279,12 @@ fn parse_codex_session(src: &SourceFile) -> Option<ParsedSession> {
                     current_model = Some(m);
                 }
             }
-            RolloutBody::ResponseItem(p) if first_user_msg.is_none() => {
+            // Once first_user_msg is set, response_item payloads (the
+            // bulk of a rollout's bytes) are never deserialized at all.
+            "response_item" if first_user_msg.is_none() => {
+                let Some(p) = payload_as::<ResponseItemPayload>(line.payload) else {
+                    continue;
+                };
                 if p.role.as_deref() != Some("user") {
                     continue;
                 }
@@ -290,48 +299,51 @@ fn parse_codex_session(src: &SourceFile) -> Option<ParsedSession> {
                     }
                 }
             }
-            RolloutBody::EventMsg(EventMsgPayload::TokenCount { info: Some(info) }) => {
-                let u = info.last_token_usage;
-                let cached = u.cached_input_tokens.max(0) as u64;
-                // Codex `input_tokens` includes cached; subtract for the
-                // uncached-rate column.
-                let total_input = u.input_tokens.max(0) as u64;
-                let uncached = total_input.saturating_sub(cached);
-                let output = u.output_tokens.max(0) as u64;
-                // Local consecutive-dup guard ONLY: Codex re-emits an
-                // identical `last_token_usage` on rate-limit-only updates
-                // (upstream #14489), so skip a triple that exactly repeats
-                // the previous one under the same model. We deliberately
-                // emit `msg_id_hash: None` rather than hashing the triple
-                // into a global message id — Codex has no real message ids,
-                // and two genuinely distinct calls (other sessions, or
-                // non-consecutive in this one) can share a token triple;
-                // using it as a global dedup key silently undercounts them.
-                let mut buf = [0u8; 24];
-                buf[0..8].copy_from_slice(&uncached.to_le_bytes());
-                buf[8..16].copy_from_slice(&cached.to_le_bytes());
-                buf[16..24].copy_from_slice(&output.to_le_bytes());
-                let h = fnv1a(&buf);
-                if last_token_hash == Some(h) {
-                    continue;
+            "event_msg" => match payload_as::<EventMsgPayload>(line.payload) {
+                Some(EventMsgPayload::TokenCount { info: Some(info) }) => {
+                    let u = info.last_token_usage;
+                    let cached = u.cached_input_tokens.max(0) as u64;
+                    // Codex `input_tokens` includes cached; subtract for the
+                    // uncached-rate column.
+                    let total_input = u.input_tokens.max(0) as u64;
+                    let uncached = total_input.saturating_sub(cached);
+                    let output = u.output_tokens.max(0) as u64;
+                    // Local consecutive-dup guard ONLY: Codex re-emits an
+                    // identical `last_token_usage` on rate-limit-only updates
+                    // (upstream #14489), so skip a triple that exactly repeats
+                    // the previous one under the same model. We deliberately
+                    // emit `msg_id_hash: None` rather than hashing the triple
+                    // into a global message id — Codex has no real message ids,
+                    // and two genuinely distinct calls (other sessions, or
+                    // non-consecutive in this one) can share a token triple;
+                    // using it as a global dedup key silently undercounts them.
+                    let mut buf = [0u8; 24];
+                    buf[0..8].copy_from_slice(&uncached.to_le_bytes());
+                    buf[8..16].copy_from_slice(&cached.to_le_bytes());
+                    buf[16..24].copy_from_slice(&output.to_le_bytes());
+                    let h = fnv1a(&buf);
+                    if last_token_hash == Some(h) {
+                        continue;
+                    }
+                    last_token_hash = Some(h);
+                    lines.push(ParsedLine {
+                        day: day_from_ts(line.timestamp),
+                        msg_id_hash: None,
+                        model: current_model.clone(),
+                        input: uncached.min(u64::from(u32::MAX)) as u32,
+                        output: output.min(u64::from(u32::MAX)) as u32,
+                        cache_read: cached.min(u64::from(u32::MAX)) as u32,
+                        cache_create: 0,
+                    });
+                    ts_unix.push(line.timestamp.timestamp());
                 }
-                last_token_hash = Some(h);
-                lines.push(ParsedLine {
-                    day: day_from_ts(line.timestamp),
-                    msg_id_hash: None,
-                    model: current_model.clone(),
-                    input: uncached.min(u64::from(u32::MAX)) as u32,
-                    output: output.min(u64::from(u32::MAX)) as u32,
-                    cache_read: cached.min(u64::from(u32::MAX)) as u32,
-                    cache_create: 0,
-                });
-                ts_unix.push(line.timestamp.timestamp());
-            }
-            RolloutBody::EventMsg(EventMsgPayload::UserMessage { message: Some(m) })
-                if first_user_msg.is_none() && !m.is_empty() && !m.starts_with('<') =>
-            {
-                first_user_msg = Some(m);
-            }
+                Some(EventMsgPayload::UserMessage { message: Some(m) })
+                    if first_user_msg.is_none() && !m.is_empty() && !m.starts_with('<') =>
+                {
+                    first_user_msg = Some(m);
+                }
+                _ => {}
+            },
             _ => {}
         }
     }

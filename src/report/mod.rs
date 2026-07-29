@@ -14,14 +14,22 @@ use crate::cache::{BLOCK_SECS, Bucket, FilterOpts, LoadedCache, aggregate};
 use crate::cli::{Cmd, Options};
 use crate::source::Source;
 
-pub fn render<S: Source + ?Sized>(cache: &LoadedCache, opts: &Options, source: &S) {
+/// Render the requested report to stdout.
+///
+/// The `Err` carries the stdout write failure — callers decide policy
+/// (a broken pipe is a normal way for `| head` to end; anything else
+/// deserves a nonzero exit instead of reporting success with no data).
+pub fn render<S: Source + ?Sized>(
+    cache: &LoadedCache,
+    opts: &Options,
+    source: &S,
+) -> std::io::Result<()> {
     // Statusline runs its own narrowly-scoped aggregations (today + active
     // block); return early so the polled status-bar path doesn't pay for a
     // full rollup it would only throw away — and which, under `--timezone
     // Local`, is the per-line slow path.
     if matches!(opts.cmd, Cmd::Statusline) {
-        statusline::print(cache, opts, source);
-        return;
+        return statusline::print(cache, opts, source);
     }
 
     let bucket = match opts.cmd {
@@ -57,10 +65,10 @@ pub fn render<S: Source + ?Sized>(cache: &LoadedCache, opts: &Options, source: &
     }
 
     if opts.json {
-        json::print(cache, &rollup, opts, bucket, source);
+        json::print(cache, &rollup, opts, bucket, source)
     } else if opts.plain {
-        table::print_plain(cache, &rollup, opts, bucket, source);
+        table::print_plain(cache, &rollup, opts, bucket, source)
     } else {
-        table::print(cache, &rollup, opts, bucket, source);
+        table::print(cache, &rollup, opts, bucket, source)
     }
 }

@@ -26,10 +26,14 @@ const ATTR_FILE_DATALENGTH: u32 = 0x0000_0200;
 // Vnode object types
 const VREG: u32 = 1;
 
-// O_RDONLY; libc is already pulled in transitively by chrono/rayon but
-// we'd rather not depend on it explicitly. Raw constants keep the FFI
-// surface self-contained.
+// open(2) flags; libc is already pulled in transitively by chrono/rayon
+// but we'd rather not depend on it explicitly. Raw constants keep the
+// FFI surface self-contained. O_DIRECTORY fails fast if the path stops
+// being a directory; O_CLOEXEC keeps the fd from leaking across
+// fork/exec that another thread might perform mid-scan.
 const O_RDONLY: i32 = 0;
+const O_DIRECTORY: i32 = 0x0010_0000;
+const O_CLOEXEC: i32 = 0x0100_0000;
 
 #[repr(C)]
 struct Attrlist {
@@ -90,7 +94,7 @@ pub fn scan(dir: &Path) -> Option<Vec<BulkEntry>> {
 
     // Open the directory fd. getattrlistbulk requires an open fd, not a
     // path, so one open(2) per directory is the minimum cost.
-    let fd = unsafe { open(c_path.as_ptr(), O_RDONLY) };
+    let fd = unsafe { open(c_path.as_ptr(), O_RDONLY | O_DIRECTORY | O_CLOEXEC) };
     if fd < 0 {
         return None;
     }
@@ -161,10 +165,14 @@ impl ParsedEntry {
     }
 }
 
+fn read_u32(buf: &[u8], at: usize) -> Option<u32> {
+    let b = buf.get(at..at + 4)?;
+    Some(u32::from_ne_bytes(b.try_into().ok()?))
+}
+
 // Parse one record starting at `cursor` in `buf`. Returns None on any
 // structural problem — we bail back to the portable path rather than
 // speculate about partially-read data.
-#[allow(unsafe_code)]
 fn parse_entry(buf: &[u8], start: usize) -> Option<ParsedEntry> {
     // Record layout (we requested RETURNED_ATTRS + NAME + OBJTYPE + MODTIME
     // in commonattr, DATALENGTH in fileattr, so attrs appear in bit order):
@@ -179,24 +187,39 @@ fn parse_entry(buf: &[u8], start: usize) -> Option<ParsedEntry> {
     //   ..      name bytes (NUL-terminated utf8), addressed via name_ref
     let len_bytes = buf.get(start..start + 4)?;
     let record_length = u32::from_ne_bytes(len_bytes.try_into().ok()?) as usize;
-    if record_length < 24 || start + record_length > buf.len() {
+    // 32 = length word + AttributeSet + name Attrreference — everything
+    // read unconditionally below. A shorter record can't contain the
+    // name ref, and reading it anyway would run past the buffer on a
+    // truncated final record.
+    if record_length < 32 || start + record_length > buf.len() {
         return None;
     }
 
     // AttributeSet tells us which attrs were actually filled. If the kernel
     // dropped one we asked for (e.g. modtime unavailable), the field is
-    // absent from the record. Use read_unaligned — we can't assume the
-    // record starts on a 4-byte boundary even though it usually does.
-    #[allow(clippy::cast_ptr_alignment)] // read_unaligned handles it
-    let returned_ptr = unsafe { buf.as_ptr().add(start + 4).cast::<AttributeSet>() };
-    let returned: AttributeSet = unsafe { returned_ptr.read_unaligned() };
+    // absent from the record. All reads go through `buf.get` +
+    // `from_ne_bytes` so a lying record_length can't take us out of
+    // bounds and alignment is a non-issue.
+    let returned = AttributeSet {
+        commonattr: read_u32(buf, start + 4)?,
+        volattr: read_u32(buf, start + 8)?,
+        dirattr: read_u32(buf, start + 12)?,
+        fileattr: read_u32(buf, start + 16)?,
+        forkattr: read_u32(buf, start + 20)?,
+    };
     let mut cursor = start + 4 + size_of::<AttributeSet>();
 
-    // Name reference (always immediately after RETURNED_ATTRS when requested).
+    // Name reference (immediately after RETURNED_ATTRS — but only if the
+    // kernel actually returned a NAME; without it the bytes there belong
+    // to some other attr and the whole record layout assumption is off).
+    if returned.commonattr & ATTR_CMN_NAME == 0 {
+        return None;
+    }
     let name_ref_pos = cursor;
-    #[allow(clippy::cast_ptr_alignment)] // read_unaligned handles it
-    let nref_ptr = unsafe { buf.as_ptr().add(cursor).cast::<Attrreference>() };
-    let nref: Attrreference = unsafe { nref_ptr.read_unaligned() };
+    let nref = Attrreference {
+        attr_dataoffset: read_u32(buf, cursor)?.cast_signed(),
+        attr_length: read_u32(buf, cursor + 4)?,
+    };
     cursor += size_of::<Attrreference>();
 
     // obj_type: u32, if filled
@@ -210,10 +233,14 @@ fn parse_entry(buf: &[u8], start: usize) -> Option<ParsedEntry> {
     // mod_time: struct timespec (16 bytes on 64-bit Darwin). Unlike
     // getattrlist, the bulk form packs these tight — no 8-byte padding
     // between obj_type and tv_sec. Verified empirically on macOS 14+.
+    // tv_sec is signed; clamp pre-1970 mtimes to 0 like the portable
+    // path's `duration_since(UNIX_EPOCH)` failure does, so the two scan
+    // paths fingerprint identically.
     let mut mtime_secs: u64 = 0;
     if returned.commonattr & ATTR_CMN_MODTIME != 0 {
         let b = buf.get(cursor..cursor + 8)?;
-        mtime_secs = u64::from_ne_bytes(b.try_into().ok()?);
+        let tv_sec = i64::from_ne_bytes(b.try_into().ok()?);
+        mtime_secs = u64::try_from(tv_sec).unwrap_or(0);
         cursor += 16; // skip sec + nsec together
     }
 

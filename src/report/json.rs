@@ -63,7 +63,7 @@ pub fn print<S: Source + ?Sized>(
     opts: &Options,
     bucket: Bucket,
     _source: &S,
-) {
+) -> std::io::Result<()> {
     let mut keys = apply_tail(sort_keys(rollup, bucket), opts.tail, bucket);
     reorder(&mut keys, rollup, bucket, opts.order);
     let now = chrono::Utc::now().timestamp();
@@ -168,14 +168,14 @@ pub fn print<S: Source + ?Sized>(
         rows,
         carbon,
     };
-    // Stream straight to stdout via BufWriter — no intermediate String.
-    // Large reports (--breakdown over a year of logs) used to allocate a
-    // multi-MB string here just to push it back through println!.
+    // Stream straight to stdout via BufWriter — building the document
+    // as one String costs a multi-MB allocation on large reports
+    // (--breakdown over a year of logs) just to push it through
+    // println!.
     use std::io::Write as _;
     let stdout = std::io::stdout();
     let mut w = std::io::BufWriter::new(stdout.lock());
-    if serde_json::to_writer_pretty(&mut w, &report).is_ok() {
-        let _ = w.write_all(b"\n");
-        let _ = w.flush();
-    }
+    serde_json::to_writer_pretty(&mut w, &report).map_err(std::io::Error::other)?;
+    w.write_all(b"\n")?;
+    w.flush()
 }

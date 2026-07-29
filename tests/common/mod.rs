@@ -47,29 +47,40 @@ impl Harness {
 
     /// Invoke the binary built by `cargo build --release`.
     pub fn run(&self, args: &[&str]) -> Output {
-        let bin = bin_path();
-        Command::new(bin)
-            .env("HOME", self.home.path())
-            .env_remove("CCAUDIT_LAZY")
-            .env_remove("CCAUDIT_PROF")
-            .args(args)
-            .output()
-            .expect("spawn ccaudit")
+        self.base_cmd().args(args).output().expect("spawn ccaudit")
     }
 
     // Used by tests/cli.rs (CCAUDIT_LAZY); unused by tests/uniformity.rs,
     // and each test binary compiles `mod common` from scratch.
     #[allow(dead_code)]
     pub fn run_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
-        let bin = bin_path();
-        let mut cmd = Command::new(bin);
-        cmd.env("HOME", self.home.path())
-            .env_remove("CCAUDIT_LAZY")
-            .env_remove("CCAUDIT_PROF");
+        let mut cmd = self.base_cmd();
         for (k, v) in env {
             cmd.env(k, v);
         }
         cmd.args(args).output().expect("spawn ccaudit")
+    }
+
+    /// Command with a scrubbed environment: pristine `$HOME` plus every
+    /// env var the binary reads removed, so test outcomes don't depend on
+    /// the developer's shell (e.g. `FORCE_COLOR=1` would leak ANSI escapes
+    /// into the "no escapes in a pipe" assertions, and a preset `NO_COLOR`
+    /// would mask a TTY-autodetect regression by making them vacuous).
+    fn base_cmd(&self) -> Command {
+        let mut cmd = Command::new(bin_path());
+        cmd.env("HOME", self.home.path());
+        for k in [
+            "CCAUDIT_LAZY",
+            "CCAUDIT_PROF",
+            "NO_COLOR",
+            "FORCE_COLOR",
+            "CCAUDIT_NO_COLOR",
+            "CCAUDIT_FORCE_COLOR",
+            "TERM",
+        ] {
+            cmd.env_remove(k);
+        }
+        cmd
     }
 }
 

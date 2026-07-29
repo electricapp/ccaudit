@@ -17,7 +17,7 @@ pub fn print<S: Source + ?Sized>(
     opts: &Options,
     bucket: Bucket,
     source: &S,
-) {
+) -> std::io::Result<()> {
     let base = if opts.compact { &COMPACT } else { &NORMAL };
     // Override label width per bucket; session also gets a trailing
     // "Last Activity" column to mirror ccusage.
@@ -100,9 +100,9 @@ pub fn print<S: Source + ?Sized>(
     };
     let second_col = if opts.instances { "Projects" } else { "Models" };
 
-    // Precompute the three separator strings once. Each `write_hline`
-    // used to allocate eight `"─".repeat(n)` Strings; rendered four
-    // times that's 32 small allocs we now fold into 3 reusable buffers.
+    // Precompute the three separator strings once — building them at
+    // each of the four render sites costs eight `"─".repeat(n)`
+    // allocations apiece.
     let top_hline = build_hline(w, '┌', '┬', '┐');
     let mid_hline = build_hline(w, '├', '┼', '┤');
     let bot_hline = build_hline(w, '└', '┴', '┘');
@@ -150,9 +150,8 @@ pub fn print<S: Source + ?Sized>(
 
     // Six scratch slots reused across rows: [in, out, cache_create,
     // cache_read, total, cost]. Each cell formatter pushes into its
-    // slot, then write_row reads &str. Old code allocated six Strings
-    // per row; with the scratch, allocations only happen once each
-    // slot grows past its first row's width.
+    // slot, then write_row reads &str — allocations only happen when a
+    // slot outgrows its widest row so far, not six Strings per row.
     let mut scratch: [String; 6] = Default::default();
 
     for k in &keys {
@@ -312,10 +311,17 @@ pub fn print<S: Source + ?Sized>(
     // Per-column dollar cost. We already know token counts per column;
     // this row shows the dollars attributable to each column so you can
     // see which token type is actually driving spend (usually cache-
-    // create for heavy contexts, output for agentic loops). These are
-    // summed over the same rows as "Total" above, so the four columns add
-    // up to the Total Cost row exactly.
-    let total_prices = tot_cost_in + tot_cost_out + tot_cost_cache_w + tot_cost_cache_r;
+    // create for heavy contexts, output for agentic loops). The printed
+    // total sums the CENT-ROUNDED column values so the row reconciles
+    // with its own cells — summing the raw values would let four
+    // `<$0.01` cells display a `$0.02` total. It can differ from the
+    // "Total" row's cost by a rounding cent.
+    let cents = |c: f64| (c * 100.0).round();
+    let total_prices = (cents(tot_cost_in)
+        + cents(tot_cost_out)
+        + cents(tot_cost_cache_w)
+        + cents(tot_cost_cache_r))
+        / 100.0;
     buf.push_str(&mid_hline);
     for s in &mut scratch {
         s.clear();
@@ -351,7 +357,7 @@ pub fn print<S: Source + ?Sized>(
 
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    let _ = lock.write_all(buf.as_bytes());
+    lock.write_all(buf.as_bytes())
 }
 
 /// Plain, machine-readable rendering for `--plain`: one tab-separated
@@ -366,7 +372,7 @@ pub fn print_plain<S: Source + ?Sized>(
     opts: &Options,
     bucket: Bucket,
     source: &S,
-) {
+) -> std::io::Result<()> {
     use std::fmt::Write as _;
     let mut keys = apply_tail(sort_keys(rollup, bucket), opts.tail, bucket);
     super::fmt::reorder(&mut keys, rollup, bucket, opts.order);
@@ -421,17 +427,19 @@ pub fn print_plain<S: Source + ?Sized>(
 
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    let _ = lock.write_all(buf.as_bytes());
+    lock.write_all(buf.as_bytes())
 }
 
 // Format last-activity cell as a date string from a unix-seconds value,
 // honoring `--locale` via the centralized `format_date` helper. Empty
-// when the bucket carried no timestamp.
+// when the bucket carried no timestamp. Shift-then-format-as-UTC, the
+// same trick `format_block` uses, so the date agrees with the report's
+// --timezone bucketing instead of being off by a day near midnight.
 fn format_last_activity(ts_unix: i64, opts: &Options) -> String {
     if ts_unix <= 0 {
         return String::new();
     }
-    chrono::DateTime::<chrono::Utc>::from_timestamp(ts_unix, 0)
+    chrono::DateTime::<chrono::Utc>::from_timestamp(ts_unix + i64::from(opts.tz_offset_secs), 0)
         .map(|d| super::fmt::format_date(d.date_naive(), opts))
         .unwrap_or_default()
 }
@@ -516,20 +524,46 @@ struct Row<'a> {
 // Truncate a variable-width cell (label / model / date) to `w` display
 // columns with a trailing ellipsis, so an over-long session name or
 // localized date can't overrun the column and break box alignment.
-// Returns `Borrowed` (no allocation) for the common in-width case.
+// Measures DISPLAY columns, not chars — CJK/emoji are 2 cells wide, so
+// char-count math under-measures them and blows the box borders out of
+// alignment. Returns `Borrowed` (no allocation) for the in-width case.
 fn fit_cell(s: &str, w: usize) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
-    let len = if s.is_ascii() {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    // ASCII fast path: bytes == display columns.
+    let width = if s.is_ascii() {
         s.len()
     } else {
-        s.chars().count()
+        UnicodeWidthStr::width(s)
     };
-    if w == 0 || len <= w {
+    if w == 0 || width <= w {
         return Cow::Borrowed(s);
     }
-    let mut out: String = s.chars().take(w.saturating_sub(1)).collect();
+    let budget = w.saturating_sub(1); // reserve one column for '…'
+    let mut out = String::with_capacity(s.len().min(4 * w));
+    let mut used = 0;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + cw > budget {
+            break;
+        }
+        used += cw;
+        out.push(ch);
+    }
     out.push('…');
     Cow::Owned(out)
+}
+
+// Display width of a cell for manual padding. `{s:<w$}` pads by char
+// count, which under-pads wide glyphs — every left-aligned variable
+// cell pads via this instead.
+fn cell_width(s: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    if s.is_ascii() {
+        s.len()
+    } else {
+        UnicodeWidthStr::width(s)
+    }
 }
 
 fn write_row(buf: &mut String, w: &Widths, r: &Row<'_>) {
@@ -544,16 +578,23 @@ fn write_row(buf: &mut String, w: &Widths, r: &Row<'_>) {
     let extra = fit_cell(r.extra, w.models);
     let _ = write!(
         buf,
-        "│ {pre}{label:<w_label$}{post} │ {pre}{extra:<w_models$}{post}",
-        w_label = w.label,
-        w_models = w.models,
+        "│ {pre}{label}{lpad:<lw$}{post} │ {pre}{extra}{epad:<ew$}{post}",
+        lpad = "",
+        lw = w.label.saturating_sub(cell_width(&label)),
+        epad = "",
+        ew = w.models.saturating_sub(cell_width(&extra)),
     );
     for (v, cw) in r.nums.iter().zip(num_widths(w).iter()) {
         let _ = write!(buf, " │ {pre}{v:>w$}{post}", w = *cw);
     }
     if w.last_activity > 0 {
         let tail = fit_cell(r.tail, w.last_activity);
-        let _ = write!(buf, " │ {pre}{tail:<w$}{post}", w = w.last_activity);
+        let _ = write!(
+            buf,
+            " │ {pre}{tail}{tpad:<tw$}{post}",
+            tpad = "",
+            tw = w.last_activity.saturating_sub(cell_width(&tail)),
+        );
     }
     if w.limit > 0 {
         let (lpre, lpost) = match r.limit_color {

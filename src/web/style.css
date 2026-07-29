@@ -922,8 +922,8 @@ details.msg > .msg-b {
 }
 /* Pie legend rows: swatch | name (flex) | pct (fixed) | cost (fixed).
    Grid layout aligns the right two columns regardless of model name
-   length, which used to ride along on a single right-anchored span and
-   bounce around with the percentage's character count. */
+   length — a single right-anchored span bounces around with the
+   percentage's character count. */
 .pie-item {
   display: grid;
   grid-template-columns: 8px minmax(0, 1fr) 42px 70px;
