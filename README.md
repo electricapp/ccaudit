@@ -260,12 +260,17 @@ Report subcommands accept `--json` (structured) or `--plain` (tab-separated) for
 - **Web dashboard** — tables with sortable columns, pie/histogram/heatmap charts, full message viewer, URL routing (`/p/{slug}/s/{uuid}`)
 - **Scope-aware**: press `d` from any view and the dashboard reflects just that project or session
 - **Per-token-type cost breakdown** on hover
-- **Accurate pricing** — fetches latest rates from LiteLLM on demand (`ccaudit refresh-prices`)
+- **Accurate pricing** — fetches latest rates from LiteLLM on demand (`ccaudit refresh-prices`). Cache writes are billed per TTL: the 5-minute tier at 1.25× input, the 1-hour tier at 2×, read from the `cache_creation` split the logs carry.
 - **Carbon footer** (`--carbon`) — energy / CO₂ / tree-year estimate for the reported window
 - **Deterministic filters** — `--since YYYYMMDD`, `--until`, `--project`, `--timezone`, `--locale`, `--source`
+- **Cross-provider reports** — `--all` sums every provider that has logs; `--by-agent` splits the rows per provider. Each is aggregated by its own `Source`, so nothing is ever priced against another provider's rate table.
+- **Config file** — `./ccaudit.json` or `~/.config/ccaudit/config.json` (or `--config PATH`) sets defaults, per-provider log directories, and per-model price overrides keyed on the raw model name. Schema at [`ccaudit.schema.json`](ccaudit.schema.json). Flags always beat the file.
+- **Somewhere else to look** — `--logs-dir A,B` replaces a provider's default location with one or more roots, so an archive reports alongside (or instead of) `$HOME`.
+- **Numbers without the money** — `--no-cost` drops every dollar figure from the table, the TSV, and the JSON.
 - **mmap'd cache** — repeated runs on the same `~/.claude/projects/` read from a memory-mapped schema, zero deserialization
 - **Pluggable sources** — a `Source` trait (see `src/source/mod.rs`) abstracts log discovery, parsing, model pricing, and model normalization. Today ships **Claude Code** (`--source claude-code`, default) and **OpenAI Codex CLI** (`--source codex`); the trait accepts adapters for OpenCode, π / Pi, MCP servers, or any other agent that writes JSONL-shaped session logs.
 - **Single source of truth** — CLI `daily`, web sessions table, and web heatmap all read from one `cache::per_session_totals` pipeline. A test (`tests/uniformity.rs`) asserts they agree to the cent on every run.
+- **Checked against a second implementation** — a nightly workflow seeds a synthetic corpus from a fresh seed, reports on it with both ccaudit and `ccusage`, and diffs the two. ccusage is a differential oracle rather than ground truth (the tools diverge on purpose over subagent transcripts and `<synthetic>` lines), so a breach is advisory: the step goes red, the job passes, and the seed in the summary reproduces the corpus exactly.
 
 ## Optional features
 

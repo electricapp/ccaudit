@@ -44,6 +44,12 @@ struct JsonTotals {
 struct JsonRow {
     key: String,
     model: Option<String>,
+    /// Provider this row belongs to, under `--by-agent`. Its own field
+    /// rather than reusing `model`: a row split by provider is not a row
+    /// split by model, and a consumer reading `.model` should not get
+    /// "Claude Code" back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
     models: Vec<String>,
     projects: Vec<String>,
     input: u64,
@@ -106,10 +112,17 @@ pub fn print<S: Source + ?Sized>(
             *c += u.cost;
         }
 
-        let model = if opts.breakdown && k.1 != u16::MAX {
-            cache.models.get(k.1 as usize).cloned()
+        // Under --by-agent the second key slot holds a provider, not a
+        // model; the two never coexist (the CLI rejects the pair).
+        let split = (k.1 != u16::MAX)
+            .then(|| cache.models.get(k.1 as usize).cloned())
+            .flatten();
+        let (model, agent) = if opts.by_agent {
+            (None, split)
+        } else if opts.breakdown {
+            (split, None)
         } else {
-            None
+            (None, None)
         };
         let models: Vec<String> = u
             .models
@@ -134,6 +147,7 @@ pub fn print<S: Source + ?Sized>(
         rows.push(JsonRow {
             key: label_for(bucket, k.0, cache, opts),
             model,
+            agent,
             models,
             projects,
             input: u.input,

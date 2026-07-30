@@ -1,0 +1,128 @@
+name: ccusage drift
+# Nightly differential run. A fresh synthetic corpus is generated from a
+# date-derived seed, both ccaudit and ccusage report on it, and the two
+# are diffed.
+#
+# ccusage is a differential oracle, not ground truth: it has been right
+# where ccaudit was wrong (it split cache writes by TTL first), and the
+# two also diverge on purpose — ccaudit reads subagent transcripts and
+# drops `<synthetic>` compaction lines. So the comparison step is
+# advisory: it goes red on a tolerance breach and the job still passes.
+# Treat a red step as "go look", not "something is broken".
+#
+# The seed is printed in the summary and derived from the date, so any
+# night's corpus can be regenerated exactly:
+#   cargo run --release --example seed_corpus -- --seed <seed> --out ./corpus
+on:
+  schedule:
+    # 04:17 UTC. Off the hour deliberately — the top of the hour is when
+    # every other scheduled workflow on the planet queues.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: "Corpus seed (blank = derive from today's date)"
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.97.1"
+
+jobs:
+  drift:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal
+          rustup default "${RUST_TOOLCHAIN}"
+          rustc --version
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-drift-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-drift-
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: Build ccaudit + corpus generator
+        run: cargo build --release --all-features --bin ccaudit --example seed_corpus
+
+      # Date-derived so consecutive nights explore different shapes while
+      # any single night stays reproducible from the number in the summary.
+      - name: Pick a seed
+        id: seed
+        run: |
+          set -eu
+          SEED="${{ inputs.seed }}"
+          if [ -z "$SEED" ]; then
+            SEED=$(date -u +%Y%m%d)
+          fi
+          echo "value=$SEED" >> "$GITHUB_OUTPUT"
+          echo "seed=$SEED"
+
+      # A throwaway HOME so both tools read the generated tree and
+      # nothing else — ccusage discovers logs from $HOME with no flag to
+      # point it elsewhere.
+      - name: Seed a synthetic corpus
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/fakehome/.claude"
+          ./target/release/examples/seed_corpus \
+            --seed "${{ steps.seed.outputs.value }}" \
+            --out "$RUNNER_TEMP/fakehome/.claude/projects"
+
+      - name: Report with ccaudit
+        run: |
+          set -eu
+          HOME="$RUNNER_TEMP/fakehome" ./target/release/ccaudit daily --json \
+            > "$RUNNER_TEMP/ccaudit.json"
+
+      - name: Report with ccusage
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP"
+          HOME="$RUNNER_TEMP/fakehome" bunx ccusage@latest claude daily --json \
+            > "$RUNNER_TEMP/ccusage.json"
+
+      # Advisory: a breach fails this step (visible red) without failing
+      # the job, because some drift is expected and some is a real find.
+      - name: Diff the two reports
+        continue-on-error: true
+        run: |
+          uv run scripts/drift-vs-ccusage.py \
+            "$RUNNER_TEMP/ccusage.json" \
+            "$RUNNER_TEMP/ccaudit.json" \
+            --seed "${{ steps.seed.outputs.value }}"
+
+      - name: Upload both reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: drift-reports-${{ steps.seed.outputs.value }}
+          path: |
+            ${{ runner.temp }}/ccaudit.json
+            ${{ runner.temp }}/ccusage.json
+          retention-days: 14

@@ -66,6 +66,29 @@ impl Harness {
         self.home.path().join(root).to_string_lossy().into_owned()
     }
 
+    /// Write a Codex rollout at `~/.codex/sessions/YYYY/MM/DD/`, the
+    /// dated layout Codex's scanner expects. Used to give cross-source
+    /// tests a second provider with real numbers.
+    pub fn write_codex_rollout(
+        &self,
+        ymd: (&str, &str, &str),
+        name: &str,
+        lines: &[&str],
+    ) -> PathBuf {
+        let dir = self
+            .home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join(ymd.0)
+            .join(ymd.1)
+            .join(ymd.2);
+        std::fs::create_dir_all(&dir).expect("mk codex dir");
+        let path = dir.join(format!("rollout-{name}.jsonl"));
+        std::fs::write(&path, lines.join("\n") + "\n").expect("write rollout");
+        path
+    }
+
     /// Write a config file under the harness home and return its path.
     pub fn write_config(&self, name: &str, body: &str) -> String {
         let path = self.home.path().join(name);
@@ -218,6 +241,41 @@ pub fn assistant_line(a: &AssistantLine<'_>) -> String {
         }
     });
     v.to_string()
+}
+
+/// One Codex rollout carrying a single billable turn.
+///
+/// `input` is the total Codex reports, of which `cached` was a cache
+/// read — Codex's `input_tokens` includes cached, so the uncached column
+/// ends up `input - cached`.
+pub fn codex_session(id: &str, model: &str, input: u64, cached: u64, output: u64) -> Vec<String> {
+    vec![
+        serde_json::json!({
+            "timestamp": "2026-04-01T12:00:00.000Z",
+            "type": "session_meta",
+            "payload": { "id": id, "cwd": "/Users/test/code/gamma" }
+        })
+        .to_string(),
+        serde_json::json!({
+            "timestamp": "2026-04-01T12:00:01.000Z",
+            "type": "turn_context",
+            "payload": { "model": model }
+        })
+        .to_string(),
+        serde_json::json!({
+            "timestamp": "2026-04-01T12:00:02.000Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": { "last_token_usage": {
+                    "input_tokens": input,
+                    "cached_input_tokens": cached,
+                    "output_tokens": output
+                }}
+            }
+        })
+        .to_string(),
+    ]
 }
 
 pub fn read_stdout(out: &Output) -> String {

@@ -32,43 +32,83 @@ pub fn render<S: Source + ?Sized>(
         return statusline::print(cache, opts, source);
     }
 
-    let bucket = match opts.cmd {
+    let bucket = bucket_for(opts.cmd);
+    let filter = filter_for(opts);
+    let mut rollup = aggregate(cache, bucket, &filter, opts.breakdown, source);
+    retain_block_window(&mut rollup, bucket, opts);
+
+    emit(cache, &rollup, opts, bucket, source)
+}
+
+/// Render the union of every provider that has logs (`--all`).
+///
+/// Takes no `cache`/`source`: each provider is loaded and aggregated by
+/// its own `Source` inside [`crate::cache::aggregate_all`], and what
+/// comes back is already summed. Rendering then runs against
+/// [`crate::source::Union`], whose only real jobs are the report title
+/// and leaving the pre-shortened model names alone.
+pub fn render_all(opts: &Options) -> std::io::Result<()> {
+    let bucket = bucket_for(opts.cmd);
+    let filter = filter_for(opts);
+    let merged = crate::cache::aggregate_all(bucket, &filter, opts.breakdown, opts.by_agent);
+    let mut rollup = merged.rollup;
+    retain_block_window(&mut rollup, bucket, opts);
+    emit(&merged.cache, &rollup, opts, bucket, &crate::source::Union)
+}
+
+const fn bucket_for(cmd: Cmd) -> Bucket {
+    match cmd {
         Cmd::Weekly => Bucket::Week,
         Cmd::Monthly => Bucket::Month,
         Cmd::Session => Bucket::Session,
         Cmd::Blocks => Bucket::Block,
         _ => Bucket::Day,
-    };
+    }
+}
 
-    let filter = FilterOpts {
+fn filter_for(opts: &Options) -> FilterOpts<'_> {
+    FilterOpts {
         since_day: opts.since,
         until_day: opts.until,
         project: opts.project.as_deref(),
         tz_offset_secs: opts.tz_offset_secs,
-    };
-
-    let mut rollup = aggregate(cache, bucket, &filter, opts.breakdown, source);
-
-    // `blocks --active` / `--recent` are time-window filters on the
-    // already-aggregated block rows (the block key is its start ts).
-    if matches!(bucket, Bucket::Block) && (opts.blocks_active || opts.blocks_recent) {
-        let now = chrono::Utc::now().timestamp();
-        rollup.retain(|k, _| {
-            let start = k.0.as_i64();
-            if opts.blocks_active {
-                now >= start && now < start + BLOCK_SECS
-            } else {
-                // --recent: blocks started within the last 3 days.
-                start >= now - 3 * 86_400
-            }
-        });
     }
+}
 
+/// `blocks --active` / `--recent` are time-window filters on the
+/// already-aggregated block rows (the block key is its start ts).
+fn retain_block_window(
+    rollup: &mut rustc_hash::FxHashMap<crate::cache::BreakdownKey, crate::cache::BucketUsage>,
+    bucket: Bucket,
+    opts: &Options,
+) {
+    if !matches!(bucket, Bucket::Block) || !(opts.blocks_active || opts.blocks_recent) {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    rollup.retain(|k, _| {
+        let start = k.0.as_i64();
+        if opts.blocks_active {
+            now >= start && now < start + BLOCK_SECS
+        } else {
+            // --recent: blocks started within the last 3 days.
+            start >= now - 3 * 86_400
+        }
+    });
+}
+
+fn emit<S: Source + ?Sized>(
+    cache: &LoadedCache,
+    rollup: &rustc_hash::FxHashMap<crate::cache::BreakdownKey, crate::cache::BucketUsage>,
+    opts: &Options,
+    bucket: Bucket,
+    source: &S,
+) -> std::io::Result<()> {
     if opts.json {
-        json::print(cache, &rollup, opts, bucket, source)
+        json::print(cache, rollup, opts, bucket, source)
     } else if opts.plain {
-        table::print_plain(cache, &rollup, opts, bucket, source)
+        table::print_plain(cache, rollup, opts, bucket, source)
     } else {
-        table::print(cache, &rollup, opts, bucket, source)
+        table::print(cache, rollup, opts, bucket, source)
     }
 }

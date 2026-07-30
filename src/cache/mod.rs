@@ -6,9 +6,11 @@ mod agg;
 mod build;
 mod load;
 mod schema;
+mod union;
 
 pub use agg::{
     BLOCK_SECS, BreakdownKey, Bucket, BucketKey, BucketUsage, FilterOpts, ProjectFilter,
     SessionTotals, aggregate, per_session_totals, resolve_project_filter, week_start_day,
 };
 pub use load::{LoadedCache, load};
+pub use union::{Merged, aggregate_all};

@@ -1216,6 +1216,128 @@ fn subcommand_list_is_identical_in_help_and_completion() {
     }
 }
 
+// ── Cross-source reports ──
+
+/// Give the harness both providers with real, distinct numbers.
+/// Claude: 1500 in / 2500 out / 10000 cw / 1000 cr on opus-4-7.
+/// Codex:  800 uncached in / 200 cached / 100 out on gpt-5.4.
+fn setup_two_providers(h: &Harness) {
+    setup_single_project(h);
+    let lines = codex_session("cx1", "gpt-5.4", 1000, 200, 100);
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let _ = h.write_codex_rollout(("2026", "04", "01"), "a", &refs);
+}
+
+/// `--all` is exactly the sum of the per-provider reports.
+///
+/// Each provider is aggregated by its own `Source` and only the totals
+/// are added, so this also pins that Codex tokens are not silently
+/// priced against Claude's rate table — the failure mode that motivated
+/// keeping the merge at the rollup level.
+#[test]
+fn all_sources_sums_each_provider_priced_by_its_own_table() {
+    let h = Harness::new();
+    setup_two_providers(&h);
+
+    let totals = |args: &[&str]| -> (u64, u64, u64, u64, f64) {
+        let out = h.run(args);
+        require_success(&out, "totals");
+        let v: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+        let t = &v["totals"];
+        (
+            t["input"].as_u64().unwrap_or(0),
+            t["output"].as_u64().unwrap_or(0),
+            t["cache_create"].as_u64().unwrap_or(0),
+            t["cache_read"].as_u64().unwrap_or(0),
+            t["cost_usd"].as_f64().unwrap_or(0.0),
+        )
+    };
+
+    let claude = totals(&["daily", "--json"]);
+    let codex = totals(&["daily", "--json", "--source", "codex"]);
+    let all = totals(&["daily", "--json", "--all"]);
+
+    assert_eq!(claude.0, 1500, "claude fixture");
+    assert_eq!(codex.0, 800, "codex input excludes the cached portion");
+    assert_eq!(codex.3, 200, "codex cached tokens are cache reads");
+
+    assert_eq!(all.0, claude.0 + codex.0, "input");
+    assert_eq!(all.1, claude.1 + codex.1, "output");
+    assert_eq!(all.2, claude.2 + codex.2, "cache_create");
+    assert_eq!(all.3, claude.3 + codex.3, "cache_read");
+    assert!(
+        (all.4 - (claude.4 + codex.4)).abs() < 1e-9,
+        "cost: {} vs {} + {}",
+        all.4,
+        claude.4,
+        codex.4
+    );
+    // Codex must be priced as Codex: 800@$1.25 + 100@$10 + 200@$0.125.
+    assert!(
+        (codex.4 - 0.002_025).abs() < 1e-9,
+        "codex priced off its own table, got {}",
+        codex.4
+    );
+}
+
+#[test]
+fn by_agent_splits_rows_by_provider() {
+    let h = Harness::new();
+    setup_two_providers(&h);
+
+    let out = h.run(&["daily", "--json", "--by-agent"]);
+    require_success(&out, "daily --by-agent");
+    let v: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let rows = v["rows"].as_array().expect("rows");
+
+    // Both providers were active on 2026-04-01, so that day yields two
+    // rows where a plain --all yields one.
+    let day1 = rows.iter().filter(|r| r["key"] == "2026-04-01").count();
+    assert_eq!(day1, 2, "one row per provider on a shared day: {rows:?}");
+
+    let named: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r["agent"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        named.iter().any(|m| m == "Claude Code") && named.iter().any(|m| m == "Codex"),
+        "the split dimension must name providers, got {named:?}"
+    );
+    // A provider is not a model: `.model` must stay absent so a consumer
+    // reading it doesn't get "Claude Code" back.
+    assert!(
+        rows.iter().all(|r| r["model"].is_null()),
+        "--by-agent must not populate `model`: {rows:?}"
+    );
+
+    // The table's second column names the provider too, so the two
+    // renderings agree on what the split dimension is.
+    let table = read_stdout(&h.run(&["daily", "--by-agent"]));
+    assert!(table.contains("Claude Code"), "table:\n{table}");
+    assert!(table.contains("Codex"), "table:\n{table}");
+}
+
+#[test]
+fn cross_source_flags_reject_what_they_contradict() {
+    let h = Harness::new();
+    setup_two_providers(&h);
+
+    let e = require_usage_error(
+        &h.run(&["daily", "--all", "--source", "codex"]),
+        "--all + --source",
+    );
+    assert!(e.contains("--source"), "got: {e}");
+
+    let e = require_usage_error(
+        &h.run(&["daily", "--by-agent", "--breakdown"]),
+        "--by-agent + --breakdown",
+    );
+    assert!(e.contains("--breakdown"), "got: {e}");
+
+    let e = require_usage_error(&h.run(&["tui", "--all"]), "--all on tui");
+    assert!(e.contains("--all"), "got: {e}");
+}
+
 // ── Config file ──
 
 /// A price override actually reprices, and does so from the RAW model

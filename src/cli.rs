@@ -119,6 +119,13 @@ pub struct Options {
     /// uniformity without spawning a browser.
     pub no_serve: bool,
     pub source: crate::source::SourceKind,
+    /// Report every provider that has logs, summed, instead of the one
+    /// `--source` names. Implied by `--by-agent`.
+    pub all_sources: bool,
+    /// Split the `--all` rows by provider rather than collapsing them.
+    /// Occupies the same row-splitting slot as `--breakdown`, so the two
+    /// are mutually exclusive.
+    pub by_agent: bool,
     /// Limit the displayed rows to the most recent N buckets. `None`
     /// shows all rows. Applied after sorting; totals reflect visible
     /// rows only.
@@ -361,6 +368,15 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
                 o.no_cost = true;
                 i += 1;
             }
+            "--all" => {
+                o.all_sources = true;
+                i += 1;
+            }
+            "--by-agent" => {
+                o.all_sources = true;
+                o.by_agent = true;
+                i += 1;
+            }
             "--config" => {
                 o.config_path = Some(next()?.to_string());
                 i += 2;
@@ -587,6 +603,8 @@ const KNOWN_FLAGS: &[&str] = &[
     "no-cost",
     "logs-dir",
     "config",
+    "all",
+    "by-agent",
     "version",
     "no-color",
     "quiet",
@@ -687,6 +705,20 @@ fn validate_flag_scopes(o: &Options) -> Result<(), String> {
     }
     if o.carbon {
         report_flag("--carbon")?;
+    }
+    if o.all_sources {
+        report_flag(if o.by_agent { "--by-agent" } else { "--all" })?;
+        // Both split rows on the renderer's single secondary dimension.
+        if o.by_agent && o.breakdown {
+            return Err(
+                "--by-agent cannot be combined with --breakdown (both split rows)".to_string(),
+            );
+        }
+        // `--all` already means every provider; naming one too is a
+        // contradiction rather than a narrowing.
+        if o.source != crate::source::SourceKind::default() {
+            return Err("--all reports every provider; drop --source".to_string());
+        }
     }
     if o.no_cost {
         report_flag("--no-cost")?;
@@ -1028,6 +1060,8 @@ pub fn print_help() {
             // flag that doesn't exist, which the parity test catches.
             "read logs for --source from DIRS (comma-separated)",
         ),
+        ("", "--all", "report every provider that has logs, summed"),
+        ("", "--by-agent", "like --all, one row per provider"),
         ("", "--no-cost", "omit every dollar figure from the output"),
         ("", "--no-color", "disable ANSI color (also: NO_COLOR env)"),
         ("-q", "--quiet", "suppress non-essential output"),

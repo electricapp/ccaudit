@@ -202,6 +202,22 @@ fn validate(sessions: &[SessionEntry], sources: &[SourceFile]) -> bool {
     true
 }
 
+/// A cache carrying only the interned name tables.
+///
+/// The cross-source union renders from a merged rollup rather than from
+/// rows: renderers reach into the cache only for `models` / `projects`
+/// names and session labels, all of which are names. Handing them one of
+/// these keeps the union off the row-shaped paths entirely, so there is
+/// no need to splice several providers' sessions, lines and preaggs into
+/// one address space just to print a table.
+pub fn names_only(models: Vec<String>, projects: Vec<String>) -> LoadedCache {
+    LoadedCache {
+        models,
+        projects,
+        ..empty()
+    }
+}
+
 const fn empty() -> LoadedCache {
     LoadedCache {
         storage: CacheStorage::Owned {

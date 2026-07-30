@@ -187,7 +187,11 @@ fn main() {
                     process::exit(2);
                 }
             }
-            let render_result = report::render(&cache, &opts, source);
+            let render_result = if opts.all_sources {
+                report::render_all(&opts)
+            } else {
+                report::render(&cache, &opts, source)
+            };
             let t_render = t0.elapsed().saturating_sub(t_load);
             if tprof {
                 eprintln!("load={t_load:?}  render={t_render:?}");
@@ -460,7 +464,7 @@ fn print_completion(shell: Option<&str>) -> Result<(), String> {
     let subcommands: Vec<&str> = cli::Cmd::ALL.iter().map(|c| c.as_str()).collect();
     let subs = subcommands.join(" ");
     let flags = "--since --until --project --timezone --locale --source --json --plain \
---breakdown --compact --instances --order --tail --carbon --cost-limit --no-cost --logs-dir --config \
+--breakdown --compact --instances --order --tail --carbon --cost-limit --no-cost --logs-dir --config --all --by-agent \
 --active --recent \
 --live --offline --mode --no-color --quiet --version --help --port --out --no-serve";
     let script = match shell {

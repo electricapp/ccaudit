@@ -500,6 +500,58 @@ impl std::str::FromStr for SourceKind {
     }
 }
 
+/// Rendering-only provider for a cross-source union (`--all`).
+///
+/// A union has no log directory and no rate table of its own: the rows
+/// were already priced by each contributing provider and their model
+/// names already shortened by whichever provider produced them. So the
+/// methods below are not stubs — they state exactly that. `logs_dir` is
+/// `None` because a union owns no files, `normalize_model` is identity
+/// because the names arrive pre-normalized, and `base_price` is zero
+/// because nothing routed through here is ever priced again.
+pub struct Union;
+
+/// Rate table for [`Union`]. Never applied — a merged rollup carries
+/// costs computed by the contributing providers — but a real zero is a
+/// safer answer than a plausible-looking guess if it ever were.
+static UNION_ZERO_RATE: Pricing = Pricing {
+    input: 0.0,
+    output: 0.0,
+    cache_write: 0.0,
+    cache_write_1h: 0.0,
+    cache_read: 0.0,
+};
+
+impl Source for Union {
+    fn id(&self) -> &'static str {
+        "all"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "All providers"
+    }
+
+    fn logs_dir(&self) -> Option<PathBuf> {
+        None
+    }
+
+    fn parse_session(&self, _src: &SourceFile) -> Option<ParsedSession> {
+        None
+    }
+
+    fn parse_messages(&self, _path: &Path) -> Option<crate::parse::Session> {
+        None
+    }
+
+    fn base_price(&self, _model: Option<&str>) -> &Pricing {
+        &UNION_ZERO_RATE
+    }
+
+    fn normalize_model<'a>(&self, model: &'a str) -> Cow<'a, str> {
+        Cow::Borrowed(model)
+    }
+}
+
 /// Resolve a `SourceKind` to its singleton `Source` impl.
 pub fn pick(kind: SourceKind) -> &'static dyn Source {
     match kind {
