@@ -32,11 +32,10 @@ impl Source for Codex {
     }
 
     fn scan_sources(&self) -> Vec<SourceFile> {
-        let Some(root) = self.logs_dir() else {
-            return vec![];
-        };
         let mut out: Vec<SourceFile> = Vec::with_capacity(128);
-        scan_yyyy_mm_dd(&root, &mut out);
+        for root in self.log_roots() {
+            scan_yyyy_mm_dd(&root, &mut out);
+        }
         out
     }
 
@@ -57,7 +56,7 @@ impl Source for Codex {
         cwd.unwrap_or("unknown").to_owned()
     }
 
-    fn price(&self, model: Option<&str>) -> &Pricing {
+    fn base_price(&self, model: Option<&str>) -> &Pricing {
         // `model` first so `price(None)` never forces the LiteLLM table
         // load — see the matching note in `ClaudeCode::price`.
         if let Some(name) = model {

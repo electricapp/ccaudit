@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/electricapp/ccaudit/main/ccaudit.schema.json",
+  "title": "ccaudit configuration",
+  "description": "Defaults, per-provider log locations, and per-model price overrides for ccaudit. Every field is optional and every field has a command-line equivalent that overrides it. Searched at ./ccaudit.json then $XDG_CONFIG_HOME/ccaudit/config.json (else ~/.config/ccaudit/config.json), or named with --config.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "URL of this schema, for editor autocomplete."
+    },
+    "source": {
+      "type": "string",
+      "description": "Default log provider (--source).",
+      "enum": ["claude-code", "claude", "cc", "codex", "openai", "cdx"]
+    },
+    "timezone": {
+      "type": "string",
+      "description": "Default timezone for date grouping (--timezone): UTC, Local, or ±HH:MM.",
+      "examples": ["UTC", "Local", "-05:00"]
+    },
+    "locale": {
+      "type": "string",
+      "description": "Default date locale (--locale).",
+      "examples": ["en_US", "ja_JP"]
+    },
+    "no_cost": {
+      "type": "boolean",
+      "description": "Omit every dollar figure from reports (--no-cost)."
+    },
+    "compact": {
+      "type": "boolean",
+      "description": "Use the narrow table layout (--compact)."
+    },
+    "breakdown": {
+      "type": "boolean",
+      "description": "Split each bucket into one row per model (--breakdown)."
+    },
+    "sources": {
+      "type": "object",
+      "description": "Per-provider settings, keyed by the --source id.",
+      "additionalProperties": false,
+      "propertyNames": { "enum": ["claude-code", "codex"] },
+      "patternProperties": {
+        "^.*$": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "logs_dirs": {
+              "type": "array",
+              "description": "Directories to read this provider's logs from, replacing its default location. Several roots are read as one corpus, so a live directory and an archive can be reported together.",
+              "items": { "type": "string" },
+              "minItems": 1
+            }
+          }
+        }
+      }
+    },
+    "prices": {
+      "type": "object",
+      "description": "Per-model rate overrides in US dollars per million tokens. Keyed on the RAW model name as it appears in the logs (claude-opus-4-6-20251205), not the shortened display name — display names collapse date suffixes and would cover several distinctly priced models at once. Editing any rate invalidates the cached cost aggregation automatically.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["input", "output", "cache_write", "cache_read"],
+        "description": "All four base rates are required: a partial override would blend user intent with a shipped default, and a missing rate reading as $0 is exactly the quiet wrong number this file exists to fix.",
+        "properties": {
+          "input": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Uncached input tokens, $/M."
+          },
+          "output": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Output tokens, $/M."
+          },
+          "cache_write": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Cache writes at the short (5-minute) TTL, $/M."
+          },
+          "cache_write_1h": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Cache writes at the 1-hour TTL, $/M. Defaults to cache_write for models with only one tier. Anthropic charges 2x input here against 1.25x for the 5-minute tier."
+          },
+          "cache_read": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Cache reads, $/M."
+          }
+        }
+      }
+    }
+  }
+}

@@ -28,21 +28,23 @@ impl Source for ClaudeCode {
     // cache_path: default impl composes {cache_root}/{id}.db for us.
 
     fn scan_sources(&self) -> Vec<SourceFile> {
-        let Some(dir) = self.logs_dir() else {
-            return vec![];
-        };
-        // Opt-in fast path: macOS getattrlistbulk batches readdir + stat
-        // into one kernel round-trip per directory, shaving ~500μs off
-        // the hot path (~2.8ms → ~2.1ms on a typical project tree).
-        // Set CCAUDIT_BULK_SCAN=1 to try it; any FFI error falls back
-        // silently to the portable default_scan path.
-        #[cfg(target_os = "macos")]
-        if std::env::var_os("CCAUDIT_BULK_SCAN").is_some() {
-            if let Some(out) = scan_with_bulk(&dir) {
-                return out;
+        let mut out: Vec<SourceFile> = Vec::new();
+        for dir in self.log_roots() {
+            // Opt-in fast path: macOS getattrlistbulk batches readdir +
+            // stat into one kernel round-trip per directory, shaving
+            // ~500μs off the hot path (~2.8ms → ~2.1ms on a typical
+            // project tree). Set CCAUDIT_BULK_SCAN=1 to try it; any FFI
+            // error falls back silently to the portable default_scan.
+            #[cfg(target_os = "macos")]
+            if std::env::var_os("CCAUDIT_BULK_SCAN").is_some() {
+                if let Some(files) = scan_with_bulk(&dir) {
+                    out.extend(files);
+                    continue;
+                }
             }
+            out.extend(super::default_scan(&dir));
         }
-        super::default_scan(&dir)
+        out
     }
 
     fn parse_session(&self, src: &SourceFile) -> Option<ParsedSession> {
@@ -84,7 +86,7 @@ impl Source for ClaudeCode {
             .into_owned()
     }
 
-    fn price(&self, model: Option<&str>) -> &Pricing {
+    fn base_price(&self, model: Option<&str>) -> &Pricing {
         // 1. Try the user's refreshed LiteLLM cache (if present). This
         //    matches ccusage's approach and keeps prices current without
         //    a code change. Multiple name variants are tried (exact +

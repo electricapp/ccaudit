@@ -129,6 +129,24 @@ pub struct Options {
     /// Append a carbon-footprint footer (energy kWh, CO₂ kg, tree-
     /// years) to the report. Off by default to keep output lean.
     pub carbon: bool,
+    /// Drop every dollar figure: the table's cost column and per-column
+    /// price row, the TSV's trailing field, and the JSON's `cost_usd`
+    /// keys. For sharing token volumes without disclosing spend.
+    pub no_cost: bool,
+    /// Directories to read `--source`'s logs from, replacing its default
+    /// location. Empty means "use the default". Several roots let one
+    /// run cover a live directory plus an archive.
+    pub logs_dirs: Vec<String>,
+    /// Config file that was actually loaded, if any. Set by the parser
+    /// after the search; `--config` names one explicitly and a path that
+    /// doesn't exist is an error rather than a silent fallback.
+    pub config_path: Option<String>,
+    /// Per-source log roots from the config. `--logs-dir` overrides the
+    /// selected source; this can set several at once.
+    pub config_log_roots: Vec<(String, Vec<std::path::PathBuf>)>,
+    /// Per-model price overrides from the config, keyed on the raw model
+    /// name as it appears in the logs.
+    pub config_prices: Vec<(String, crate::source::Pricing)>,
     /// Force-disable ANSI color regardless of TTY detection. Mirrors the
     /// `NO_COLOR` / `CCAUDIT_NO_COLOR` env vars and the universal
     /// `--no-color` convention. The final decision (TTY + env + flag)
@@ -180,6 +198,24 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             _ => vec![a.clone()],
         })
         .collect();
+
+    // The config seeds defaults BEFORE flags are read, so the loop below
+    // overwrites them naturally and the command line always wins. Doing
+    // it after would need a "was this flag given?" bit on every field
+    // just to know what may be overridden.
+    //
+    // `--config` therefore has to be found ahead of its own parse, hence
+    // the pre-scan. It stays in the loop as well so an unknown-flag
+    // error can't fire on it.
+    let explicit_config = args
+        .iter()
+        .position(|a| a == "--config")
+        .and_then(|p| args.get(p + 1))
+        .map(String::as_str);
+    if let Some((path, cfg)) = crate::config::load(explicit_config)? {
+        apply_config(&mut o, &cfg)?;
+        o.config_path = Some(path.to_string_lossy().into_owned());
+    }
 
     // First positional token, if present, may be a subcommand.
     let mut i = 0usize;
@@ -321,6 +357,28 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
                 o.carbon = true;
                 i += 1;
             }
+            "--no-cost" => {
+                o.no_cost = true;
+                i += 1;
+            }
+            "--config" => {
+                o.config_path = Some(next()?.to_string());
+                i += 2;
+            }
+            "--logs-dir" => {
+                let raw = next()?;
+                let dirs: Vec<String> = raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                if dirs.is_empty() {
+                    return Err("--logs-dir needs at least one directory".to_string());
+                }
+                o.logs_dirs = dirs;
+                i += 2;
+            }
             "--version" | "-V" => {
                 o.cmd = Cmd::Version;
                 i += 1;
@@ -452,6 +510,40 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
 /// only by the typo-hint matcher on an unknown flag, so it doesn't
 /// need to track which command each applies to — `validate_flag_scopes`
 /// handles correctness; this just rescues typos like `--complact`.
+/// Seed `o` from a loaded config. Flag parsing runs afterwards and
+/// overwrites anything it sets, so this only ever supplies defaults.
+///
+/// Values are validated exactly as the equivalent flag would be — a bad
+/// timezone in a config file should fail the same way `--timezone junk`
+/// does, naming the file so the user knows where to look.
+fn apply_config(o: &mut Options, cfg: &crate::config::Config) -> Result<(), String> {
+    if let Some(s) = cfg.source.as_deref() {
+        use std::str::FromStr as _;
+        o.source =
+            crate::source::SourceKind::from_str(s).map_err(|e| format!("config `source`: {e}"))?;
+    }
+    if let Some(tz) = cfg.timezone.as_deref() {
+        let (offset, label) = parse_timezone(tz).map_err(|e| format!("config `timezone`: {e}"))?;
+        o.tz_offset_secs = offset;
+        o.tz_label = label;
+    }
+    if let Some(l) = cfg.locale.as_deref() {
+        o.locale = Some(l.to_string());
+    }
+    if let Some(v) = cfg.no_cost {
+        o.no_cost = v;
+    }
+    if let Some(v) = cfg.compact {
+        o.compact = v;
+    }
+    if let Some(v) = cfg.breakdown {
+        o.breakdown = v;
+    }
+    o.config_log_roots = cfg.log_roots();
+    o.config_prices = cfg.price_overrides();
+    Ok(())
+}
+
 /// Rendered `--source` value list, e.g. `claude-code (default), codex`.
 ///
 /// Built from [`SourceKind::ALL`] rather than typed out, so a provider
@@ -492,6 +584,9 @@ const KNOWN_FLAGS: &[&str] = &[
     "tail",
     "carbon",
     "cost-limit",
+    "no-cost",
+    "logs-dir",
+    "config",
     "version",
     "no-color",
     "quiet",
@@ -592,6 +687,15 @@ fn validate_flag_scopes(o: &Options) -> Result<(), String> {
     }
     if o.carbon {
         report_flag("--carbon")?;
+    }
+    if o.no_cost {
+        report_flag("--no-cost")?;
+        // --cost-limit renders a percentage of a dollar cap. Honoring
+        // both would either leak the spend the user asked to hide or
+        // silently drop the column they asked for.
+        if o.cost_limit.is_some() {
+            return Err("--no-cost cannot be combined with --cost-limit".to_string());
+        }
     }
     if o.plain {
         report_flag("--plain")?;
@@ -912,6 +1016,19 @@ pub fn print_help() {
         ("", "--timezone TZ", "UTC, Local, or ±HH:MM (default UTC)"),
         ("", "--locale LOC", "date locale (e.g. en_US, ja_JP)"),
         ("", "--source NAME", source_desc.as_str()),
+        (
+            "",
+            "--config PATH",
+            "read defaults + price overrides from PATH",
+        ),
+        (
+            "",
+            "--logs-dir DIRS",
+            // No possessive on a flag name: `--source's` scrapes as a
+            // flag that doesn't exist, which the parity test catches.
+            "read logs for --source from DIRS (comma-separated)",
+        ),
+        ("", "--no-cost", "omit every dollar figure from the output"),
         ("", "--no-color", "disable ANSI color (also: NO_COLOR env)"),
         ("-q", "--quiet", "suppress non-essential output"),
         ("-V", "--version", "print the version"),

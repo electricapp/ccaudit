@@ -85,7 +85,7 @@ pub struct Tokens {
 // Per-million-token prices. A provider returns one of these for each
 // model it knows about; unknown models fall back to the provider's
 // default (typically Sonnet-tier).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Pricing {
     pub input: f64,
     pub output: f64,
@@ -138,16 +138,43 @@ pub trait Source: Sync + Send {
     /// e.g. "Claude Code", "Codex", "`OpenCode`".
     fn display_name(&self) -> &'static str;
 
-    /// Directory where this provider's logs live. `None` when the
-    /// platform doesn't expose a home dir (rare). Providers whose
+    /// Directory where this provider's logs live by default. `None` when
+    /// the platform doesn't expose a home dir (rare). Providers whose
     /// sessions aren't filesystem-rooted (e.g. a SQLite-backed provider)
     /// return the containing directory of the db.
+    ///
+    /// Scanners read [`Source::log_roots`], not this — the user can point
+    /// a provider at other directories entirely.
     fn logs_dir(&self) -> Option<PathBuf>;
 
-    /// Binary cache file path. Default: `{cache_root}/{id()}.db`. Override
-    /// only to put the cache somewhere non-standard.
+    /// Every directory to scan for this provider's logs.
+    ///
+    /// A configured override replaces `logs_dir()` outright rather than
+    /// adding to it: pointing at an archive should report that archive,
+    /// not silently blend it with whatever is in `$HOME`.
+    fn log_roots(&self) -> Vec<PathBuf> {
+        match log_root_override(self.id()) {
+            Some(roots) => roots.to_vec(),
+            None => self.logs_dir().into_iter().collect(),
+        }
+    }
+
+    /// Binary cache file path. Default: `{cache_root}/{id()}.db`, or
+    /// `{cache_root}/{id()}-{hash}.db` when the roots are overridden —
+    /// two corpora under one filename would invalidate each other on
+    /// every alternating run.
     fn cache_path(&self) -> Option<PathBuf> {
-        default_cache_path(self.id())
+        let mut h: u64 = price_override_digest();
+        if let Some(roots) = log_root_override(self.id()) {
+            for r in roots {
+                h ^= path_hash(r);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        if h == 0 {
+            return default_cache_path(self.id());
+        }
+        default_cache_path(&format!("{}-{h:016x}", self.id()))
     }
 
     /// Enumerate every session available from this provider without
@@ -156,10 +183,11 @@ pub trait Source: Sync + Send {
     /// override to synthesize one `SourceFile` per session, stashing
     /// whatever identity info they need in `path_hash` + `path`.
     fn scan_sources(&self) -> Vec<SourceFile> {
-        self.logs_dir()
-            .as_deref()
-            .map(default_scan)
-            .unwrap_or_default()
+        let mut out = Vec::new();
+        for root in self.log_roots() {
+            out.extend(default_scan(&root));
+        }
+        out
     }
 
     /// Parse one session into canonical form. Takes the full `SourceFile`
@@ -201,9 +229,24 @@ pub trait Source: Sync + Send {
         path.parent().unwrap_or(path).to_string_lossy().into_owned()
     }
 
-    /// Pricing for a given model. `None` means "unknown model" — the
-    /// implementation decides the fallback.
-    fn price(&self, model: Option<&str>) -> &Pricing;
+    /// Pricing for a given model, honoring the user's config overrides.
+    ///
+    /// Not implemented by providers — they write [`Source::base_price`].
+    /// Applying overrides here rather than in each provider is what
+    /// guarantees a new provider picks them up for free instead of
+    /// quietly ignoring the config.
+    fn price(&self, model: Option<&str>) -> &Pricing {
+        if let Some(name) = model {
+            if let Some(p) = price_override(name) {
+                return p;
+            }
+        }
+        self.base_price(model)
+    }
+
+    /// This provider's own rate for a model. `None` means "unknown
+    /// model" — the implementation decides the fallback.
+    fn base_price(&self, model: Option<&str>) -> &Pricing;
 
     /// Normalize a model name for display (strip vendor prefix, date
     /// suffix, etc.). `"claude-opus-4-6-20251205"` → `"opus-4-6"`. Returns
@@ -341,6 +384,85 @@ fn scan_dir_recursive(dir: &Path, depth_left: usize, out: &mut Vec<SourceFile>) 
             size: meta.len(),
         });
     }
+}
+
+// ── Log-root overrides ──
+//
+// Set once at startup from `--logs-dir` / the config file, then read by
+// every `log_roots()` call. A process global rather than a field on the
+// provider because the `Source` impls are zero-sized singletons handed
+// out as `&'static dyn Source`; threading the paths through every call
+// site instead would touch the cache, parse, report and web layers to
+// carry something only the scanner needs.
+
+static LOG_ROOTS: std::sync::OnceLock<Vec<(String, Vec<PathBuf>)>> = std::sync::OnceLock::new();
+
+/// Install per-source log-root overrides. Only the first call takes
+/// effect, which is the one `main` makes before any scan.
+pub fn set_log_roots(roots: Vec<(String, Vec<PathBuf>)>) {
+    let _ = LOG_ROOTS.set(roots);
+}
+
+/// Configured roots for `id`, or `None` to use the provider's default.
+/// Linear scan over a list that holds one entry per provider.
+fn log_root_override(id: &str) -> Option<&'static [PathBuf]> {
+    LOG_ROOTS
+        .get()?
+        .iter()
+        .find(|(k, _)| k == id)
+        .map(|(_, v)| v.as_slice())
+}
+
+// ── Price overrides ──
+//
+// Config-supplied rates, keyed on the raw model name from the logs. Read
+// on every `price()` call, so the list stays small — one entry per model
+// the user chose to correct, not a copy of the LiteLLM table.
+
+static PRICE_OVERRIDES: std::sync::OnceLock<Vec<(String, Pricing)>> = std::sync::OnceLock::new();
+
+/// Install per-model price overrides. Only the first call takes effect,
+/// which is the one `main` makes before any pricing happens.
+pub fn set_price_overrides(prices: Vec<(String, Pricing)>) {
+    let _ = PRICE_OVERRIDES.set(prices);
+}
+
+fn price_override(model: &str) -> Option<&'static Pricing> {
+    PRICE_OVERRIDES
+        .get()?
+        .iter()
+        .find(|(k, _)| k == model)
+        .map(|(_, p)| p)
+}
+
+/// Digest of the active price overrides, or 0 when there are none.
+///
+/// Costs are baked into the aggregation cache at build time, so the
+/// cache filename has to change when the rates do.
+pub fn price_override_digest() -> u64 {
+    let Some(list) = PRICE_OVERRIDES.get() else {
+        return 0;
+    };
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for (model, p) in list {
+        for b in model.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        for v in [
+            p.input,
+            p.output,
+            p.cache_write,
+            p.cache_write_1h,
+            p.cache_read,
+        ] {
+            for b in v.to_bits().to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+    }
+    h
 }
 
 // ── Source registry ──

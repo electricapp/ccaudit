@@ -1216,6 +1216,280 @@ fn subcommand_list_is_identical_in_help_and_completion() {
     }
 }
 
+// ── Config file ──
+
+/// A price override actually reprices, and does so from the RAW model
+/// name in the logs rather than the shortened display name.
+///
+/// Costs are baked into the aggregation cache at build time, so this
+/// also pins that editing a rate invalidates it — a stale cache would
+/// report the old money while looking perfectly fresh.
+#[test]
+fn config_price_override_reprices_by_raw_model_name() {
+    let h = Harness::new();
+    setup_single_project(&h); // 1500 in / 2500 out / 10000 cw / 1000 cr, opus-4-7
+
+    let baseline: Value =
+        serde_json::from_slice(&h.run(&["daily", "--json"]).stdout).expect("baseline JSON");
+    let base_cost = baseline["totals"]["cost_usd"].as_f64().expect("cost");
+
+    // Ten dollars per million on every column makes the expected total
+    // trivially checkable: 15000 tokens → $0.15.
+    let cfg = h.write_config(
+        "flat.json",
+        r#"{"prices":{"claude-opus-4-7":{"input":10.0,"output":10.0,"cache_write":10.0,"cache_read":10.0}}}"#,
+    );
+    let out = h.run(&["daily", "--json", "--config", &cfg]);
+    require_success(&out, "daily --config");
+    let v: Value = serde_json::from_slice(&out.stdout).expect("override JSON");
+    let cost = v["totals"]["cost_usd"].as_f64().expect("cost");
+    assert!(
+        (cost - 0.15).abs() < 1e-9,
+        "15000 tokens at $10/M should be $0.15, got {cost} (baseline was {base_cost})"
+    );
+
+    // The display name is `opus-4-7`; keying on it must NOT match, since
+    // it would cover every dated build of that model at once.
+    let wrong = h.write_config(
+        "display.json",
+        r#"{"prices":{"opus-4-7":{"input":10.0,"output":10.0,"cache_write":10.0,"cache_read":10.0}}}"#,
+    );
+    let v: Value = serde_json::from_slice(&h.run(&["daily", "--json", "--config", &wrong]).stdout)
+        .expect("display-name JSON");
+    assert!(
+        (v["totals"]["cost_usd"].as_f64().expect("cost") - base_cost).abs() < 1e-9,
+        "a display-name key must not match; overrides are keyed on the raw log name"
+    );
+}
+
+#[test]
+fn config_supplies_defaults_that_flags_override() {
+    let h = Harness::new();
+    setup_single_project(&h);
+
+    let cfg = h.write_config("defaults.json", r#"{"no_cost":true}"#);
+    let from_cfg = read_stdout(&h.run(&["daily", "--config", &cfg]));
+    assert!(!from_cfg.contains('$'), "config `no_cost` was not applied");
+
+    let cfg2 = h.write_config("compact.json", r#"{"compact":true,"timezone":"UTC"}"#);
+    let compact = read_stdout(&h.run(&["daily", "--config", &cfg2]));
+    let normal = read_stdout(&h.run(&["daily"]));
+    let width = |s: &str| s.lines().map(str::len).max().unwrap_or(0);
+    assert!(
+        width(&compact) < width(&normal),
+        "config `compact` was not applied"
+    );
+
+    // A flag given alongside the config wins.
+    let cfg3 = h.write_config("src.json", r#"{"source":"codex"}"#);
+    let out = h.run(&[
+        "daily",
+        "--json",
+        "--config",
+        &cfg3,
+        "--source",
+        "claude-code",
+    ]);
+    require_success(&out, "flag overriding config source");
+    let v: Value = serde_json::from_slice(&out.stdout).expect("JSON");
+    assert_eq!(
+        v["totals"]["input"].as_u64(),
+        Some(1500),
+        "--source on the command line must beat the config's"
+    );
+}
+
+#[test]
+fn config_errors_are_loud() {
+    let h = Harness::new();
+    setup_single_project(&h);
+
+    let missing = require_usage_error(
+        &h.run(&["daily", "--config", "/definitely/not/here.json"]),
+        "missing config",
+    );
+    assert!(missing.contains("not found"), "got: {missing}");
+
+    // A typo'd key would otherwise leave the user believing an override
+    // applied while the shipped price was used.
+    let typo = h.write_config("typo.json", r#"{"pricess":{}}"#);
+    let err = require_usage_error(&h.run(&["daily", "--config", &typo]), "unknown field");
+    assert!(err.contains("unknown field"), "got: {err}");
+
+    let bad_tz = h.write_config("tz.json", r#"{"timezone":"Mars/Olympus"}"#);
+    let err = require_usage_error(&h.run(&["daily", "--config", &bad_tz]), "bad timezone");
+    assert!(err.contains("timezone"), "got: {err}");
+}
+
+#[test]
+fn config_sets_log_roots_per_source() {
+    let h = Harness::new();
+    setup_single_project(&h);
+    let line = assistant_line(&AssistantLine {
+        msg_id: "m_cfg",
+        model: "claude-opus-4-7",
+        iso_ts: "2026-05-01T10:00:00.000Z",
+        input: 77,
+        output: 0,
+        cache_read: 0,
+        cache_create: 0,
+        text: "cfg",
+    });
+    let _ = h.write_jsonl_at("archive", "-Users-me-code-a", "s", &[&line]);
+    let cfg = h.write_config(
+        "roots.json",
+        &format!(
+            r#"{{"sources":{{"claude-code":{{"logs_dirs":["{}"]}}}}}}"#,
+            h.root_path("archive")
+        ),
+    );
+    let v: Value = serde_json::from_slice(&h.run(&["daily", "--json", "--config", &cfg]).stdout)
+        .expect("JSON");
+    assert_eq!(v["totals"]["input"].as_u64(), Some(77));
+}
+
+/// `--logs-dir` replaces the provider's default location outright.
+///
+/// Replacing rather than adding is the point: pointing at an archive
+/// should report that archive, not silently blend it with whatever is in
+/// `$HOME`. Several roots then compose into one report, so a live
+/// directory plus an archive can be read in a single run.
+#[test]
+fn logs_dir_replaces_the_default_root_and_unions_several() {
+    let h = Harness::new();
+    // Default location — must NOT appear once --logs-dir is given.
+    setup_single_project(&h);
+
+    let alt = |id: &str, input: u64, output: u64| {
+        assistant_line(&AssistantLine {
+            msg_id: id,
+            model: "claude-opus-4-7",
+            iso_ts: "2026-05-01T10:00:00.000Z",
+            input,
+            output,
+            cache_read: 0,
+            cache_create: 0,
+            text: "alt",
+        })
+    };
+    let _ = h.write_jsonl_at("archive-a", "-Users-me-code-a", "s", &[&alt("m_a", 11, 22)]);
+    let _ = h.write_jsonl_at("archive-b", "-Users-me-code-b", "s", &[&alt("m_b", 33, 44)]);
+
+    let one = h.run(&["daily", "--json", "--logs-dir", &h.root_path("archive-a")]);
+    require_success(&one, "--logs-dir single");
+    let v: Value = serde_json::from_slice(&one.stdout).expect("valid JSON");
+    assert_eq!(
+        v["totals"]["input"].as_u64(),
+        Some(11),
+        "the default $HOME root must not be scanned once --logs-dir is given"
+    );
+
+    let both = format!("{},{}", h.root_path("archive-a"), h.root_path("archive-b"));
+    let two = h.run(&["daily", "--json", "--logs-dir", &both]);
+    require_success(&two, "--logs-dir comma-separated");
+    let v: Value = serde_json::from_slice(&two.stdout).expect("valid JSON");
+    assert_eq!(v["totals"]["input"].as_u64(), Some(44), "11 + 33");
+    assert_eq!(v["totals"]["output"].as_u64(), Some(66), "22 + 44");
+}
+
+#[test]
+fn logs_dir_tolerates_a_missing_root() {
+    let h = Harness::new();
+    let line = assistant_line(&AssistantLine {
+        msg_id: "m1",
+        model: "claude-opus-4-7",
+        iso_ts: "2026-05-01T10:00:00.000Z",
+        input: 7,
+        output: 9,
+        cache_read: 0,
+        cache_create: 0,
+        text: "x",
+    });
+    let _ = h.write_jsonl_at("archive-a", "-Users-me-code-a", "s", &[&line]);
+    // An archive that has been moved or unmounted shouldn't take the
+    // whole report down — the roots that do exist still report.
+    let roots = format!("{},{}", h.root_path("archive-a"), h.root_path("gone"));
+    let out = h.run(&["daily", "--json", "--logs-dir", &roots]);
+    require_success(&out, "--logs-dir with a missing root");
+    let v: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(v["totals"]["input"].as_u64(), Some(7));
+}
+
+#[test]
+fn logs_dir_rejects_an_empty_value() {
+    let h = Harness::new();
+    let stderr = require_usage_error(&h.run(&["daily", "--logs-dir", ",,"]), "--logs-dir ,,");
+    assert!(stderr.contains("--logs-dir"), "got: {stderr}");
+}
+
+/// `--no-cost` removes every dollar figure from every output format.
+///
+/// Dropping the JSON key rather than zeroing it is deliberate: a
+/// consumer reading `.cost_usd` should fail loudly instead of quietly
+/// believing the run was free.
+#[test]
+fn no_cost_omits_every_dollar_figure() {
+    let h = Harness::new();
+    setup_single_project(&h);
+
+    let table = read_stdout(&h.run(&["daily", "--no-cost"]));
+    assert!(
+        !table.contains("Cost"),
+        "table kept a cost header:\n{table}"
+    );
+    assert!(!table.contains('$'), "table kept a dollar figure:\n{table}");
+    assert!(
+        !table.contains("Total Prices"),
+        "the per-column price row is all dollars and must go too:\n{table}"
+    );
+    // The box must still close: a suppressed column changes every
+    // border and separator, not just the data cells.
+    let widths: Vec<usize> = table
+        .lines()
+        .filter(|l| l.starts_with('┌') || l.starts_with('├') || l.starts_with('└'))
+        .map(|l| l.chars().count())
+        .collect();
+    assert!(!widths.is_empty(), "no table borders found:\n{table}");
+    assert!(
+        widths.windows(2).all(|w| w[0] == w[1]),
+        "borders disagree on width after dropping a column: {widths:?}"
+    );
+
+    let plain = read_stdout(&h.run(&["daily", "--no-cost", "--plain"]));
+    let header = plain.lines().next().unwrap_or_default();
+    assert!(!header.contains("cost_usd"), "TSV header: {header}");
+    let cols = header.split('\t').count();
+    for line in plain.lines().skip(1) {
+        assert_eq!(
+            line.split('\t').count(),
+            cols,
+            "TSV row field count must match the header so awk indices hold: {line}"
+        );
+    }
+
+    let out = h.run(&["daily", "--no-cost", "--json"]);
+    require_success(&out, "daily --no-cost --json");
+    let v: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert!(
+        v["totals"].get("cost_usd").is_none(),
+        "totals kept cost_usd"
+    );
+    for row in v["rows"].as_array().expect("rows") {
+        assert!(row.get("cost_usd").is_none(), "row kept cost_usd: {row}");
+    }
+}
+
+#[test]
+fn no_cost_rejects_the_flags_it_contradicts() {
+    let h = Harness::new();
+    setup_single_project(&h);
+    let stderr = require_usage_error(
+        &h.run(&["blocks", "--no-cost", "--cost-limit", "50"]),
+        "both",
+    );
+    assert!(stderr.contains("--cost-limit"), "got: {stderr}");
+}
+
 /// A streamed assistant message bills its FINAL usage, not its first.
 ///
 /// Claude Code rewrites a streamed message as it arrives, repeating the

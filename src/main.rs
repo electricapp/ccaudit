@@ -30,6 +30,29 @@ fn main() {
         }
     };
 
+    // Publish log-root and price overrides before anything scans or
+    // prices. `--logs-dir` scopes to the selected --source and replaces
+    // whatever the config set for it; the config can cover several
+    // providers at once.
+    let mut roots = opts.config_log_roots.clone();
+    if !opts.logs_dirs.is_empty() {
+        let id = source::pick(opts.source).id().to_string();
+        roots.retain(|(k, _)| *k != id);
+        roots.push((
+            id,
+            opts.logs_dirs
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+        ));
+    }
+    if !roots.is_empty() {
+        source::set_log_roots(roots);
+    }
+    if !opts.config_prices.is_empty() {
+        source::set_price_overrides(opts.config_prices.clone());
+    }
+
     // Resolve the color decision once and publish it to the report
     // layer. Order of precedence (clig.dev + NO_COLOR spec):
     //   1. explicit --no-color / --plain        → off
@@ -437,7 +460,8 @@ fn print_completion(shell: Option<&str>) -> Result<(), String> {
     let subcommands: Vec<&str> = cli::Cmd::ALL.iter().map(|c| c.as_str()).collect();
     let subs = subcommands.join(" ");
     let flags = "--since --until --project --timezone --locale --source --json --plain \
---breakdown --compact --instances --order --tail --carbon --cost-limit --active --recent \
+--breakdown --compact --instances --order --tail --carbon --cost-limit --no-cost --logs-dir --config \
+--active --recent \
 --live --offline --mode --no-color --quiet --version --help --port --out --no-serve";
     let script = match shell {
         "bash" => format!(

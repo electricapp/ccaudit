@@ -61,6 +61,8 @@ pub fn print<S: Source + ?Sized>(
         label: label_w,
         last_activity,
         limit: limit_w,
+        // Zero width omits the column outright — see `num_cells`.
+        cost: if opts.no_cost { 0 } else { base.cost },
         ..*base
     };
     let w = &w;
@@ -316,34 +318,38 @@ pub fn print<S: Source + ?Sized>(
     // with its own cells — summing the raw values would let four
     // `<$0.01` cells display a `$0.02` total. It can differ from the
     // "Total" row's cost by a rounding cent.
-    let cents = |c: f64| (c * 100.0).round();
-    let total_prices = (cents(tot_cost_in)
-        + cents(tot_cost_out)
-        + cents(tot_cost_cache_w)
-        + cents(tot_cost_cache_r))
-        / 100.0;
-    buf.push_str(&mid_hline);
-    for s in &mut scratch {
-        s.clear();
+    // The whole row is dollars, so `--no-cost` drops it rather than
+    // blanking its cells.
+    if !opts.no_cost {
+        let cents = |c: f64| (c * 100.0).round();
+        let total_prices = (cents(tot_cost_in)
+            + cents(tot_cost_out)
+            + cents(tot_cost_cache_w)
+            + cents(tot_cost_cache_r))
+            / 100.0;
+        buf.push_str(&mid_hline);
+        for s in &mut scratch {
+            s.clear();
+        }
+        write_cost(&mut scratch[0], tot_cost_in);
+        write_cost(&mut scratch[1], tot_cost_out);
+        write_cost(&mut scratch[2], tot_cost_cache_w);
+        write_cost(&mut scratch[3], tot_cost_cache_r);
+        write_cost(&mut scratch[4], total_prices);
+        write_rates_row(
+            &mut buf,
+            w,
+            "Total Prices",
+            [
+                &scratch[0],
+                &scratch[1],
+                &scratch[2],
+                &scratch[3],
+                &scratch[4],
+                "",
+            ],
+        );
     }
-    write_cost(&mut scratch[0], tot_cost_in);
-    write_cost(&mut scratch[1], tot_cost_out);
-    write_cost(&mut scratch[2], tot_cost_cache_w);
-    write_cost(&mut scratch[3], tot_cost_cache_r);
-    write_cost(&mut scratch[4], total_prices);
-    write_rates_row(
-        &mut buf,
-        w,
-        "Total Prices",
-        [
-            &scratch[0],
-            &scratch[1],
-            &scratch[2],
-            &scratch[3],
-            &scratch[4],
-            "",
-        ],
-    );
     buf.push_str(&bot_hline);
 
     if opts.carbon {
@@ -387,9 +393,12 @@ pub fn print_plain<S: Source + ?Sized>(
     let second_col = if opts.instances { "projects" } else { "models" };
 
     let mut buf = String::with_capacity(8_192);
+    // The trailing cost field is dropped entirely under --no-cost, header
+    // included, so an awk field index stays meaningful either way.
+    let cost_hdr = if opts.no_cost { "" } else { "\tcost_usd" };
     let _ = writeln!(
         buf,
-        "#{first_col}\t{second_col}\tinput\toutput\tcache_create\tcache_read\ttotal\tcost_usd"
+        "#{first_col}\t{second_col}\tinput\toutput\tcache_create\tcache_read\ttotal{cost_hdr}"
     );
 
     for k in &keys {
@@ -418,10 +427,15 @@ pub fn print_plain<S: Source + ?Sized>(
                 .join(",")
         };
         let total = u.input + u.output + u.cache_create + u.cache_read;
+        let cost = if opts.no_cost {
+            String::new()
+        } else {
+            format!("\t{:.4}", u.cost)
+        };
         let _ = writeln!(
             buf,
-            "{label}\t{second}\t{}\t{}\t{}\t{}\t{}\t{:.4}",
-            u.input, u.output, u.cache_create, u.cache_read, total, u.cost,
+            "{label}\t{second}\t{}\t{}\t{}\t{}\t{total}{cost}",
+            u.input, u.output, u.cache_create, u.cache_read,
         );
     }
 
@@ -457,6 +471,20 @@ const fn num_widths(w: &Widths) -> [usize; 6] {
     ]
 }
 
+/// Pair each numeric cell with its column width, dropping the columns
+/// set to zero.
+///
+/// A zero width means "omit this column", not "render an empty cell" —
+/// the same convention `last_activity` and `limit` already use. That is
+/// how `--no-cost` removes the cost column without every row builder
+/// needing to know the array got shorter.
+fn num_cells<'a>(w: &Widths, nums: &'a [&'a str; 6]) -> impl Iterator<Item = (&'a str, usize)> {
+    nums.iter()
+        .copied()
+        .zip(num_widths(w))
+        .filter(|&(_, cw)| cw > 0)
+}
+
 // Build a horizontal separator line once. Used by `print` to precompute
 // the top/middle/bottom borders, then pushed into the output buffer
 // each time we need one — instead of re-allocating the eight `seg`
@@ -480,7 +508,7 @@ fn build_hline(w: &Widths, left: char, mid: char, right: char) -> String {
     push_seg(&mut s, w.label);
     s.push(mid);
     push_seg(&mut s, w.models);
-    for c in num_widths(w) {
+    for c in num_widths(w).into_iter().filter(|&c| c > 0) {
         s.push(mid);
         push_seg(&mut s, c);
     }
@@ -584,8 +612,8 @@ fn write_row(buf: &mut String, w: &Widths, r: &Row<'_>) {
         epad = "",
         ew = w.models.saturating_sub(cell_width(&extra)),
     );
-    for (v, cw) in r.nums.iter().zip(num_widths(w).iter()) {
-        let _ = write!(buf, " │ {pre}{v:>w$}{post}", w = *cw);
+    for (v, cw) in num_cells(w, &r.nums) {
+        let _ = write!(buf, " │ {pre}{v:>cw$}{post}");
     }
     if w.last_activity > 0 {
         let tail = fit_cell(r.tail, w.last_activity);
@@ -621,8 +649,8 @@ fn write_total(buf: &mut String, w: &Widths, label: &str, nums: [&str; 6]) {
         w_models = w.models,
         blank = "",
     );
-    for (v, cw) in nums.iter().zip(num_widths(w).iter()) {
-        let _ = write!(buf, " │ {yellow}{v:>w$}{reset}", w = *cw);
+    for (v, cw) in num_cells(w, &nums) {
+        let _ = write!(buf, " │ {yellow}{v:>cw$}{reset}");
     }
     if w.last_activity > 0 {
         let _ = write!(buf, " │ {blank:<w$}", w = w.last_activity, blank = "");
@@ -645,8 +673,8 @@ fn write_rates_row(buf: &mut String, w: &Widths, label: &str, nums: [&str; 6]) {
         w_models = w.models,
         blank = "",
     );
-    for (v, cw) in nums.iter().zip(num_widths(w).iter()) {
-        let _ = write!(buf, " │ {dim}{v:>w$}{reset}", w = *cw);
+    for (v, cw) in num_cells(w, &nums) {
+        let _ = write!(buf, " │ {dim}{v:>cw$}{reset}");
     }
     if w.last_activity > 0 {
         let _ = write!(buf, " │ {blank:<w$}", w = w.last_activity, blank = "");

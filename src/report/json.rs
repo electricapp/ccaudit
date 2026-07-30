@@ -33,7 +33,11 @@ struct JsonTotals {
     cache_create: u64,
     cache_read: u64,
     total_tokens: u64,
-    cost_usd: f64,
+    /// `None` under `--no-cost`, where the key is dropped rather than
+    /// zeroed — a consumer reading `.cost_usd` should fail loudly, not
+    /// silently believe the run was free.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_usd: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -47,7 +51,8 @@ struct JsonRow {
     cache_create: u64,
     cache_read: u64,
     total_tokens: u64,
-    cost_usd: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_usd: Option<f64>,
     api_calls: u32,
     active: bool,
     // Populated only for `blocks` with --cost-limit. Uses the bucket's
@@ -84,14 +89,22 @@ pub fn print<S: Source + ?Sized>(
         };
 
     let mut rows: Vec<JsonRow> = Vec::with_capacity(keys.len());
-    let mut totals = JsonTotals::default();
+    let mut totals = JsonTotals {
+        // Seeded here, not on first row: an empty corpus must still
+        // report `"cost_usd": 0.0`. Leaving it `None` would make "no
+        // sessions" indistinguishable from `--no-cost`.
+        cost_usd: (!opts.no_cost).then_some(0.0),
+        ..JsonTotals::default()
+    };
     for k in &keys {
         let Some(u) = rollup.get(k) else { continue };
         totals.input += u.input;
         totals.output += u.output;
         totals.cache_create += u.cache_create;
         totals.cache_read += u.cache_read;
-        totals.cost_usd += u.cost;
+        if let Some(c) = totals.cost_usd.as_mut() {
+            *c += u.cost;
+        }
 
         let model = if opts.breakdown && k.1 != u16::MAX {
             cache.models.get(k.1 as usize).cloned()
@@ -128,7 +141,7 @@ pub fn print<S: Source + ?Sized>(
             cache_create: u.cache_create,
             cache_read: u.cache_read,
             total_tokens: u.input + u.output + u.cache_create + u.cache_read,
-            cost_usd: u.cost,
+            cost_usd: (!opts.no_cost).then_some(u.cost),
             api_calls: u.line_count,
             active,
             limit_pct,

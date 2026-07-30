@@ -4,11 +4,18 @@
 // compiled `ccaudit` binary against it. Fixtures are synthesized inline so
 // the numbers the report prints are deterministic.
 
+// `dead_code` is blanket-allowed for the module, not because anything
+// here is unused, but because Cargo compiles `mod common` separately
+// into every integration binary. `tests/cli.rs` and `tests/uniformity.rs`
+// each pull in the whole file and use a different subset, so any helper
+// is unreferenced in one of the two copies. Per-item annotations just
+// spread that one fact across seven attributes.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
+    dead_code,
     unused_results
 )]
 
@@ -36,6 +43,36 @@ impl Harness {
         p
     }
 
+    /// Write a JSONL file into a log root OUTSIDE the default
+    /// `$HOME/.claude/projects` tree, for exercising `--logs-dir`.
+    /// `root` is relative to the harness home so it stays inside the
+    /// tempdir and is cleaned up with it.
+    pub fn write_jsonl_at(
+        &self,
+        root: &str,
+        slug: &str,
+        session_id: &str,
+        lines: &[&str],
+    ) -> PathBuf {
+        let dir = self.home.path().join(root).join(slug);
+        std::fs::create_dir_all(&dir).expect("mk alt root");
+        let path = dir.join(format!("{session_id}.jsonl"));
+        std::fs::write(&path, lines.join("\n") + "\n").expect("write alt jsonl");
+        path
+    }
+
+    /// Absolute path to a log root under the harness home.
+    pub fn root_path(&self, root: &str) -> String {
+        self.home.path().join(root).to_string_lossy().into_owned()
+    }
+
+    /// Write a config file under the harness home and return its path.
+    pub fn write_config(&self, name: &str, body: &str) -> String {
+        let path = self.home.path().join(name);
+        std::fs::write(&path, body).expect("write config");
+        path.to_string_lossy().into_owned()
+    }
+
     /// Write a JSONL file under `slug` with the given content.
     pub fn write_jsonl(&self, slug: &str, session_id: &str, lines: &[&str]) -> PathBuf {
         let dir = self.project_dir(slug);
@@ -50,7 +87,6 @@ impl Harness {
     /// Claude Code nests subagent transcripts below the project dir
     /// (`<uuid>/subagents/agent-*.jsonl`), and deeper still for workflow
     /// agents. Tests use this to pin that those files are scanned.
-    #[allow(dead_code)]
     pub fn write_jsonl_nested(&self, slug: &str, rel: &str, lines: &[&str]) -> PathBuf {
         let path = self.project_dir(slug).join(rel);
         std::fs::create_dir_all(path.parent().expect("nested path has a parent"))
@@ -65,9 +101,7 @@ impl Harness {
         self.base_cmd().args(args).output().expect("spawn ccaudit")
     }
 
-    // Used by tests/cli.rs (CCAUDIT_LAZY); unused by tests/uniformity.rs,
-    // and each test binary compiles `mod common` from scratch.
-    #[allow(dead_code)]
+    // Used by tests/cli.rs for the CCAUDIT_LAZY path.
     pub fn run_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         let mut cmd = self.base_cmd();
         for (k, v) in env {
@@ -84,9 +118,16 @@ impl Harness {
     fn base_cmd(&self) -> Command {
         let mut cmd = Command::new(bin_path());
         cmd.env("HOME", self.home.path());
+        // Run from the pristine home, not the repo root. The config
+        // search includes `./ccaudit.json`, so a config sitting in the
+        // working tree would otherwise silently steer every test — the
+        // same failure mode the HOME scrub exists to prevent.
+        cmd.current_dir(self.home.path());
         for k in [
             "CCAUDIT_LAZY",
             "CCAUDIT_PROF",
+            "CCAUDIT_CONFIG",
+            "XDG_CONFIG_HOME",
             "NO_COLOR",
             "FORCE_COLOR",
             "CCAUDIT_NO_COLOR",
@@ -131,9 +172,6 @@ fn cargo_root() -> PathBuf {
 // Small helpers so individual tests stay readable instead of drowning in
 // raw escape sequences.
 
-// Each test binary compiles `mod common` from scratch, so a helper only
-// some of them use reads as dead code in the others.
-#[allow(dead_code)]
 pub fn summary_line(text: &str) -> String {
     let v = serde_json::json!({
         "type": "summary",
@@ -182,12 +220,10 @@ pub fn assistant_line(a: &AssistantLine<'_>) -> String {
     v.to_string()
 }
 
-#[allow(dead_code)]
 pub fn read_stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
-#[allow(dead_code)]
 pub fn read_stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).to_string()
 }
