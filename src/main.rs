@@ -85,25 +85,34 @@ fn main() {
                 process::exit(2);
             }
         }
-        cli::Cmd::RefreshPrices => match source::prices::refresh() {
-            Ok(r) => {
-                println!(
-                    "refreshed {} models → {} ({} bytes){}",
-                    r.model_count,
-                    r.cache_path.display(),
-                    r.bytes_written,
-                    if r.invalidated_usage_db {
-                        "  (usage cache invalidated)"
-                    } else {
-                        ""
-                    }
-                );
+        cli::Cmd::RefreshPrices => {
+            // --emit-table regenerates the checked-in fallback instead of
+            // the user's cache: a maintainer action, not a user one.
+            let outcome = match opts.emit_table.as_deref() {
+                Some(path) => source::prices::emit_builtin_table(std::path::Path::new(path))
+                    .map(|r| format!("wrote {} models → {}", r.model_count, r.out_path.display())),
+                None => source::prices::refresh().map(|r| {
+                    format!(
+                        "refreshed {} models → {} ({} bytes){}",
+                        r.model_count,
+                        r.cache_path.display(),
+                        r.bytes_written,
+                        if r.invalidated_usage_db {
+                            "  (usage cache invalidated)"
+                        } else {
+                            ""
+                        }
+                    )
+                }),
+            };
+            match outcome {
+                Ok(msg) => println!("{msg}"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
             }
-            Err(e) => {
-                eprintln!("error: {e}");
-                process::exit(1);
-            }
-        },
+        }
         cli::Cmd::Tui => {
             #[cfg(feature = "tui")]
             {
@@ -466,7 +475,7 @@ fn print_completion(shell: Option<&str>) -> Result<(), String> {
     let flags = "--since --until --project --timezone --locale --source --json --plain \
 --breakdown --compact --instances --order --tail --carbon --cost-limit --no-cost --logs-dir --config --all --by-agent \
 --active --recent \
---live --offline --mode --no-color --quiet --version --help --port --out --no-serve";
+--live --offline --mode --no-color --quiet --version --help --port --out --no-serve --emit-table";
     let script = match shell {
         "bash" => format!(
             "# ccaudit bash completion. Install: ccaudit completion bash > \

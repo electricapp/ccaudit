@@ -16,7 +16,8 @@ use super::{Pricing, SourceKind};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -152,6 +153,35 @@ fn load() -> Option<PricesLookup> {
     }
 }
 
+/// Per-token → per-million, rounded to drop float noise
+/// (`1e-07 * 1e6` is `0.09999999999999999`).
+fn per_million(cost_per_token: f64) -> f64 {
+    (cost_per_token * 1_000_000.0 * 1e6).round() / 1e6
+}
+
+/// The 1-hour cache-write rate, distrusting the feed when it can't be true.
+///
+/// `LiteLLM` carries a stale `6e-06` on several Claude 3.x entries — it
+/// belongs to `claude-3-7-sonnet` and was copied to its siblings. On
+/// `claude-3-opus` that's a 1-hour tier cheaper than the same model's
+/// 5-minute tier ($6.00 vs $18.75); on `claude-3-haiku` it's 24× input.
+///
+/// Accept a published rate in the range a real tier occupies, else fall
+/// back to Anthropic's 2× input. That fallback reproduces the
+/// hand-verified rates this table replaced ($30.00 / $0.50), which is
+/// why it's trusted over the feed.
+fn resolve_1h_tier(published: Option<f64>, input: f64, cache_write: f64) -> f64 {
+    // Absent means one cache tier, so the write rate covers every write.
+    let Some(rate) = published else {
+        return cache_write;
+    };
+    if rate >= cache_write && rate <= input * 4.0 {
+        rate
+    } else {
+        cache_write.max(input * 2.0)
+    }
+}
+
 fn parse(bytes: &[u8]) -> Result<PricesLookup, String> {
     // Capture each model's body as an unparsed span and deserialize only
     // the four cost fields. A `serde_json::Value` tree for all ~3k models
@@ -172,25 +202,22 @@ fn parse(bytes: &[u8]) -> Result<PricesLookup, String> {
             continue;
         };
         // LiteLLM values are per-token; our Pricing struct is per-million.
+        let input = per_million(in_c);
         let cache_write = e
             .cache_creation_input_token_cost
-            .map(|c| c * 1_000_000.0)
-            .unwrap_or(in_c * 1_000_000.0 * 1.25); // LiteLLM convention when unset
+            .map_or(input * 1.25, per_million); // LiteLLM convention when unset
         let p = Pricing {
-            input: in_c * 1_000_000.0,
-            output: out_c * 1_000_000.0,
+            input,
+            output: per_million(out_c),
             cache_write,
-            // Absent means the model has one cache tier, so the write
-            // rate covers every write. Falling back to `cache_write`
-            // (rather than assuming a 2× tier) keeps a model without the
-            // longer TTL priced at what it actually charges.
-            cache_write_1h: e
-                .cache_creation_input_token_cost_above_1hr
-                .map_or(cache_write, |c| c * 1_000_000.0),
+            cache_write_1h: resolve_1h_tier(
+                e.cache_creation_input_token_cost_above_1hr.map(per_million),
+                input,
+                cache_write,
+            ),
             cache_read: e
                 .cache_read_input_token_cost
-                .map(|c| c * 1_000_000.0)
-                .unwrap_or(in_c * 1_000_000.0 * 0.1),
+                .map_or(input * 0.1, per_million),
         };
         let _ = entries.insert(name.to_string(), p);
     }
@@ -248,6 +275,86 @@ pub fn refresh() -> Result<RefreshResult, String> {
         invalidated_usage_db: invalidated,
     })
 }
+
+// ── Built-in table generation ──
+//
+// `refresh-prices` keeps a user's rates current; this keeps the shipped
+// binary's current, so a fresh install prices today's models before
+// anyone runs anything. Same fetch and same `parse()`, so the generated
+// table is exactly what a refresh would have produced.
+
+/// Which keys get baked in. The bare `claude-*` names are canonical; the
+/// `anthropic/`, `vertex_ai/` and regional variants restate the same
+/// rates under prefixes that never appear in a Claude Code log.
+fn is_builtin_key(name: &str) -> bool {
+    name.starts_with("claude-")
+}
+
+pub struct EmitResult {
+    pub model_count: usize,
+    pub out_path: PathBuf,
+}
+
+/// Fetch `LiteLLM` and rewrite the checked-in fallback table. A developer
+/// command — it writes Rust source, so the path is explicit, not default.
+pub fn emit_builtin_table(out_path: &Path) -> Result<EmitResult, String> {
+    let body = http_get(LITELLM_URL)?;
+    let parsed = parse(body.as_bytes())?;
+
+    let mut rows: Vec<(&str, &Pricing)> = parsed
+        .entries
+        .iter()
+        .filter(|(k, _)| is_builtin_key(k))
+        .map(|(k, p)| (k.as_str(), p))
+        .collect();
+    if rows.is_empty() {
+        return Err(
+            "no claude-* models in the LiteLLM response; refusing to write an empty table"
+                .to_string(),
+        );
+    }
+    // The lookup binary-searches this. Keys are unique, so unstable sort
+    // has no ties to reorder between runs.
+    rows.sort_unstable_by_key(|(k, _)| *k);
+
+    let mut out = String::with_capacity(rows.len() * 160 + 2048);
+    out.push_str(HEADER);
+    // rustfmt would explode each entry to ten lines, so a regenerated
+    // table would never match a formatted one and `fmt --check` would
+    // fight the generator. One line per model is also just readable.
+    let _ = writeln!(out, "#[rustfmt::skip]");
+    let _ = writeln!(out, "pub static BUILTIN: &[(&str, Pricing)] = &[");
+    for (name, p) in &rows {
+        let _ = writeln!(
+            out,
+            "    ({:?}, Pricing {{ input: {:?}, output: {:?}, cache_write: {:?}, cache_write_1h: {:?}, cache_read: {:?} }}),",
+            name, p.input, p.output, p.cache_write, p.cache_write_1h, p.cache_read
+        );
+    }
+    out.push_str("];\n");
+
+    std::fs::write(out_path, out.as_bytes())
+        .map_err(|e| format!("write {}: {e}", out_path.display()))?;
+
+    Ok(EmitResult {
+        model_count: rows.len(),
+        out_path: out_path.to_path_buf(),
+    })
+}
+
+const HEADER: &str = concat!(
+    "// @generated by `ccaudit refresh-prices --emit-table src/source/price_table.rs`.\n",
+    "// Do not edit by hand — rerun that command instead.\n",
+    "//\n",
+    "// Anthropic rates from LiteLLM, per million tokens. The offline\n",
+    "// fallback: a user who ran `refresh-prices` gets their newer copy\n",
+    "// first, and a model in neither is priced at zero and reported.\n",
+    "//\n",
+    "// Sorted by key — `claude_code::builtin_price` binary-searches it.\n",
+    "\n",
+    "use super::Pricing;\n",
+    "\n",
+);
 
 fn http_get(url: &str) -> Result<String, String> {
     // Zero Rust deps for HTTP — shell out to the curl that ships with
@@ -309,6 +416,34 @@ mod tests {
             entries,
             lower_keys,
         }
+    }
+
+    #[test]
+    fn implausible_1h_tier_is_rejected() {
+        // claude-3-opus as LiteLLM actually publishes it: a 1-hour rate
+        // below the model's own 5-minute rate. Impossible, so the
+        // documented 2x-input tier wins.
+        assert!((resolve_1h_tier(Some(6.0), 15.0, 18.75) - 30.0).abs() < f64::EPSILON);
+        // claude-3-haiku, same stale value, 24x its input rate.
+        assert!((resolve_1h_tier(Some(6.0), 0.25, 0.3) - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn plausible_1h_tier_is_kept_verbatim() {
+        // Every current model publishes exactly 2x input; the guard must
+        // not "correct" a number that was right to begin with.
+        assert!((resolve_1h_tier(Some(20.0), 10.0, 12.5) - 20.0).abs() < f64::EPSILON);
+        assert!((resolve_1h_tier(Some(6.0), 3.0, 3.75) - 6.0).abs() < f64::EPSILON);
+        // Absent → the model has one tier; the write rate covers it.
+        assert!((resolve_1h_tier(None, 1.25, 1.25) - 1.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn per_million_has_no_float_tail() {
+        // 1e-07/token is $0.10/M, not $0.09999999999999999/M.
+        assert!((per_million(1e-07) - 0.1).abs() < f64::EPSILON);
+        assert!((per_million(2e-07) - 0.2).abs() < f64::EPSILON);
+        assert!((per_million(1.875e-05) - 18.75).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -104,16 +104,36 @@ impl Source for ClaudeCode {
                 }
             }
         }
-        // 2. Fall back to the hardcoded table (March 2026 prices).
-        //    Claude 3.x rates differ sharply from 4.x (3-opus is 3× the
-        //    4.x opus price), so match the generation before the family.
-        match model.unwrap_or("") {
-            m if m.contains("3-opus") => &OPUS_3,
-            m if m.contains("3-5-haiku") => &HAIKU_3_5,
-            m if m.contains("3-haiku") => &HAIKU_3,
-            m if m.contains("opus") => &OPUS,
-            m if m.contains("haiku") => &HAIKU,
-            _ => &SONNET,
+        // 2. The generated table — same LiteLLM rates, snapshotted at
+        //    release. An exact hit is a fact, so nothing is reported.
+        if let Some(name) = model {
+            if let Some(p) = builtin_price(name) {
+                return p;
+            }
+        }
+        // 3. Family heuristic, for a model newer than the table. Claude
+        //    3.x rates differ sharply from 4.x (3-opus is 3× the 4.x
+        //    price), so match generation before family.
+        let Some(name) = model else {
+            // No model on the line: nothing to look up or report.
+            return &super::UNKNOWN_PRICING;
+        };
+        let inferred = match name {
+            m if m.contains("3-opus") => Some(&OPUS_3),
+            m if m.contains("3-5-haiku") => Some(&HAIKU_3_5),
+            m if m.contains("3-haiku") => Some(&HAIKU_3),
+            m if m.contains("opus") => Some(&OPUS),
+            m if m.contains("sonnet") => Some(&SONNET),
+            m if m.contains("haiku") => Some(&HAIKU),
+            _ => None,
+        };
+        // 4. Nothing recognizable. Zero, and named in the report.
+        if let Some(p) = inferred {
+            super::note_model_resolution(name, super::Resolution::Estimated);
+            p
+        } else {
+            super::note_model_resolution(name, super::Resolution::Unknown);
+            &super::UNKNOWN_PRICING
         }
     }
 
@@ -135,6 +155,35 @@ impl Source for ClaudeCode {
     // new providers don't inherit this Anthropic-specific filter.
     fn skip_model(&self, model: &str) -> bool {
         model == "<synthetic>"
+    }
+}
+
+/// Exact-match probe into the generated table: the raw model name, then
+/// the same name minus its `-YYYYMMDD` suffix. Logs always carry the
+/// dated form; `LiteLLM` carries one form or both.
+fn builtin_price(name: &str) -> Option<&'static Pricing> {
+    let table = super::price_table::BUILTIN;
+    let find = |k: &str| {
+        table
+            .binary_search_by(|(key, _)| (*key).cmp(k))
+            .ok()
+            .and_then(|i| table.get(i))
+            .map(|(_, p)| p)
+    };
+    find(name).or_else(|| find(strip_date_suffix(name)))
+}
+
+/// `"claude-opus-4-8-20260601"` → `"claude-opus-4-8"`. Returns the input
+/// unchanged when there's no 8-digit trailing segment.
+fn strip_date_suffix(name: &str) -> &str {
+    let Some(idx) = name.rfind('-') else {
+        return name;
+    };
+    let tail = name.get(idx + 1..).unwrap_or_default();
+    if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit()) {
+        name.get(..idx).unwrap_or(name)
+    } else {
+        name
     }
 }
 
@@ -169,13 +218,13 @@ fn claude_name_candidates(name: &str) -> ([String; 4], usize) {
     (out, len)
 }
 
-// Anthropic pricing, per-million tokens. These are the hardcoded fallback
-// used when `prices.json` (from `ccaudit refresh-prices`) isn't present.
-// Numbers mirror what LiteLLM currently reports for Claude 4.x: the
-// 5-minute cache write tier at 1.25× input, the 1-hour tier at 2×, and a
-// 90% cache-read discount. Values here are verified against:
-//   https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-// (keys: claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5).
+// Per-family tier rates, per-million tokens.
+//
+// Not the price table — that's `price_table::BUILTIN`. These are the
+// last resort for a model whose name announces a family but which no
+// table knows yet. Anthropic has held each family's rates steady across
+// 4.x, which is what makes the guess worth making; it's still recorded
+// as `Resolution::Estimated` so a repricing shows up.
 const OPUS: Pricing = Pricing {
     input: 5.0,
     output: 25.0,

@@ -186,11 +186,20 @@ pub struct Options {
     pub blocks_live: bool,
     /// `completion` only: the target shell to emit a script for.
     pub completion_shell: Option<String>,
+    /// `refresh-prices` only: regenerate the checked-in fallback table at
+    /// this path instead of refreshing the user's price cache.
+    pub emit_table: Option<String>,
 }
 
 pub fn parse(args: &[String]) -> Result<Options, String> {
+    // Local by default: UTC buckets split one evening's work across two
+    // day rows west of Greenwich, and put every row out of step with
+    // ccusage. `Local` can't fail to parse; the fallback avoids an unwrap.
+    let (tz_offset_secs, tz_label) =
+        parse_timezone("Local").unwrap_or_else(|_| (0, "UTC".to_string()));
     let mut o = Options {
-        tz_label: "UTC".to_string(),
+        tz_offset_secs,
+        tz_label,
         ..Default::default()
     };
 
@@ -333,6 +342,10 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             }
             "--locale" => {
                 o.locale = Some(next()?.to_string());
+                i += 2;
+            }
+            "--emit-table" => {
+                o.emit_table = Some(next()?.to_string());
                 i += 2;
             }
             "--source" => {
@@ -615,6 +628,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "live",
     "order",
     "mode",
+    "emit-table",
 ];
 
 /// Closest candidate to `input` within edit distance 2, or `None`. The
@@ -737,6 +751,11 @@ fn validate_flag_scopes(o: &Options) -> Result<(), String> {
     }
     if o.mode != CostMode::Auto {
         report_flag("--mode")?;
+    }
+
+    // refresh-prices-only.
+    if o.emit_table.is_some() && o.cmd != Cmd::RefreshPrices {
+        return Err("--emit-table only applies to `refresh-prices`".to_string());
     }
 
     // Blocks-only.
@@ -1045,7 +1064,7 @@ pub fn print_help() {
         ("", "--since YYYYMMDD", "filter by start date (inclusive)"),
         ("", "--until YYYYMMDD", "filter by end date (inclusive)"),
         ("", "--project NAME", "filter to a single project"),
-        ("", "--timezone TZ", "UTC, Local, or ±HH:MM (default UTC)"),
+        ("", "--timezone TZ", "UTC, Local, or ±HH:MM (default Local)"),
         ("", "--locale LOC", "date locale (e.g. en_US, ja_JP)"),
         ("", "--source NAME", source_desc.as_str()),
         (
@@ -1191,9 +1210,11 @@ pub fn print_subcommand_help(cmd: Cmd) {
             println!();
             println!("FLAGS");
             println!("  --source NAME       log provider: claude-code (default), codex");
+            println!("  --emit-table PATH   regenerate the built-in fallback table (maintainers)");
             println!();
             println!("EXAMPLES");
             println!("  ccaudit refresh-prices");
+            println!("  ccaudit refresh-prices --emit-table src/source/price_table.rs");
         }
         Cmd::Completion => {
             println!("ccaudit completion - print a shell completion script");

@@ -104,11 +104,63 @@ fn emit<S: Source + ?Sized>(
     bucket: Bucket,
     source: &S,
 ) -> std::io::Result<()> {
-    if opts.json {
+    let result = if opts.json {
         json::print(cache, rollup, opts, bucket, source)
     } else if opts.plain {
         table::print_plain(cache, rollup, opts, bucket, source)
     } else {
         table::print(cache, rollup, opts, bucket, source)
+    };
+    // After the report, so the note lands under the numbers it qualifies.
+    // JSON carries the same list as a field; a stderr copy would be noise.
+    if !opts.json {
+        warn_about_unpriced_models(opts);
+    }
+    result
+}
+
+/// Name every model the run could not price from a table. stderr only —
+/// a report piped into `awk` must not grow a prose line.
+#[allow(clippy::print_stderr)]
+fn warn_about_unpriced_models(opts: &Options) {
+    use crate::source::Resolution;
+    if opts.quiet || opts.no_cost {
+        return;
+    }
+    let found = crate::source::model_resolutions();
+    if found.is_empty() {
+        return;
+    }
+    let names = |want: Resolution| -> Vec<&str> {
+        found
+            .iter()
+            .filter(|(_, r)| *r == want)
+            .map(|(n, _)| n.as_str())
+            .collect()
+    };
+    let unknown = names(Resolution::Unknown);
+    if !unknown.is_empty() {
+        eprintln!(
+            "note: no price for {} — billed at $0, so the totals above are low: {}",
+            plural(unknown.len(), "model"),
+            unknown.join(", ")
+        );
+    }
+    let estimated = names(Resolution::Estimated);
+    if !estimated.is_empty() {
+        eprintln!(
+            "note: {} priced from its family's rate, not a table entry: {}",
+            plural(estimated.len(), "model"),
+            estimated.join(", ")
+        );
+    }
+    eprintln!("Run `ccaudit refresh-prices` to pull current rates from LiteLLM.");
+}
+
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
     }
 }

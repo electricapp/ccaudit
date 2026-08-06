@@ -7,11 +7,14 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 pub mod claude_code;
 pub mod codex;
+pub mod price_table;
 pub mod prices;
 
 #[cfg(target_os = "macos")]
@@ -83,8 +86,8 @@ pub struct Tokens {
 }
 
 // Per-million-token prices. A provider returns one of these for each
-// model it knows about; unknown models fall back to the provider's
-// default (typically Sonnet-tier).
+// model it knows about; a model no table covers is priced by
+// [`UNKNOWN_PRICING`] and reported, never guessed at.
 #[derive(Clone, Copy, Debug)]
 pub struct Pricing {
     pub input: f64,
@@ -120,6 +123,57 @@ impl Pricing {
             (t.cache_read as f64) * self.cache_read / 1_000_000.0,
         ]
     }
+}
+
+/// Rates for a model no price table covers: zero across the board.
+///
+/// Zero is wrong, but wrong in a direction the totals make obvious. The
+/// Sonnet-tier default it replaces was wrong *plausibly* — which is how
+/// every `fable-5` token stayed billed at 30% of its real rate until a
+/// ccusage diff caught it.
+pub const UNKNOWN_PRICING: Pricing = Pricing {
+    input: 0.0,
+    output: 0.0,
+    cache_write: 0.0,
+    cache_write_1h: 0.0,
+    cache_read: 0.0,
+};
+
+/// How confident a provider is in the rate it returned.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Resolution {
+    /// Priced from a family-name match, not a table entry. Breaks when a
+    /// new generation reprices, so it's worth surfacing.
+    Estimated,
+    /// No table entry, no recognizable family. Priced at zero.
+    Unknown,
+}
+
+// Mutex rather than thread-local: pricing runs inside rayon's par_iter
+// during cache builds, and every worker's findings feed one report.
+static MODEL_RESOLUTIONS: OnceLock<Mutex<BTreeMap<String, Resolution>>> = OnceLock::new();
+
+/// Record a model priced by something less certain than an exact hit.
+pub fn note_model_resolution(name: &str, how: Resolution) {
+    if name.is_empty() {
+        return;
+    }
+    let map = MODEL_RESOLUTIONS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(mut guard) = map.lock() {
+        // Worst verdict wins: a name resolved both ways across providers
+        // is only as good as its weakest resolution.
+        let slot = guard.entry(name.to_string()).or_insert(how);
+        *slot = (*slot).max(how);
+    }
+}
+
+/// Every model priced by heuristic or not priced at all, name-sorted.
+pub fn model_resolutions() -> Vec<(String, Resolution)> {
+    MODEL_RESOLUTIONS
+        .get()
+        .and_then(|m| m.lock().ok())
+        .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default()
 }
 
 // ── Source trait ──
@@ -293,9 +347,25 @@ pub struct ModelRates {
 
 impl ModelRates {
     pub fn build<S: Source + ?Sized>(source: &S, models: &[String]) -> Self {
+        let skip: Vec<bool> = models.iter().map(|m| source.skip_model(m)).collect();
+        // Skipped models are never priced. `<synthetic>` isn't a real
+        // model and has no rate anywhere, so pricing it would report it
+        // as unpriced on every run — a warning about a line the report
+        // deliberately drops.
+        let pricing = models
+            .iter()
+            .zip(&skip)
+            .map(|(m, skipped)| {
+                if *skipped {
+                    UNKNOWN_PRICING
+                } else {
+                    *source.price(Some(m))
+                }
+            })
+            .collect();
         Self {
-            pricing: models.iter().map(|m| *source.price(Some(m))).collect(),
-            skip: models.iter().map(|m| source.skip_model(m)).collect(),
+            pricing,
+            skip,
             unknown: *source.price(None),
         }
     }
@@ -395,7 +465,7 @@ fn scan_dir_recursive(dir: &Path, depth_left: usize, out: &mut Vec<SourceFile>) 
 // site instead would touch the cache, parse, report and web layers to
 // carry something only the scanner needs.
 
-static LOG_ROOTS: std::sync::OnceLock<Vec<(String, Vec<PathBuf>)>> = std::sync::OnceLock::new();
+static LOG_ROOTS: OnceLock<Vec<(String, Vec<PathBuf>)>> = OnceLock::new();
 
 /// Install per-source log-root overrides. Only the first call takes
 /// effect, which is the one `main` makes before any scan.
@@ -419,7 +489,7 @@ fn log_root_override(id: &str) -> Option<&'static [PathBuf]> {
 // on every `price()` call, so the list stays small — one entry per model
 // the user chose to correct, not a copy of the LiteLLM table.
 
-static PRICE_OVERRIDES: std::sync::OnceLock<Vec<(String, Pricing)>> = std::sync::OnceLock::new();
+static PRICE_OVERRIDES: OnceLock<Vec<(String, Pricing)>> = OnceLock::new();
 
 /// Install per-model price overrides. Only the first call takes effect,
 /// which is the one `main` makes before any pricing happens.
@@ -634,7 +704,62 @@ pub fn sanitize_control(s: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
-    use super::{Pricing, Tokens};
+    use super::{Pricing, Source, Tokens};
+
+    /// `builtin_price` binary-searches this; unsorted means silent misses.
+    #[test]
+    fn builtin_table_is_sorted_and_populated() {
+        let table = super::price_table::BUILTIN;
+        assert!(
+            table.len() > 10,
+            "generated price table looks truncated: {} entries",
+            table.len()
+        );
+        assert!(
+            table.windows(2).all(|w| match w {
+                [a, b] => a.0 < b.0,
+                _ => true,
+            }),
+            "price table must be strictly sorted by key for binary search"
+        );
+    }
+
+    /// `fable-5` carries no family token, so it billed at the Sonnet
+    /// tier — 30% of true cost — until a ccusage diff caught it.
+    #[test]
+    fn fable_is_priced_from_the_table_not_a_family_guess() {
+        let p = super::claude_code::ClaudeCode.price(Some("claude-fable-5-20260601"));
+        assert_eq!(p.input, 10.0, "fable-5 input rate");
+        assert_eq!(p.output, 50.0, "fable-5 output rate");
+        assert_eq!(p.cache_write, 12.5, "fable-5 5-minute cache write");
+        assert_eq!(p.cache_write_1h, 20.0, "fable-5 1-hour cache write");
+        assert_eq!(p.cache_read, 1.0, "fable-5 cache read");
+        // Exact table hit after the date suffix is stripped — not a guess.
+        assert!(
+            !super::model_resolutions()
+                .iter()
+                .any(|(n, _)| n.contains("fable")),
+            "an exact table hit must not be reported as estimated or unknown"
+        );
+    }
+
+    /// A model no table knows is zeroed and named, not billed at
+    /// whichever tier the match arms happened to end on.
+    #[test]
+    fn unrecognized_model_prices_at_zero_and_is_reported() {
+        let name = "some-vendor-model-that-does-not-exist-9";
+        let p = super::claude_code::ClaudeCode.price(Some(name));
+        assert_eq!(p.input, 0.0);
+        assert_eq!(p.output, 0.0);
+        assert_eq!(p.cache_read, 0.0);
+        let found = super::model_resolutions();
+        assert!(
+            found
+                .iter()
+                .any(|(n, r)| n == name && *r == super::Resolution::Unknown),
+            "unpriced model must be reported: {found:?}"
+        );
+    }
 
     // Claude Opus 4.x, mirroring `claude_code::OPUS`.
     const OPUS: Pricing = Pricing {

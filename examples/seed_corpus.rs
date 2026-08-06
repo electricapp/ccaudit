@@ -70,6 +70,13 @@ const MODELS: &[&str] = &[
     "claude-opus-4-6-20251205",
     "claude-sonnet-4-6-20251110",
     "claude-haiku-4-5-20251001",
+    // Not a real model, and carrying no family token for a name match to
+    // catch. Every other entry is one both tools price from a table,
+    // which is why this corpus never caught ccaudit billing an unknown
+    // model at the Sonnet tier while ccusage billed zero — the fable-5
+    // bug, ~19% of a real month. Both now price unknowns at zero, so
+    // this row agrees until one of them starts guessing again.
+    "claude-nonexistent-9-20260101",
 ];
 
 const TOOLS: &[&str] = &["Bash", "Read", "Edit", "Grep", "Write"];

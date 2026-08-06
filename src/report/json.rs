@@ -15,6 +15,20 @@ struct JsonReport<'a> {
     rows: Vec<JsonRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     carbon: Option<JsonCarbon>,
+    /// Models this run could not price from a table, so a consumer can
+    /// tell "cost is $0" from "cost is unknown". Omitted when every
+    /// model resolved, which is the normal case — its presence is the
+    /// signal.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unpriced_models: Vec<JsonUnpriced>,
+}
+
+#[derive(Serialize)]
+struct JsonUnpriced {
+    model: String,
+    /// "unknown" — billed at zero — or "estimated", priced from the
+    /// model's family tier rather than an exact table entry.
+    resolution: &'static str,
 }
 
 #[derive(Serialize)]
@@ -188,12 +202,23 @@ pub fn print<S: Source + ?Sized>(
     } else {
         None
     };
+    let unpriced = crate::source::model_resolutions()
+        .into_iter()
+        .map(|(model, r)| JsonUnpriced {
+            model,
+            resolution: match r {
+                crate::source::Resolution::Unknown => "unknown",
+                crate::source::Resolution::Estimated => "estimated",
+            },
+        })
+        .collect();
     let report = JsonReport {
         command: cmd_str,
         timezone: &opts.tz_label,
         totals,
         rows,
         carbon,
+        unpriced_models: unpriced,
     };
     // Stream straight to stdout via BufWriter — building the document
     // as one String costs a multi-MB allocation on large reports

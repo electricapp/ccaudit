@@ -558,8 +558,10 @@ fn statusline_prints_single_line() {
 
 // ── Timezone / locale ──
 
+// Days are bucketed in local time, matching ccusage. Under UTC an
+// evening session west of Greenwich lands on tomorrow's row.
 #[test]
-fn timezone_utc_is_default() {
+fn timezone_local_is_default() {
     let h = Harness::new();
     setup_single_project(&h);
     let default = h.run(&["--json"]);
@@ -568,8 +570,13 @@ fn timezone_utc_is_default() {
     require_success(&utc, "--timezone UTC");
     let d: Value = serde_json::from_str(&read_stdout(&default)).unwrap();
     let u: Value = serde_json::from_str(&read_stdout(&utc)).unwrap();
-    assert_eq!(d["timezone"], "UTC");
+    assert!(
+        d["timezone"].as_str().unwrap().starts_with("Local "),
+        "default timezone should be Local, got {:?}",
+        d["timezone"]
+    );
     assert_eq!(u["timezone"], "UTC");
+    // Totals are offset-independent; only the day a row lands on moves.
     assert_eq!(d["totals"], u["totals"]);
 }
 

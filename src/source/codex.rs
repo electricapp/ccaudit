@@ -67,13 +67,26 @@ impl Source for Codex {
                 }
             }
         }
-        // Hardcoded fallback (April 2026 OpenAI list prices). Refresh via
-        // `ccaudit refresh-prices` to pick up LiteLLM rates (prices.json is
-        // shared across providers).
-        match model.unwrap_or("") {
-            m if m.contains("mini") => &GPT5_MINI,
-            m if m.contains("nano") => &GPT5_NANO,
-            _ => &GPT5,
+        // Family heuristic over the hardcoded tiers (April 2026 OpenAI
+        // list prices). `mini`/`nano` before the base tier: "gpt-5-mini"
+        // contains "gpt-5", and the modifier is the sharper signal.
+        let Some(name) = model else {
+            return &super::UNKNOWN_PRICING;
+        };
+        let inferred = match name {
+            m if m.contains("mini") => Some(&GPT5_MINI),
+            m if m.contains("nano") => Some(&GPT5_NANO),
+            m if m.contains("gpt-5") => Some(&GPT5),
+            _ => None,
+        };
+        // Codex drives whatever model the user configured. Billing an
+        // unrecognized one at the GPT-5 rate looks right and isn't.
+        if let Some(p) = inferred {
+            super::note_model_resolution(name, super::Resolution::Estimated);
+            p
+        } else {
+            super::note_model_resolution(name, super::Resolution::Unknown);
+            &super::UNKNOWN_PRICING
         }
     }
 
