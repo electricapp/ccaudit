@@ -459,19 +459,30 @@ pub fn generate(projects: &[Project], cache: &LoadedCache, out_dir: &Path) -> st
     drop(search_w);
     let search_size = fs::metadata(&search_path).map(|m| m.len()).unwrap_or(0);
     if !quiet {
-        eprintln!("search index: {:.0}KB", search_size as f64 / 1024.0);
+        eprintln!("search index: {}", fmt_bytes(search_size));
     }
 
     if !quiet {
         let total_session_files: usize = projects.iter().map(|p| p.sessions.len()).sum();
         eprintln!(
-            "wrote {} ({:.0}KB index + {} session files)",
+            "wrote {} ({} index + {} session files)",
             out_dir.display(),
-            index_size as f64 / 1024.0,
+            fmt_bytes(index_size),
             total_session_files
         );
     }
     Ok(())
+}
+
+/// Byte counts for the build-stats lines. Below a kilobyte the count is
+/// printed in bytes: a provider with one short session has a real index
+/// of a few dozen bytes, and rounding it to `0KB` reads as a failure.
+fn fmt_bytes(n: u64) -> String {
+    if n < 1024 {
+        format!("{n}B")
+    } else {
+        format!("{:.0}KB", n as f64 / 1024.0)
+    }
 }
 
 // The HTML shell is provider-agnostic: it ships the app, and the app
