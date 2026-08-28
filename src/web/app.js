@@ -460,14 +460,28 @@ function buildTable(view, identLbl, rows, limit) {
   // a different mechanism later). Active sort column gets the .active
   // class so the user can see which column is sorting; click-to-reverse
   // is implicit (no arrow chrome needed).
-  let h = '<table class="utable"><thead><tr>';
+  // role="grid": one tab stop, arrows move inside. HTML-AAM remaps the
+  // native tr/th/td roles under it, so cells need nothing of their own.
+  let h = '<table class="utable" role="grid"><thead><tr>';
   for (const c of UCOLS) {
     let label = c.label;
     if (label === '%LBL%') label = identLbl;
     const sortable = !dead.has(c.key);
-    const active = sortable && ss && ss.col === c.key ? ' active' : '';
+    const on = sortable && ss && ss.col === c.key;
+    const active = on ? ' active' : '';
     const cls = c.cls + (c.align === 'r' ? ' r' : '') + (sortable ? ' sortable' : '') + active;
-    const attrs = sortable ? ' data-sort="' + c.key + '" data-view="' + view + '"' : '';
+    // aria-sort announces the direction the accent color shows.
+    const attrs = sortable
+      ? ' data-sort="' +
+        c.key +
+        '" data-view="' +
+        view +
+        '" tabindex="0" aria-sort="' +
+        (on ? (ss.desc ? 'descending' : 'ascending') : 'none') +
+        '" title="sort by ' +
+        esc(label) +
+        '"'
+      : '';
     h += '<th class="' + cls + '"' + attrs + '>' + esc(label) + '</th>';
   }
   h += '</tr></thead><tbody>';
@@ -479,7 +493,8 @@ function buildTable(view, identLbl, rows, limit) {
       // the underlying session without re-deriving it from the onclick
       // payload, which is a code string, not data.
       (r.dataSess ? ' data-sess="' + esc(r.dataSess) + '"' : '');
-    h += '<tr class="clickable"' + attrs + '>';
+    // Roving tabindex, see `retab`.
+    h += '<tr class="clickable" tabindex="-1" aria-selected="false"' + attrs + '>';
     for (const c of UCOLS) {
       const align = c.align === 'r' ? ' r' : '';
       const dimCls =
@@ -547,11 +562,20 @@ function buildTable(view, identLbl, rows, limit) {
     h += '<tr class="more-row"><td colspan="' + UCOLS.length + '">';
     if (total > cap) {
       const hidden = total - cap;
-      h += '<span class="more-chip" data-expand="' + view + '">▼ ' + ft(hidden) + ' more</span>';
-      h += '<span class="more-chip more-all" data-expand-all="' + view + '">▾ All</span>';
+      h +=
+        '<button type="button" class="more-chip" data-expand="' +
+        view +
+        '">▼ ' +
+        ft(hidden) +
+        ' more</button>';
+      h +=
+        '<button type="button" class="more-chip more-all" data-expand-all="' +
+        view +
+        '">▾ All</button>';
     }
     if (expanded) {
-      h += '<span class="more-chip" data-collapse="' + view + '">△ Collapse</span>';
+      h +=
+        '<button type="button" class="more-chip" data-collapse="' + view + '">△ Collapse</button>';
     }
     h += '</td></tr>';
   }
@@ -573,16 +597,19 @@ function populateModelFilter() {
 // (CSS) when present in the Set.
 function renderModelDrop(root, opts) {
   let h =
-    '<button type="button" class="drop-btn">' +
+    '<button type="button" class="drop-btn" aria-haspopup="listbox" aria-expanded="false">' +
     esc(modelLabel()) +
-    '<span class="drop-arr">▾</span></button>';
-  h += '<div class="drop-menu hidden">';
+    '<span class="drop-arr" aria-hidden="true">▾</span></button>';
+  h +=
+    '<div class="drop-menu hidden" role="listbox" aria-multiselectable="true" aria-label="filter by model">';
   for (const o of opts) {
     const isAll = o.v === '';
     const on = isAll ? modelFilters.size === 0 : modelFilters.has(o.v);
     h +=
       '<div class="drop-item' +
       (on ? ' on' : '') +
+      '" role="option" tabindex="-1" aria-selected="' +
+      (on ? 'true' : 'false') +
       '" data-v="' +
       esc(o.v) +
       '">' +
@@ -601,10 +628,10 @@ function renderModelDrop(root, opts) {
 function renderSourceDrop() {
   if (!SF) return;
   let h =
-    '<button type="button" class="drop-btn">' +
+    '<button type="button" class="drop-btn" aria-haspopup="listbox" aria-expanded="false">' +
     esc(srcLabel(src)) +
-    '<span class="drop-arr">▾</span></button>';
-  h += '<div class="drop-menu hidden">';
+    '<span class="drop-arr" aria-hidden="true">▾</span></button>';
+  h += '<div class="drop-menu hidden" role="listbox" aria-label="provider">';
   for (const o of SOURCES) {
     const note = o.sessions
       ? o.sessions + (o.sessions === 1 ? ' session' : ' sessions')
@@ -612,6 +639,8 @@ function renderSourceDrop() {
     h +=
       '<div class="drop-item' +
       (o.id === src ? ' on' : '') +
+      '" role="option" tabindex="-1" aria-selected="' +
+      (o.id === src ? 'true' : 'false') +
       '" data-v="' +
       esc(o.id) +
       '">' +
@@ -650,9 +679,14 @@ function toggleModelFilter(m) {
     modelFilters.add(m);
   }
   if (MF) {
+    const hadFocus = dropHasFocus();
     renderModelDrop(MF, modelDropOpts());
-    const menu = MF.querySelector('.drop-menu');
-    if (menu) menu.classList.remove('hidden');
+    openDrop(MF);
+    // Rebuilt in place, so focus has to be put back.
+    if (hadFocus) {
+      const again = [...MF.querySelectorAll('.drop-item')].find((i) => i.dataset.v === (m || ''));
+      if (again) again.focus();
+    }
   }
   render();
 }
@@ -798,64 +832,133 @@ function syncPresets(activeDays) {
   });
 }
 
+// `[keys]` rebinds injected by web.rs: physical key -> the default key
+// the handlers below are written against. Absent means defaults.
+const REBIND = typeof CCAUDIT_REBIND === 'undefined' ? {} : CCAUDIT_REBIND;
+
+// `e.key` alone reports Ctrl+K as plain `k`, which fired the bare `k`
+// action and let Cmd+R reset every filter on its way to reloading.
+function nk(e) {
+  if (e.altKey) return '';
+  const chord = e.ctrlKey || e.metaKey;
+  const spec = chord ? 'ctrl-' + e.key : e.key;
+  if (Object.prototype.hasOwnProperty.call(REBIND, spec)) return REBIND[spec];
+  return chord ? '' : e.key;
+}
+
+// Click targets that aren't <button>, so they get no activation free.
+const ACTIVATABLE =
+  'th.sortable, [data-msg-sort], .crumb, .drop-item, .utable tr.clickable, [data-day], [data-model]';
+const COMPOSITE_KEYS = new Set([
+  'ArrowUp',
+  'ArrowDown',
+  'ArrowLeft',
+  'ArrowRight',
+  'j',
+  'k',
+  'g',
+  'G',
+  'Home',
+  'End',
+  'Escape',
+  'Tab',
+]);
+
 document.addEventListener('keydown', (e) => {
-  if (e.key === '/' && document.activeElement !== S) {
+  const key = nk(e);
+  // Both overlays are modal.
+  if ($('#palette')) {
+    paletteKey(e, key);
+    return;
+  }
+  if ($('#keyhelp')) {
+    if (key === 'Escape' || key === '?') {
+      toggleKeyHelp();
+      e.preventDefault();
+    }
+    return;
+  }
+  if (key === 'Enter' || key === ' ') {
+    const t = document.activeElement;
+    if (t && t.matches && t.matches(ACTIVATABLE)) {
+      t.click();
+      e.preventDefault();
+      return;
+    }
+  }
+  // Open dropdowns and rove groups own the motion keys while focused,
+  // but only those — `/`, `?` and the rest still work from inside one.
+  if ((dropHasFocus() || roveAt(document.activeElement)) && COMPOSITE_KEYS.has(key)) return;
+  if (key === '/' && document.activeElement !== S) {
     e.preventDefault();
     S.focus();
     return;
   }
-  if (e.key === 'Escape') {
+  if (key === 'Escape') {
     if (document.activeElement === S) S.blur();
     goBack();
     e.preventDefault();
     return;
   }
+  if (key === 'PageDown' || key === 'PageUp') {
+    if (view === 'messages' || view === 'dash') {
+      const page = Math.max(SCROLL_STEP, M.clientHeight * 0.9);
+      M.scrollBy({ top: key === 'PageDown' ? page : -page });
+      e.preventDefault();
+      return;
+    }
+  }
   // n/N for match navigation in message view
   if (view === 'messages' && sq && document.activeElement !== S) {
-    if (e.key === 'n') {
+    if (key === 'n') {
       jumpMatch(1);
       e.preventDefault();
       return;
     }
-    if (e.key === 'N') {
+    if (key === 'N') {
       jumpMatch(-1);
       e.preventDefault();
       return;
     }
   }
   if (document.activeElement === S) return;
-  if (e.key === '?') {
+  if (key === '?') {
     toggleKeyHelp();
     e.preventDefault();
     return;
   }
-  if (e.key === 'q') {
+  if (key === ':') {
+    togglePalette();
+    e.preventDefault();
+    return;
+  }
+  if (key === 'q') {
     goBack();
     e.preventDefault();
     return;
   }
   // `c` copies the resume command for the session in hand — the same
   // thing the resume button does, and the same key the TUI binds.
-  if (e.key === 'c') {
-    const s =
-      view === 'messages' && cp != null && cs != null ? IDX[cp].sessions[cs] : selectedRow();
-    if (s) {
-      navigator.clipboard.writeText(resumeCmd(s));
-      flashToast('copied ' + resumeCmd(s));
-      e.preventDefault();
-      return;
-    }
+  if (key === 'c' && copyResume()) {
+    e.preventDefault();
+    return;
   }
-  // Arrow navigation for list views
-  const listView = view === 'projects' || view === 'sessions' || view === 'search';
+  // Arrow navigation for list views. The dashboard scrolls by default,
+  // but once the user has tabbed into one of its tables the same keys
+  // belong to that table.
+  const listView =
+    view === 'projects' ||
+    view === 'sessions' ||
+    view === 'search' ||
+    (view === 'dash' && rowFocused());
   if (listView) {
-    if (e.key === 'ArrowDown' || e.key === 'j') {
+    if (key === 'ArrowDown' || key === 'j') {
       sel++;
       updateSel();
       e.preventDefault();
       return;
     }
-    if (e.key === 'ArrowUp' || e.key === 'k') {
+    if (key === 'ArrowUp' || key === 'k') {
       sel--;
       updateSel();
       e.preventDefault();
@@ -863,19 +966,19 @@ document.addEventListener('keydown', (e) => {
     }
     // g/G jump to the ends of the list, matching the TUI's move_top /
     // move_bottom.
-    if (e.key === 'g') {
+    if (key === 'g') {
       sel = 0;
       updateSel();
       e.preventDefault();
       return;
     }
-    if (e.key === 'G') {
+    if (key === 'G') {
       sel = getRows().length - 1;
       updateSel();
       e.preventDefault();
       return;
     }
-    if (e.key === 'ArrowRight' || e.key === 'Enter' || e.key === 'l') {
+    if (key === 'ArrowRight' || key === 'Enter' || key === 'l') {
       activateSel();
       e.preventDefault();
       return;
@@ -885,22 +988,22 @@ document.addEventListener('keydown', (e) => {
   // same motion keys drive the pane instead — matching the TUI, where
   // j/k scroll and g/G jump to the ends in exactly these two views.
   if (view === 'messages' || view === 'dash') {
-    if (e.key === 'ArrowDown' || e.key === 'j') {
+    if (key === 'ArrowDown' || key === 'j') {
       M.scrollBy({ top: SCROLL_STEP });
       e.preventDefault();
       return;
     }
-    if (e.key === 'ArrowUp' || e.key === 'k') {
+    if (key === 'ArrowUp' || key === 'k') {
       M.scrollBy({ top: -SCROLL_STEP });
       e.preventDefault();
       return;
     }
-    if (e.key === 'g') {
+    if (key === 'g') {
       M.scrollTo({ top: 0 });
       e.preventDefault();
       return;
     }
-    if (e.key === 'G') {
+    if (key === 'G') {
       M.scrollTo({ top: M.scrollHeight });
       e.preventDefault();
       return;
@@ -910,7 +1013,7 @@ document.addEventListener('keydown', (e) => {
   // that way, and a motion key that means something else on one screen
   // is worse than a shifted mnemonic. The dashboard's own toggles moved
   // to H / L to make room.
-  if (e.key === 'ArrowLeft' || e.key === 'h') {
+  if (key === 'ArrowLeft' || key === 'h') {
     goBack();
     e.preventDefault();
     return;
@@ -919,23 +1022,8 @@ document.addEventListener('keydown', (e) => {
   //   landing → universal | sessions → that project | messages → that session
   // Pressing d again returns to the view we came from (so the toggle is
   // truly round-trip), preserving cp/cs.
-  if (e.key === 'd') {
-    if (view === 'dash') {
-      if (dashScope.kind === 'session') view = 'messages';
-      else if (dashScope.kind === 'project') view = 'sessions';
-      else {
-        view = 'projects';
-        q = '';
-        S.value = '';
-      }
-    } else {
-      if (view === 'sessions') dashScope = { kind: 'project', pi: cp };
-      else if (view === 'messages') dashScope = { kind: 'session', pi: cp, si: cs };
-      else dashScope = { kind: 'all' };
-      view = 'dash';
-      sel = -1;
-    }
-    render();
+  if (key === 'd') {
+    toggleDash();
     e.preventDefault();
     return;
   }
@@ -947,39 +1035,39 @@ document.addEventListener('keydown', (e) => {
   // letter would have thrown them away. y (not d) is day because `d` is
   // the dashboard toggle itself.
   if (view === 'dash') {
-    if (e.key === 'H') {
+    if (key === 'H') {
       setHistMode('hour');
       e.preventDefault();
       return;
     }
-    if (e.key === 'p') {
+    if (key === 'p') {
       setHistMode('project');
       e.preventDefault();
       return;
     }
-    if (e.key === 'y') {
+    if (key === 'y') {
       setHistMode('day');
       e.preventDefault();
       return;
     }
-    if (e.key === 'L') {
+    if (key === 'L') {
       toggleHistLog();
       e.preventDefault();
       return;
     }
-    if (e.key === 'm') {
+    if (key === 'm') {
       setPieMode('model');
       e.preventDefault();
       return;
     }
-    if (e.key === 't') {
+    if (key === 't') {
       setPieMode('tool');
       e.preventDefault();
       return;
     }
   }
   // r resets all filters (from any view).
-  if (e.key === 'r') {
+  if (key === 'r') {
     resetAll();
     e.preventDefault();
     return;
@@ -1002,11 +1090,163 @@ function updateSel() {
   }
   if (sel < 0) sel = 0;
   if (sel >= rows.length) sel = rows.length - 1;
-  rows.forEach((r, i) => {
-    r.classList.toggle('sel', i === sel);
-  });
+  markSel(rows, sel);
+  // A screen reader only announces the row focus lands on.
+  rows[sel].focus({ preventScroll: true });
   rows[sel].scrollIntoView({ block: 'nearest' });
 }
+
+function markSel(rows, i) {
+  rows.forEach((r, n) => {
+    const on = n === i;
+    r.classList.toggle('sel', on);
+    r.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  retab();
+}
+
+// One tab stop per grid and per rove group.
+function retab() {
+  M.querySelectorAll('.utable').forEach((t) => {
+    const rs = [...t.querySelectorAll('tr.clickable')];
+    if (!rs.length) return;
+    const stop = t.querySelector('tr.clickable.sel') || rs[0];
+    rs.forEach((r) => {
+      r.tabIndex = r === stop ? 0 : -1;
+    });
+  });
+  for (const [box, cell] of ROVE_GROUPS) {
+    M.querySelectorAll(box).forEach((g) => {
+      const cells = [...g.querySelectorAll(cell)];
+      if (!cells.length || cells.some((c) => c.getAttribute('tabindex') === '0')) return;
+      // Freshest day is the useful landing spot.
+      const stop = box === '.heatmap' ? cells[cells.length - 1] : cells[0];
+      cells.forEach((c) => c.setAttribute('tabindex', c === stop ? '0' : '-1'));
+    });
+  }
+}
+
+function rowFocused() {
+  const a = document.activeElement;
+  return !!(a && a.closest && a.closest('.utable tr.clickable'));
+}
+
+// Tab and j/k share one cursor.
+M.addEventListener('focusin', (e) => {
+  if (!e.target.closest) return;
+  const tr = e.target.closest('.utable tr.clickable');
+  if (!tr) return;
+  const rows = [...getRows()];
+  const i = rows.indexOf(tr);
+  if (i >= 0 && i !== sel) {
+    sel = i;
+    markSel(rows, i);
+  }
+});
+
+// Too big for per-cell tab stops: one stop each, arrows move within.
+const ROVE_GROUPS = [
+  ['.heatmap', '[data-day][tabindex]'],
+  ['.hist-wrap', '[data-day][tabindex]'],
+  ['.pie-wrap', '[data-model][tabindex]'],
+];
+
+function roveAt(el) {
+  if (!el || !el.closest) return null;
+  for (const [box, cell] of ROVE_GROUPS) {
+    const g = el.closest(box);
+    if (!g) continue;
+    const cells = [...g.querySelectorAll(cell)];
+    const at = cells.indexOf(el);
+    if (at >= 0) return { cells, at };
+  }
+  return null;
+}
+
+document.addEventListener('keydown', (e) => {
+  const key = nk(e);
+  const r = roveAt(document.activeElement);
+  if (!r) return;
+  if (key === 'Escape') {
+    document.activeElement.blur();
+    e.preventDefault();
+    return;
+  }
+  let to;
+  if (key === 'ArrowRight' || key === 'ArrowDown' || key === 'j') to = r.at + 1;
+  else if (key === 'ArrowLeft' || key === 'ArrowUp' || key === 'k') to = r.at - 1;
+  else if (key === 'Home' || key === 'g') to = 0;
+  else if (key === 'End' || key === 'G') to = r.cells.length - 1;
+  else return;
+  to = Math.max(0, Math.min(r.cells.length - 1, to));
+  r.cells.forEach((c, i) => c.setAttribute('tabindex', i === to ? '0' : '-1'));
+  r.cells[to].focus();
+  e.preventDefault();
+});
+
+function dropHasFocus() {
+  const a = document.activeElement;
+  return !!(a && a.closest && a.closest('.drop'));
+}
+
+function closeDrops() {
+  document.querySelectorAll('.drop-menu').forEach((m) => m.classList.add('hidden'));
+  document.querySelectorAll('.drop-btn').forEach((b) => b.setAttribute('aria-expanded', 'false'));
+}
+
+function openDrop(drop) {
+  closeDrops();
+  const menu = drop.querySelector('.drop-menu');
+  const btn = drop.querySelector('.drop-btn');
+  if (menu) menu.classList.remove('hidden');
+  if (btn) btn.setAttribute('aria-expanded', 'true');
+}
+
+// Listbox keys: the menus used to open from the keyboard and then have
+// no way to pick anything.
+document.addEventListener('keydown', (e) => {
+  const key = nk(e);
+  if (!e.target.closest) return;
+  const drop = e.target.closest('.drop');
+  if (!drop) return;
+  const btn = drop.querySelector('.drop-btn');
+  const menu = drop.querySelector('.drop-menu');
+  if (!menu) return;
+  const items = [...menu.querySelectorAll('.drop-item')];
+  const focusItem = (i) => {
+    if (items.length) items[Math.max(0, Math.min(items.length - 1, i))].focus();
+  };
+  if (e.target === btn) {
+    if (key === 'ArrowDown' || key === 'Enter' || key === ' ') {
+      openDrop(drop);
+      focusItem(
+        Math.max(
+          0,
+          items.findIndex((i) => i.classList.contains('on'))
+        )
+      );
+      e.preventDefault();
+    }
+    return;
+  }
+  if (menu.classList.contains('hidden')) return;
+  if (key === 'Escape' || key === 'Tab') {
+    closeDrops();
+    if (key === 'Escape' && btn) {
+      btn.focus();
+      e.preventDefault();
+    }
+    return;
+  }
+  const at = items.indexOf(e.target);
+  if (at < 0) return;
+  if (key === 'ArrowDown') focusItem(at + 1);
+  else if (key === 'ArrowUp') focusItem(at - 1);
+  else if (key === 'Home') focusItem(0);
+  else if (key === 'End') focusItem(items.length - 1);
+  else return;
+  e.preventDefault();
+});
 
 function activateSel() {
   const rows = getRows();
@@ -1049,6 +1289,9 @@ const KEY_HELP = [
   ['', 'g / G', 'first / last row, or top / bottom'],
   ['', 'l / → / enter', 'open the selected row'],
   ['', 'h / ← / q / esc', 'back'],
+  ['', 'PgDn / PgUp', 'page through a session or the dashboard'],
+  ['', 'tab', 'step between tables, charts and controls'],
+  ['', ':', 'command palette'],
   ['Find', '/', 'focus search'],
   ['', 'n / N', 'next / previous match in a session'],
   ['Act', 'c', 'copy the resume command'],
@@ -1058,20 +1301,172 @@ const KEY_HELP = [
   ['', 'L', 'toggle log scale'],
   ['', 'm / t', 'pie by model / by tool'],
 ];
+// Invert, so the overlay shows the key the user actually presses.
+const UNBIND = {};
+for (const [from, to] of Object.entries(REBIND)) if (to) UNBIND[to] = from;
+const showKeys = (cell) =>
+  cell
+    .split(' / ')
+    .map((k) => UNBIND[k] || k)
+    .join(' / ');
+
+// Every action by name, for a key you don't know or rebound.
+const PALETTE = [
+  ['open the selected row', () => activateSel()],
+  ['back', () => goBack()],
+  ['filter the list', () => S.focus()],
+  ['copy the resume command', () => copyResume()],
+  ['toggle the dashboard', () => toggleDash()],
+  ['reset filters, sort, scope, and provider', () => resetAll()],
+  ['histogram by day', () => setHistMode('day')],
+  ['histogram by project', () => setHistMode('project')],
+  ['histogram by hour', () => setHistMode('hour')],
+  ['toggle log scale', () => toggleHistLog()],
+  ['pie by model', () => setPieMode('model')],
+  ['pie by tool', () => setPieMode('tool')],
+  ['key reference', () => toggleKeyHelp()],
+];
+
+// Shared by the `c` key and the palette.
+function copyResume() {
+  const s = view === 'messages' && cp != null && cs != null ? IDX[cp].sessions[cs] : selectedRow();
+  if (!s) return false;
+  navigator.clipboard.writeText(resumeCmd(s));
+  flashToast('copied ' + resumeCmd(s));
+  return true;
+}
+
+// Entry view sets scope: landing → universal, sessions → that project,
+// messages → that session. Pressing again round-trips, preserving cp/cs.
+function toggleDash() {
+  if (view === 'dash') {
+    if (dashScope.kind === 'session') view = 'messages';
+    else if (dashScope.kind === 'project') view = 'sessions';
+    else {
+      view = 'projects';
+      q = '';
+      S.value = '';
+    }
+  } else {
+    if (view === 'sessions') dashScope = { kind: 'project', pi: cp };
+    else if (view === 'messages') dashScope = { kind: 'session', pi: cp, si: cs };
+    else dashScope = { kind: 'all' };
+    view = 'dash';
+    sel = -1;
+  }
+  render();
+}
+
+let paletteQuery = '';
+let paletteSel = 0;
+let paletteReturn = null;
+
+function paletteRows() {
+  const q = paletteQuery.toLowerCase();
+  return PALETTE.filter(([what]) => !q || what.toLowerCase().includes(q));
+}
+
+function togglePalette() {
+  const open = $('#palette');
+  if (open) {
+    open.remove();
+    if (paletteReturn && paletteReturn.isConnected) paletteReturn.focus();
+    paletteReturn = null;
+    return;
+  }
+  paletteReturn = document.activeElement;
+  paletteQuery = '';
+  paletteSel = 0;
+  const el = document.createElement('div');
+  el.id = 'palette';
+  el.setAttribute('role', 'dialog');
+  el.setAttribute('aria-modal', 'true');
+  el.setAttribute('aria-label', 'command palette');
+  el.tabIndex = -1;
+  el.addEventListener('click', (e) => {
+    if (e.target === el) {
+      togglePalette();
+      return;
+    }
+    const row = e.target.closest('[data-pl]');
+    if (!row) return;
+    const pick = paletteRows()[Number(row.dataset.pl)];
+    togglePalette();
+    if (pick) pick[1]();
+  });
+  document.body.appendChild(el);
+  drawPalette();
+  el.focus();
+}
+
+function drawPalette() {
+  const el = $('#palette');
+  if (!el) return;
+  const rows = paletteRows();
+  if (paletteSel >= rows.length) paletteSel = Math.max(0, rows.length - 1);
+  let h =
+    '<div class="kh-box"><div class="kh-title">run<span class="kh-esc">enter picks, esc closes</span></div>';
+  h += '<div class="pl-q">› ' + esc(paletteQuery) + '</div>';
+  rows.forEach(([what], i) => {
+    h +=
+      '<div class="kh-row' +
+      (i === paletteSel ? ' on' : '') +
+      '" data-pl="' +
+      i +
+      '"><span class="kh-what">' +
+      esc(what) +
+      '</span></div>';
+  });
+  if (!rows.length) h += '<div class="kh-row"><span class="kh-what">no match</span></div>';
+  h += '</div>';
+  el.innerHTML = h;
+}
+
+function paletteKey(e, key) {
+  if (key === 'Escape') {
+    togglePalette();
+  } else if (key === 'Enter') {
+    const row = paletteRows()[paletteSel];
+    togglePalette();
+    if (row) row[1]();
+  } else if (key === 'ArrowDown') {
+    paletteSel++;
+    drawPalette();
+  } else if (key === 'ArrowUp') {
+    paletteSel = Math.max(0, paletteSel - 1);
+    drawPalette();
+  } else if (key === 'Backspace') {
+    paletteQuery = paletteQuery.slice(0, -1);
+    paletteSel = 0;
+    drawPalette();
+  } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+    paletteQuery += e.key;
+    paletteSel = 0;
+    drawPalette();
+  } else {
+    return;
+  }
+  e.preventDefault();
+}
+
+let keyHelpReturn = null;
 function toggleKeyHelp() {
   const open = $('#keyhelp');
   if (open) {
     open.remove();
+    if (keyHelpReturn && keyHelpReturn.isConnected) keyHelpReturn.focus();
+    keyHelpReturn = null;
     return;
   }
+  keyHelpReturn = document.activeElement;
   let h =
-    '<div class="kh-box"><div class="kh-title">keys<span class="kh-esc">? to close</span></div>';
+    '<div class="kh-box"><div class="kh-title">keys<span class="kh-esc">esc to close</span></div>';
   for (const [group, keys, what] of KEY_HELP) {
     h +=
       '<div class="kh-row"><span class="kh-grp">' +
       esc(group) +
       '</span><span class="kh-key">' +
-      esc(keys) +
+      esc(showKeys(keys)) +
       '</span><span class="kh-what">' +
       esc(what) +
       '</span></div>';
@@ -1079,9 +1474,14 @@ function toggleKeyHelp() {
   h += '</div>';
   const el = document.createElement('div');
   el.id = 'keyhelp';
+  el.setAttribute('role', 'dialog');
+  el.setAttribute('aria-modal', 'true');
+  el.setAttribute('aria-label', 'keyboard shortcuts');
+  el.tabIndex = -1;
   el.innerHTML = h;
-  el.addEventListener('click', () => el.remove());
+  el.addEventListener('click', () => toggleKeyHelp());
   document.body.appendChild(el);
+  el.focus();
 }
 
 function goBack() {
@@ -1365,14 +1765,17 @@ function updateCrumbs() {
       sName = IDX[dashScope.pi].sessions[dashScope.si].id;
     }
   }
-  if (CP) {
-    CP.textContent = pName || '—';
-    CP.classList.toggle('dim', !pName);
-  }
-  if (CS) {
-    CS.textContent = sName || '—';
-    CS.classList.toggle('dim', !sName);
-  }
+  // A dim crumb is inert (pointer-events:none), so it drops out of the
+  // tab order too rather than advertising a button that does nothing.
+  const setCrumb = (el, name) => {
+    if (!el) return;
+    el.textContent = name || '—';
+    el.classList.toggle('dim', !name);
+    el.tabIndex = name ? 0 : -1;
+    el.setAttribute('aria-disabled', name ? 'false' : 'true');
+  };
+  setCrumb(CP, pName);
+  setCrumb(CS, sName);
   // Browser tab / shared-link title. Reflects the current view and
   // scope so a pasted URL carries meaningful context when it lands.
   let t = 'ccaudit';
@@ -1445,6 +1848,7 @@ function render() {
   updateCrumbs();
   syncResetState();
   syncUrl();
+  retab();
 }
 
 // --- Projects view ---
@@ -1775,12 +2179,16 @@ function rMessages() {
   // Custom dropdown (matches site theme, no OS popup).
   h += '<div class="drop" data-drop="detail" title="detail level">';
   h +=
-    '<button type="button" class="drop-btn">' + detail + '<span class="drop-arr">▾</span></button>';
-  h += '<div class="drop-menu hidden">';
+    '<button type="button" class="drop-btn" aria-haspopup="listbox" aria-expanded="false">' +
+    detail +
+    '<span class="drop-arr" aria-hidden="true">▾</span></button>';
+  h += '<div class="drop-menu hidden" role="listbox" aria-label="detail level">';
   ['minimal', 'low', 'high', 'full'].forEach((d) => {
     h +=
       '<div class="drop-item' +
       (detail === d ? ' on' : '') +
+      '" role="option" tabindex="-1" aria-selected="' +
+      (detail === d ? 'true' : 'false') +
       '" data-v="' +
       d +
       '">' +
@@ -1826,19 +2234,34 @@ function rMessages() {
   // column. Default is date-asc (chronological); click again reverses.
   const ms = sortState.messages;
   const active = (col) => (ms.col === col ? ' active' : '');
+  // Spans, not headers, so the direction goes in the name, not aria-sort.
+  const sortAttrs = (col) => {
+    const dir = ms.col === col ? (ms.desc ? ', sorted descending' : ', sorted ascending') : '';
+    return (
+      '" data-msg-sort="' +
+      col +
+      '" role="button" tabindex="0" aria-label="sort by ' +
+      col +
+      dir +
+      '">'
+    );
+  };
   h +=
     '<div class="msg-header">' +
     '<span class="msg-header-lbl">message</span>' +
     '<span class="msg-meta">' +
     '<span class="msg-tm msg-sort' +
     active('date') +
-    '" data-msg-sort="date">date</span>' +
+    sortAttrs('date') +
+    'date</span>' +
     '<span class="msg-sort' +
     active('who') +
-    '" data-msg-sort="who">who</span>' +
+    sortAttrs('who') +
+    'who</span>' +
     '<span class="msg-tk msg-sort' +
     active('tokens') +
-    '" data-msg-sort="tokens">tokens</span>' +
+    sortAttrs('tokens') +
+    'tokens</span>' +
     '</span></div>';
   h += '<div id="msg-list">';
   // Split render: sync prelude paints FIRST groups (extended to the
@@ -2604,7 +3027,8 @@ function buildHeatmap(byDay, maxTokens) {
     }
   }
 
-  let h = '<div class="heatmap-wrap"><div class="heatmap">';
+  let h =
+    '<div class="heatmap-wrap"><div class="heatmap" role="group" aria-label="daily activity — arrows move, enter filters to that day">';
   // Pre-build YYYY-MM-DD strings for the 53*7 cells in one UTC pass.
   // toISOString() is expensive; compute it once per cell up-front.
   const keys = new Array(53 * 7);
@@ -2639,6 +3063,7 @@ function buildHeatmap(byDay, maxTokens) {
           ' sessions|' +
           fc(data.cost)
         : key + '|no activity';
+      // Only active days rove; 371 mostly-empty stops is not navigation.
       h +=
         '<div class="heatmap-cell' +
         lvl +
@@ -2646,14 +3071,20 @@ function buildHeatmap(byDay, maxTokens) {
         esc(tip) +
         '" data-day="' +
         key +
-        '"></div>';
+        '"' +
+        (data
+          ? ' role="button" tabindex="-1" aria-label="' +
+            esc(key + ', ' + ft(data.tokens) + ' tokens, ' + data.sessions + ' sessions') +
+            '"'
+          : ' aria-hidden="true"') +
+        '></div>';
     }
     h += '</div>';
   }
   h += '</div>';
   h += '<div class="heatmap-tip" id="htip"></div>';
 
-  h += '<div class="heatmap-lbl"><span>less</span>';
+  h += '<div class="heatmap-lbl" aria-hidden="true"><span>less</span>';
   h += '<div class="heatmap-cell"></div>';
   h += '<div class="heatmap-cell l1"></div>';
   h += '<div class="heatmap-cell l2"></div>';
@@ -2730,7 +3161,13 @@ function buildPie(data, mode) {
       const tip = e.k + '|' + (frac * 100).toFixed(1) + '%|' + tipValue;
       // data-model only emitted in model mode so clicking a slice
       // filters by that model. Tool slices don't currently filter.
-      const extraAttr = isTool ? '' : ' data-model="' + esc(e.k) + '"';
+      const extraAttr = isTool
+        ? ''
+        : ' data-model="' +
+          esc(e.k) +
+          '" role="button" tabindex="-1" aria-label="' +
+          esc(e.k + ', ' + (frac * 100).toFixed(1) + '%, ' + tipValue) +
+          '"';
       svg +=
         '<path d="M ' +
         cx +
@@ -3018,8 +3455,15 @@ function buildHist(data, mode, cats) {
     let tip = hdr + '|' + catLines.join('|') + '|total: ' + ft(Math.round(total));
     if (v.cost != null) tip += '|cost: ' + fc(v.cost);
     else if (v._cost != null) tip += '|cost: ' + fc(v._cost);
-    // Only day bars are click-to-filter.
-    const clickAttr = mode === 'day' ? ' data-day="' + k + '"' : '';
+    // Only day bars are click-to-filter, so only they are focusable.
+    const clickAttr =
+      mode === 'day'
+        ? ' data-day="' +
+          k +
+          '" role="button" tabindex="-1" aria-label="' +
+          esc(k + ', ' + ft(Math.round(total)) + ' tokens') +
+          '"'
+        : '';
     svg +=
       '<rect class="hist-hit" x="' +
       gx.toFixed(1) +
@@ -3197,11 +3641,9 @@ document.addEventListener('click', (e) => {
 
   const btn = e.target.closest('.drop-btn');
   if (btn) {
-    const menu = btn.nextElementSibling;
-    document.querySelectorAll('.drop-menu').forEach((m) => {
-      if (m !== menu) m.classList.add('hidden');
-    });
-    menu.classList.toggle('hidden');
+    const wasOpen = !btn.nextElementSibling.classList.contains('hidden');
+    closeDrops();
+    if (!wasOpen) openDrop(btn.closest('.drop'));
     e.stopPropagation();
     return;
   }
@@ -3217,7 +3659,9 @@ document.addEventListener('click', (e) => {
       e.stopPropagation();
       toggleModelFilter(v);
     } else {
-      item.parentNode.classList.add('hidden');
+      const btn = drop.querySelector('.drop-btn');
+      closeDrops();
+      if (btn) btn.focus();
       if (kind === 'detail') {
         detail = v;
         render();
@@ -3229,9 +3673,7 @@ document.addEventListener('click', (e) => {
   }
 
   // Click outside any open menu — close them all.
-  if (!e.target.closest('.drop')) {
-    document.querySelectorAll('.drop-menu').forEach((m) => m.classList.add('hidden'));
-  }
+  if (!e.target.closest('.drop')) closeDrops();
 
   const d = e.target.closest('[data-day]');
   if (d) {

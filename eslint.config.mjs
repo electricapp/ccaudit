@@ -17,6 +17,10 @@ export default [
       sourceType: 'script',
       globals: {
         ...globals.browser,
+        // Key rebinds emitted by web.rs ahead of this script. Absent
+        // when app.js is opened straight from disk, hence the `typeof`
+        // guard at its only use.
+        CCAUDIT_REBIND: 'readonly',
         // Functions defined in src/web/util.js. That file is
         // concatenated ahead of app.js in the generated script block,
         // so these end up as runtime globals — eslint needs to be told.

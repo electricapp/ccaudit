@@ -235,6 +235,7 @@ pub fn write_shell(
     out_dir: &Path,
     default_id: &str,
     sources: &[SourceEntry],
+    key_overrides: &std::collections::BTreeMap<String, String>,
 ) -> std::io::Result<()> {
     #[derive(Serialize)]
     struct Manifest<'a> {
@@ -253,7 +254,7 @@ pub fn write_shell(
     w.flush()?;
     drop(w);
 
-    write_index_html(out_dir)
+    write_index_html(out_dir, key_overrides)
 }
 
 // Prints build-stats lines ("search index: …KB", "wrote …") to stderr
@@ -488,7 +489,10 @@ fn fmt_bytes(n: u64) -> String {
 // The HTML shell is provider-agnostic: it ships the app, and the app
 // picks which `{source}/index.json` to load from `sources.json`. Written
 // once per bundle rather than once per provider.
-fn write_index_html(out_dir: &Path) -> std::io::Result<()> {
+fn write_index_html(
+    out_dir: &Path,
+    key_overrides: &std::collections::BTreeMap<String, String>,
+) -> std::io::Result<()> {
     let out_file = out_dir.join("index.html");
     let mut f = BufWriter::new(fs::File::create(&out_file)?);
     f.write_all(b"<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<meta name=\"color-scheme\" content=\"dark\">\n<meta name=\"description\" content=\"Browse coding-agent session logs - projects, token usage, costs, and full message history.\">\n<meta property=\"og:title\" content=\"ccaudit\">\n<meta property=\"og:description\" content=\"Coding-agent session log browser.\">\n<meta property=\"og:type\" content=\"website\">\n<title>ccaudit</title>\n<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%230d0d0f'/><text x='16' y='22' font-size='18' text-anchor='middle' fill='%236e9eff' font-family='monospace'>cc</text></svg>\">\n<style>")?;
@@ -504,7 +508,11 @@ fn write_index_html(out_dir: &Path) -> std::io::Result<()> {
     );
     let css = CSS.replacen(TOKEN_MARKER, &build_css_tokens(), 1);
     f.write_all(css.as_bytes())?;
-    f.write_all(b"</style>\n</head>\n<body>\n<div id=\"narrow\" role=\"alert\"><strong>ccaudit is desktop-only</strong>The views are dense and table-heavy \xe2\x80\x94 they need a wider viewport than this device offers. Open ccaudit on a laptop or desktop browser.</div>\n<div id=\"app\">\n  <header>\n    <div class=\"bar\">\n      <button id=\"back\" onclick=\"goBack()\" class=\"hidden\" aria-label=\"back\">&larr;</button>\n      <nav id=\"crumbs\" class=\"crumbs\" aria-label=\"breadcrumb\">\n        <span class=\"crumb-lbl\">project:</span><a id=\"crumb-p\" class=\"crumb dim\" onclick=\"crumbClickP()\" role=\"button\" tabindex=\"0\">\xe2\x80\x94</a>\n        <span class=\"crumb-sep\" aria-hidden=\"true\">/</span>\n        <span class=\"crumb-lbl\">session:</span><a id=\"crumb-s\" class=\"crumb dim\" onclick=\"crumbClickS()\" role=\"button\" tabindex=\"0\">\xe2\x80\x94</a>\n      </nav>\n      <div class=\"filterset\" role=\"toolbar\" aria-label=\"filters\">\n        <input id=\"search\" type=\"search\" placeholder=\"/ search\" autocomplete=\"off\" spellcheck=\"false\" aria-label=\"search\">\n        <button class=\"pbtn reset\" onclick=\"resetAll()\" title=\"clear all filters / sort / scope (r)\" aria-label=\"reset filters\">reset</button>\n        <input id=\"dfrom\" type=\"date\" class=\"dateinp\" title=\"from date\" aria-label=\"from date\">\n        <input id=\"dto\" type=\"date\" class=\"dateinp\" title=\"to date\" aria-label=\"to date\">\n        <div class=\"presets\" role=\"group\" aria-label=\"date preset\">\n          <button class=\"pbtn\" data-days=\"7\" onclick=\"setDateRange(7)\">7d</button>\n          <button class=\"pbtn\" data-days=\"30\" onclick=\"setDateRange(30)\">30d</button>\n          <button class=\"pbtn\" data-days=\"90\" onclick=\"setDateRange(90)\">90d</button>\n          <button class=\"pbtn\" data-days=\"0\" onclick=\"setDateRange(null)\">all</button>\n        </div>\n        <div id=\"mfilt\" class=\"drop\" data-drop=\"model\" title=\"filter by model\"></div>\n        <div id=\"sfilt\" class=\"drop\" data-drop=\"source\" title=\"switch provider (reset returns to the one this bundle opened with)\"></div>\n      </div>\n    </div>\n  </header>\n  <main id=\"main\" role=\"main\"><div class=\"loading\" role=\"status\" aria-live=\"polite\">loading...</div></main>\n  <button id=\"btt\" onclick=\"document.getElementById('main').scrollTo({top:0,behavior:'smooth'})\" title=\"back to top\" aria-label=\"back to top\">\xe2\x86\x91</button>\n</div>\n<script>\n")?;
+    f.write_all(b"</style>\n</head>\n<body>\n<div id=\"narrow\" role=\"alert\"><strong>ccaudit is desktop-only</strong>The views are dense and table-heavy \xe2\x80\x94 they need a wider viewport than this device offers. Open ccaudit on a laptop or desktop browser.</div>\n<div id=\"app\">\n  <header>\n    <div class=\"bar\">\n      <button id=\"back\" onclick=\"goBack()\" class=\"hidden\" aria-label=\"back\">&larr;</button>\n      <nav id=\"crumbs\" class=\"crumbs\" aria-label=\"breadcrumb\">\n        <span class=\"crumb-lbl\">project:</span><a id=\"crumb-p\" class=\"crumb dim\" onclick=\"crumbClickP()\" role=\"button\" tabindex=\"0\">\xe2\x80\x94</a>\n        <span class=\"crumb-sep\" aria-hidden=\"true\">/</span>\n        <span class=\"crumb-lbl\">session:</span><a id=\"crumb-s\" class=\"crumb dim\" onclick=\"crumbClickS()\" role=\"button\" tabindex=\"0\">\xe2\x80\x94</a>\n      </nav>\n      <div class=\"filterset\" role=\"toolbar\" aria-label=\"filters\">\n        <input id=\"search\" type=\"search\" placeholder=\"/ search\" autocomplete=\"off\" spellcheck=\"false\" aria-label=\"search\">\n        <button class=\"pbtn reset\" onclick=\"resetAll()\" title=\"clear all filters / sort / scope (r)\" aria-label=\"reset filters\">reset</button>\n        <input id=\"dfrom\" type=\"date\" class=\"dateinp\" title=\"from date\" aria-label=\"from date\">\n        <input id=\"dto\" type=\"date\" class=\"dateinp\" title=\"to date\" aria-label=\"to date\">\n        <div class=\"presets\" role=\"group\" aria-label=\"date preset\">\n          <button class=\"pbtn\" data-days=\"7\" onclick=\"setDateRange(7)\">7d</button>\n          <button class=\"pbtn\" data-days=\"30\" onclick=\"setDateRange(30)\">30d</button>\n          <button class=\"pbtn\" data-days=\"90\" onclick=\"setDateRange(90)\">90d</button>\n          <button class=\"pbtn\" data-days=\"0\" onclick=\"setDateRange(null)\">all</button>\n        </div>\n        <div id=\"mfilt\" class=\"drop\" data-drop=\"model\" title=\"filter by model\"></div>\n        <div id=\"sfilt\" class=\"drop\" data-drop=\"source\" title=\"switch provider (reset returns to the one this bundle opened with)\"></div>\n      </div>\n      <button id=\"keyhelp-btn\" class=\"pbtn\" onclick=\"toggleKeyHelp()\" title=\"keyboard shortcuts (?)\" aria-label=\"keyboard shortcuts\">?</button>\n    </div>\n  </header>\n  <main id=\"main\" role=\"main\"><div class=\"loading\" role=\"status\" aria-live=\"polite\">loading...</div></main>\n  <button id=\"btt\" onclick=\"document.getElementById('main').scrollTo({top:0,behavior:'smooth'})\" title=\"back to top\" aria-label=\"back to top\">\xe2\x86\x91</button>\n</div>\n<script>\n")?;
+    // Emitted before app.js so its `const REBIND` sees the binding.
+    let (keymap, _) = crate::keymap::Keymap::new(key_overrides);
+    let rebind = serde_json::to_string(&keymap.web_rebind()).unwrap_or_else(|_| String::from("{}"));
+    f.write_all(format!("var CCAUDIT_REBIND = {rebind};\n").as_bytes())?;
     f.write_all(UTIL.as_bytes())?;
     f.write_all(JS.as_bytes())?;
     f.write_all(b"\n</script>\n</body>\n</html>")?;

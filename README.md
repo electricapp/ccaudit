@@ -265,7 +265,8 @@ Report subcommands accept `--json` (structured) or `--plain` (tab-separated) for
 - **Carbon footer** (`--carbon`) — energy / CO₂ / tree-year estimate for the reported window
 - **Deterministic filters** — `--since YYYYMMDD`, `--until`, `--project`, `--timezone` (local by default, `UTC` or `±HH:MM` on request), `--locale`, `--source`
 - **Cross-provider reports** — `--all` sums every provider that has logs; `--by-agent` splits the rows per provider. Each is aggregated by its own `Source`, so nothing is ever priced against another provider's rate table.
-- **Config file** — `./ccaudit.json` or `~/.config/ccaudit/config.json` (or `--config PATH`) sets defaults, per-provider log directories, and per-model price overrides keyed on the raw model name. Schema at [`ccaudit.schema.json`](ccaudit.schema.json). Flags always beat the file.
+- **Config file** — `./ccaudit.json` or `~/.config/ccaudit/config.json` (or `--config PATH`) sets defaults, per-provider log directories, per-model price overrides keyed on the raw model name, and key rebinds. Schema at [`ccaudit.schema.json`](ccaudit.schema.json). Flags always beat the file.
+- **Keyboard-driven, both surfaces** — every action in the TUI and the web dashboard is reachable from the keyboard, with the same bindings in each; `?` lists them and `:` opens a command palette. `[keys]` in the config rebinds an action (`{"keys":{"down":"n","palette":"ctrl-k"}}`) and moves it in the TUI *and* the generated bundle at once.
 - **Somewhere else to look** — `--logs-dir A,B` replaces a provider's default location with one or more roots, so an archive reports alongside (or instead of) `$HOME`.
 - **Numbers without the money** — `--no-cost` drops every dollar figure from the table, the TSV, and the JSON.
 - **mmap'd cache** — repeated runs on the same `~/.claude/projects/` read from a memory-mapped schema, zero deserialization

@@ -37,6 +37,19 @@
       "type": "boolean",
       "description": "Split each bucket into one row per model (--breakdown)."
     },
+    "keys": {
+      "type": "object",
+      "description": "Key rebinds for the TUI and the generated web bundle, keyed by action id. Values are key specs: a single character (\"n\", \"?\"), a named key (\"tab\", \"enter\", \"esc\", \"up\", \"down\", \"left\", \"right\", \"pgup\", \"pgdn\", \"home\", \"end\", \"space\", \"backspace\"), or a control chord (\"ctrl-k\"). Arrows, Enter, Esc and Ctrl+C keep their conventional meaning regardless.",
+      "additionalProperties": false,
+      "propertyNames": { "enum": ["down", "up", "top", "bottom", "open", "back", "quit", "search", "resume", "dashboard", "detail", "web", "help", "palette"] },
+      "patternProperties": {
+        "^.*$": {
+          "type": "string",
+          "pattern": "^(ctrl-)?(tab|enter|esc|space|up|down|left|right|pgup|pgdn|home|end|backspace|.)$"
+        }
+      },
+      "examples": [{ "down": "n", "up": "p", "palette": "ctrl-k" }]
+    },
     "sources": {
       "type": "object",
       "description": "Per-provider settings, keyed by the --source id.",

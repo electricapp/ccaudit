@@ -118,7 +118,7 @@ fn main() {
             {
                 let source = source::pick(opts.source);
                 let projects = parse::load_all_projects(source);
-                match run_tui(projects, source) {
+                match run_tui(projects, source, &opts.config_keys) {
                     Ok(Some(ui::PostAction::Resume { id, cwd })) => {
                         resume_session(&id, cwd.as_deref());
                     }
@@ -227,6 +227,7 @@ fn main() {
 fn run_tui(
     projects: Vec<parse::Project>,
     source: &'static dyn source::Source,
+    key_overrides: &std::collections::BTreeMap<String, String>,
 ) -> std::io::Result<Option<ui::PostAction>> {
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -257,7 +258,7 @@ fn run_tui(
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let mut app = ui::App::new(projects, source);
+    let mut app = ui::App::new(projects, source, key_overrides);
     let run_result = app.run(&mut terminal);
 
     crossterm::terminal::disable_raw_mode()?;
@@ -362,7 +363,12 @@ fn run_web_cmd(opts: &cli::Options) {
             cost: projects.iter().map(|p| p.total_cost).sum(),
         });
     }
-    if let Err(e) = web::write_shell(&out_dir, source::pick(opts.source).id(), &manifest) {
+    if let Err(e) = web::write_shell(
+        &out_dir,
+        source::pick(opts.source).id(),
+        &manifest,
+        &opts.config_keys,
+    ) {
         eprintln!("error: {e}");
         process::exit(1);
     }

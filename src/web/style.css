@@ -18,6 +18,22 @@ a:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
+/* Rows and SVG shapes don't take an outline reliably, so they get their
+   own treatment. */
+.utable tr.clickable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.hist-hit:focus-visible,
+.pie-svg [role='button']:focus-visible {
+  outline: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-opacity: 1;
+}
+#keyhelp:focus-visible {
+  outline: none;
+}
 /* Narrow-viewport notice. ccaudit is a dense table-heavy app; phone
    layout would be a different product. Show a gentle advisory when
    the viewport is too small to lay out the filter cluster cleanly. */
@@ -532,7 +548,8 @@ main.hide-k-System [data-msgkind='System'] {
 }
 
 /* `?` key reference — the web counterpart to the TUI's status-bar hints. */
-#keyhelp {
+#keyhelp,
+#palette {
   position: fixed;
   inset: 0;
   background: rgb(0, 0, 0, 0.55);
@@ -540,6 +557,29 @@ main.hide-k-System [data-msgkind='System'] {
   align-items: center;
   justify-content: center;
   z-index: 500;
+}
+#palette:focus-visible {
+  outline: none;
+}
+/* Palette rows are a single label column, not the overlay's key grid. */
+#palette .kh-row {
+  grid-template-columns: 1fr;
+  cursor: pointer;
+  padding: 0 6px;
+  border-radius: 3px;
+}
+#palette .kh-row.on,
+#palette .kh-row:hover {
+  background: var(--bg3);
+  color: var(--fg);
+}
+.pl-q {
+  color: var(--fg);
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+  margin-bottom: 8px;
+  min-height: 20px;
 }
 .kh-box {
   background: var(--bg2);
@@ -1202,6 +1242,10 @@ details.msg > .msg-b {
   margin: 0 4px;
   cursor: pointer;
   border-radius: 3px;
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
 }
 .utable .more-chip:hover {
   color: var(--accent);

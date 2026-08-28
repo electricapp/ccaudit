@@ -154,6 +154,8 @@ pub struct Options {
     /// Per-model price overrides from the config, keyed on the raw model
     /// name as it appears in the logs.
     pub config_prices: Vec<(String, crate::source::Pricing)>,
+    /// Config `[keys]` rebinds, by action id.
+    pub config_keys: std::collections::BTreeMap<String, String>,
     /// Force-disable ANSI color regardless of TTY detection. Mirrors the
     /// `NO_COLOR` / `CCAUDIT_NO_COLOR` env vars and the universal
     /// `--no-color` convention. The final decision (TTY + env + flag)
@@ -570,6 +572,7 @@ fn apply_config(o: &mut Options, cfg: &crate::config::Config) -> Result<(), Stri
     }
     o.config_log_roots = cfg.log_roots();
     o.config_prices = cfg.price_overrides();
+    o.config_keys = cfg.keys.clone();
     Ok(())
 }
 

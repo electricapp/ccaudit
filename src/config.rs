@@ -47,6 +47,11 @@ pub struct Config {
     #[serde(default)]
     pub breakdown: Option<bool>,
 
+    /// Key rebinds by action id (`down`, `open`, ...); values are key
+    /// specs (`n`, `?`, `tab`, `ctrl-k`). Applies to the TUI and the web.
+    #[serde(default)]
+    pub keys: BTreeMap<String, String>,
+
     /// Per-provider settings, keyed by the `--source` id.
     #[serde(default)]
     pub sources: BTreeMap<String, SourceConfig>,

@@ -1,3 +1,4 @@
+use crate::keymap::{Action as Act, Key, Name};
 use crate::parse::{self, MessageKind, Project};
 use crate::report::fmt::{format_cost, format_datetime, format_datetime_short, format_number};
 use crate::search::Searcher;
@@ -20,6 +21,30 @@ use std::time::Duration;
 // with no runtime allocation. Used by build_message_lines when the
 // message line cache is (re)built; wider pads fall back to allocation.
 const SPACES: &str = "                                                                ";
+
+/// crossterm event -> the keymap's key type.
+const fn to_key(k: event::KeyEvent) -> Option<Key> {
+    let name = match k.code {
+        KeyCode::Char(c) => Name::Char(c),
+        KeyCode::Tab => Name::Tab,
+        KeyCode::Enter => Name::Enter,
+        KeyCode::Esc => Name::Esc,
+        KeyCode::Up => Name::Up,
+        KeyCode::Down => Name::Down,
+        KeyCode::Left => Name::Left,
+        KeyCode::Right => Name::Right,
+        KeyCode::PageUp => Name::PageUp,
+        KeyCode::PageDown => Name::PageDown,
+        KeyCode::Home => Name::Home,
+        KeyCode::End => Name::End,
+        KeyCode::Backspace => Name::Backspace,
+        _ => return None,
+    };
+    Some(Key {
+        name,
+        ctrl: k.modifiers.contains(KeyModifiers::CONTROL),
+    })
+}
 
 #[derive(PartialEq)]
 enum View {
@@ -86,6 +111,14 @@ pub struct App {
     /// bindings, so the full reference lives behind a key — same set the
     /// web's `?` shows, so the two surfaces document one keymap.
     keys_open: bool,
+    /// Resolved bindings, config `[keys]` applied over the defaults.
+    keys: crate::keymap::Keymap,
+    /// Every action by name, for a key you don't know or rebound.
+    palette_open: bool,
+    palette_query: String,
+    palette_sel: usize,
+    /// Config problems worth showing once, in the status bar.
+    warnings: Vec<String>,
     pub post_action: Option<PostAction>,
     quit: bool,
     // Dashboard aggregations computed once at App::new(). Projects are
@@ -276,7 +309,12 @@ fn compute_dashboard(projects: &[Project]) -> DashboardAgg {
 }
 
 impl App {
-    pub fn new(projects: Vec<Project>, source: &'static dyn crate::source::Source) -> Self {
+    pub fn new(
+        projects: Vec<Project>,
+        source: &'static dyn crate::source::Source,
+        key_overrides: &std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        let (keys, warnings) = crate::keymap::Keymap::new(key_overrides);
         let count = projects.len();
         let filtered: Vec<usize> = (0..count).collect();
         let mut state = ListState::default();
@@ -306,6 +344,11 @@ impl App {
             dash_max_scroll: 0,
             session_detail_open: false,
             keys_open: false,
+            keys,
+            palette_open: false,
+            palette_query: String::new(),
+            palette_sel: 0,
+            warnings,
             post_action: None,
             quit: false,
             dashboard,
@@ -391,46 +434,85 @@ impl App {
             return;
         }
 
+        if self.palette_open {
+            self.handle_palette_key(key);
+            return;
+        }
+
+        // Not rebindable: a config that lost it would be unquittable.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.quit = true;
+            return;
+        }
+
+        let action = to_key(key).and_then(|k| self.keys.action(k));
+        // Arrows/Enter/Esc keep their meaning whatever `[keys]` says.
+        let action = action.or(match key.code {
+            KeyCode::Down => Some(Act::Down),
+            KeyCode::Up => Some(Act::Up),
+            KeyCode::Right | KeyCode::Enter => Some(Act::Open),
+            KeyCode::Left => Some(Act::Back),
+            KeyCode::Esc => Some(Act::Quit),
+            _ => None,
+        });
+
+        // Paging is keyed off the physical keys only; nothing binds it.
         match key.code {
-            KeyCode::Char('?') => {
-                self.keys_open = true;
+            KeyCode::PageDown => {
+                self.page(20);
+                return;
+            }
+            KeyCode::PageUp => {
+                self.page(-20);
+                return;
+            }
+            _ => {}
+        }
+
+        let Some(action) = action else { return };
+        self.run_action(action);
+    }
+
+    fn run_action(&mut self, action: Act) {
+        match action {
+            Act::Help => self.keys_open = true,
+            Act::Palette => {
+                self.palette_open = true;
+                self.palette_query.clear();
+                self.palette_sel = 0;
             }
             // A committed filter (typed, then Enter) hides the input box
             // but keeps the list narrowed — clear it before quitting or
             // stepping back.
-            KeyCode::Char('q') | KeyCode::Esc if !self.search_query.is_empty() => {
+            Act::Quit if !self.search_query.is_empty() => {
                 self.search_query.clear();
                 self.update_filter();
             }
-            KeyCode::Char('q') | KeyCode::Esc => match self.view {
+            Act::Quit => match self.view {
                 View::Projects => self.quit = true,
                 View::Dashboard => self.view = View::Projects,
-                // Same semantics as `h`/Left — keep the message-eviction
+                // Same semantics as Back — keep the message-eviction
                 // logic in back() the single exit path from a session.
                 View::Sessions | View::Messages => self.back(),
             },
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.quit = true;
-            }
-            // `c` on Sessions or Messages view → resume the highlighted
-            // session in Claude Code. Handed off to main.rs after the
-            // TUI tears down so `claude` gets a clean terminal.
-            KeyCode::Char('c') => {
+            // Handed to main.rs after teardown so `claude` gets a
+            // clean terminal.
+            Act::Resume => {
                 if let Some((id, cwd)) = self.current_resume_target() {
                     self.post_action = Some(PostAction::Resume { id, cwd });
                     self.quit = true;
                 }
             }
-            // `o` → regenerate the web bundle and open it in a browser.
-            // Uses `h` in claude-code-log but `h` is already vim-left here.
-            KeyCode::Char('o') => {
+            Act::Web => {
                 self.post_action = Some(PostAction::OpenWeb);
                 self.quit = true;
             }
-            KeyCode::Tab if self.view == View::Sessions => {
-                self.session_detail_open = !self.session_detail_open;
+            Act::Detail => {
+                if self.view == View::Sessions {
+                    self.session_detail_open = !self.session_detail_open;
+                }
             }
-            KeyCode::Char('d') => {
+            Act::Dashboard => {
                 if self.view == View::Dashboard {
                     self.view = View::Projects;
                 } else {
@@ -441,41 +523,82 @@ impl App {
             // Only the list-layout views (Projects, Sessions) render a
             // search input box; entering search mode elsewhere would
             // silently swallow keystrokes with no visible field.
-            KeyCode::Char('/') if matches!(self.view, View::Projects | View::Sessions) => {
-                self.searching = true;
-                self.search_query.clear();
-                // Without this the previous query's filtered list stays on
-                // screen under an empty search box until the next keystroke.
-                self.update_filter();
-            }
-            KeyCode::Char('j') | KeyCode::Down => self.move_down(),
-            KeyCode::Char('k') | KeyCode::Up => self.move_up(),
-            KeyCode::Char('g') => self.move_top(),
-            KeyCode::Char('G') => self.move_bottom(),
-            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => self.enter(),
-            KeyCode::Char('h') | KeyCode::Left => self.back(),
-            KeyCode::PageDown => {
-                if self.view == View::Messages {
-                    self.message_scroll = self
-                        .message_scroll
-                        .saturating_add(20)
-                        .min(self.message_max_scroll);
-                } else if self.view == View::Dashboard {
-                    self.dash_scroll = self
-                        .dash_scroll
-                        .saturating_add(20)
-                        .min(self.dash_max_scroll);
+            Act::Search => {
+                if matches!(self.view, View::Projects | View::Sessions) {
+                    self.searching = true;
+                    self.search_query.clear();
+                    // Without this the previous query's filtered list stays
+                    // on screen under an empty box until the next keystroke.
+                    self.update_filter();
                 }
             }
-            KeyCode::PageUp => {
-                if self.view == View::Messages {
-                    self.message_scroll = self.message_scroll.saturating_sub(20);
-                } else if self.view == View::Dashboard {
-                    self.dash_scroll = self.dash_scroll.saturating_sub(20);
+            Act::Down => self.move_down(),
+            Act::Up => self.move_up(),
+            Act::Top => self.move_top(),
+            Act::Bottom => self.move_bottom(),
+            Act::Open => self.enter(),
+            Act::Back => self.back(),
+        }
+    }
+
+    fn page(&mut self, delta: i32) {
+        let step = delta.unsigned_abs() as u16;
+        let (scroll, max) = match self.view {
+            View::Messages => (&mut self.message_scroll, self.message_max_scroll),
+            View::Dashboard => (&mut self.dash_scroll, self.dash_max_scroll),
+            _ => return,
+        };
+        *scroll = if delta > 0 {
+            scroll.saturating_add(step).min(max)
+        } else {
+            scroll.saturating_sub(step)
+        };
+    }
+
+    /// Palette rows matching the current query, as (key, label, action).
+    fn palette_rows(&self) -> Vec<(String, &'static str, Act)> {
+        let q = self.palette_query.to_lowercase();
+        self.keys
+            .palette_entries()
+            .into_iter()
+            .filter(|(_, what, _)| q.is_empty() || what.to_lowercase().contains(&q))
+            .map(|(k, what, a)| (k.to_string(), what, a))
+            .collect()
+    }
+
+    fn handle_palette_key(&mut self, key: event::KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.quit = true;
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.palette_open = false;
+            }
+            KeyCode::Enter => {
+                let picked = self
+                    .palette_rows()
+                    .get(self.palette_sel)
+                    .map(|(_, _, a)| *a);
+                self.palette_open = false;
+                if let Some(a) = picked {
+                    self.run_action(a);
                 }
+            }
+            KeyCode::Down => self.palette_sel = self.palette_sel.saturating_add(1),
+            KeyCode::Up => self.palette_sel = self.palette_sel.saturating_sub(1),
+            KeyCode::Backspace => {
+                let _ = self.palette_query.pop();
+                self.palette_sel = 0;
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.palette_query.push(c);
+                self.palette_sel = 0;
             }
             _ => {}
         }
+        let n = self.palette_rows().len();
+        self.palette_sel = self.palette_sel.min(n.saturating_sub(1));
     }
 
     // Bracketed paste: text goes into the search query when one is being
@@ -763,7 +886,15 @@ impl App {
 
         self.render_statusbar(f, chunks[1]);
         if self.keys_open {
-            render_key_help(f);
+            render_key_help(f, &self.keys);
+        }
+        if self.palette_open {
+            render_palette(
+                f,
+                &self.palette_query,
+                self.palette_sel,
+                &self.palette_rows(),
+            );
         }
     }
 
@@ -787,10 +918,14 @@ impl App {
         format!(" | filter {:?} {shown}/{total}", self.search_query)
     }
 
+    /// Per-view hint strip, built from the live keymap so a rebind shows
+    /// the key the user actually has.
     fn render_statusbar(&self, f: &mut Frame, area: Rect) {
         // Status bar repaints on every key. The dashboard struct holds the
         // global totals (computed once in App::new) so we don't re-walk
         // every session per frame.
+        // Hints come from the live keymap, so a rebind shows the real key.
+        let k = |a: Act| self.keys.key_for(a);
         let (left, right) = match self.view {
             View::Projects => (
                 format!(
@@ -800,8 +935,17 @@ impl App {
                     format_cost(self.dashboard.total_cost),
                     self.filter_note(),
                 ),
-                String::from(
-                    "j/k nav | g/G ends | / search | enter select | o web | d dash | ? keys | q quit ",
+                format!(
+                    "{}/{} nav | {}/{} ends | {} search | enter select | {} web | {} dash | {} keys | {} quit ",
+                    k(Act::Down),
+                    k(Act::Up),
+                    k(Act::Top),
+                    k(Act::Bottom),
+                    k(Act::Search),
+                    k(Act::Web),
+                    k(Act::Dashboard),
+                    k(Act::Help),
+                    k(Act::Quit),
                 ),
             ),
             View::Sessions => {
@@ -815,8 +959,16 @@ impl App {
                             format_cost(p.total_cost),
                             self.filter_note(),
                         ),
-                        String::from(
-                            "j/k nav | g/G ends | / search | enter view | tab detail | c resume | ? keys | esc back ",
+                        format!(
+                            "{}/{} nav | {}/{} ends | {} search | enter view | {} detail | {} resume | {} keys | esc back ",
+                            k(Act::Down),
+                            k(Act::Up),
+                            k(Act::Top),
+                            k(Act::Bottom),
+                            k(Act::Search),
+                            k(Act::Detail),
+                            k(Act::Resume),
+                            k(Act::Help),
                         ),
                     )
                 } else {
@@ -833,8 +985,14 @@ impl App {
                             s.model.as_deref().unwrap_or("?"),
                             format_cost(s.cost),
                         ),
-                        String::from(
-                            "j/k scroll | g/G ends | PgDn/PgUp page | c resume | ? keys | esc back ",
+                        format!(
+                            "{}/{} scroll | {}/{} ends | PgDn/PgUp page | {} resume | {} keys | esc back ",
+                            k(Act::Down),
+                            k(Act::Up),
+                            k(Act::Top),
+                            k(Act::Bottom),
+                            k(Act::Resume),
+                            k(Act::Help),
                         ),
                     )
                 } else {
@@ -846,8 +1004,25 @@ impl App {
                     " dashboard | {} total",
                     format_cost(self.dashboard.total_cost)
                 ),
-                String::from("j/k scroll | g/G ends | d close | ? keys | q quit "),
+                format!(
+                    "{}/{} scroll | {}/{} ends | {} close | {} run | {} keys | {} quit ",
+                    k(Act::Down),
+                    k(Act::Up),
+                    k(Act::Top),
+                    k(Act::Bottom),
+                    k(Act::Dashboard),
+                    k(Act::Palette),
+                    k(Act::Help),
+                    k(Act::Quit),
+                ),
             ),
+        };
+
+        // Otherwise invisible: the key just does nothing, and the
+        // alternate screen has swallowed stderr.
+        let left = match self.warnings.first() {
+            Some(w) => format!("{left} | config: {w}"),
+            None => left,
         };
 
         // Display width, not byte len — project names can be non-ASCII
@@ -1578,52 +1753,26 @@ fn unified_row_line(
     ])
 }
 
-/// Full keymap, `(group, keys, what)`.
-///
-/// Mirrors `KEY_HELP` in `src/web/app.js` so `?` describes the same
-/// bindings on both surfaces. The web adds dashboard-only keys (y/p/H
-/// histogram bucket, L log scale, m/t pie mode) for charts the TUI
-/// dashboard doesn't draw; every binding listed here means the same
-/// thing in both.
-const KEY_HELP: &[(&str, &str, &str)] = &[
-    ("Navigate", "j / k / ↑ / ↓", "move the selection, or scroll"),
-    ("", "g / G", "first / last row, or top / bottom"),
-    ("", "l / → / enter", "open the selected row"),
-    ("", "h / ← / q / esc", "back"),
-    ("", "PgDn / PgUp", "page through a session or the dashboard"),
-    ("Find", "/", "filter the list"),
-    ("Act", "c", "resume the session in Claude Code"),
-    ("", "tab", "expand session detail"),
-    ("", "d", "toggle the dashboard"),
-    ("", "o", "regenerate the web bundle and open it"),
-    ("", "?", "this list"),
-    ("", "q / ctrl-c", "quit"),
-];
-
-// Centered `?` overlay. `Clear` wipes the cells first so the view
-// underneath doesn't bleed through the popup's interior.
-fn render_key_help(f: &mut Frame) {
+/// Centered `?` overlay, rendered from the live keymap. `Clear` stops
+/// the view underneath bleeding through.
+fn render_key_help(f: &mut Frame, keys: &crate::keymap::Keymap) {
+    let rows = keys.help();
     let area = f.area();
     let w = 54u16.min(area.width.saturating_sub(2));
-    let h = (KEY_HELP.len() as u16 + 2).min(area.height.saturating_sub(2));
-    let rect = Rect {
-        x: area.x + (area.width.saturating_sub(w)) / 2,
-        y: area.y + (area.height.saturating_sub(h)) / 2,
-        width: w,
-        height: h,
-    };
-    let group_w = KEY_HELP.iter().map(|(g, ..)| g.len()).max().unwrap_or(0);
-    let key_w = KEY_HELP
+    let h = (rows.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let rect = centered(area, w, h);
+    let group_w = rows.iter().map(|(g, ..)| g.len()).max().unwrap_or(0);
+    let key_w = rows
         .iter()
-        .map(|(_, k, _)| unicode_width::UnicodeWidthStr::width(*k))
+        .map(|(_, k, ..)| unicode_width::UnicodeWidthStr::width(k.as_str()))
         .max()
         .unwrap_or(0);
-    let lines: Vec<Line<'static>> = KEY_HELP
+    let lines: Vec<Line<'static>> = rows
         .iter()
-        .map(|(group, keys, what)| {
+        .map(|(group, keys, what, _)| {
             let pad_g = " ".repeat(group_w.saturating_sub(group.len()));
-            let pad_k =
-                " ".repeat(key_w.saturating_sub(unicode_width::UnicodeWidthStr::width(*keys)));
+            let pad_k = " "
+                .repeat(key_w.saturating_sub(unicode_width::UnicodeWidthStr::width(keys.as_str())));
             Line::from(vec![
                 Span::styled(
                     format!("{group}{pad_g}  "),
@@ -1643,6 +1792,66 @@ fn render_key_help(f: &mut Frame) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" keys — any key closes ")
+        .border_style(Style::default().fg(style::tui(style::BORDER)));
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+const fn centered(area: Rect, w: u16, h: u16) -> Rect {
+    Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+/// Every action by name, filtered as you type.
+fn render_palette(f: &mut Frame, query: &str, sel: usize, rows: &[(String, &'static str, Act)]) {
+    let area = f.area();
+    let w = 56u16.min(area.width.saturating_sub(2));
+    let h = (rows.len() as u16 + 3).min(area.height.saturating_sub(2));
+    let rect = centered(area, w, h);
+    let key_w = rows
+        .iter()
+        .map(|(k, ..)| unicode_width::UnicodeWidthStr::width(k.as_str()))
+        .max()
+        .unwrap_or(0);
+    let mut lines: Vec<Line<'static>> = vec![Line::from(vec![
+        Span::styled("› ", Style::default().fg(style::tui(style::FG3))),
+        Span::styled(
+            query.to_string(),
+            Style::default()
+                .fg(style::tui(style::FG))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])];
+    for (i, (key, what, _)) in rows.iter().enumerate() {
+        let pad =
+            " ".repeat(key_w.saturating_sub(unicode_width::UnicodeWidthStr::width(key.as_str())));
+        let marker = if i == sel { "▸ " } else { "  " };
+        let what_style = if i == sel {
+            Style::default()
+                .fg(style::tui(style::FG))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(style::tui(style::FG2))
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker.to_string(),
+                Style::default().fg(style::tui(style::CYAN)),
+            ),
+            Span::styled(
+                format!("{key}{pad}  "),
+                Style::default().fg(style::tui(style::CYAN)),
+            ),
+            Span::styled((*what).to_string(), what_style),
+        ]));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" run — enter picks, esc closes ")
         .border_style(Style::default().fg(style::tui(style::BORDER)));
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines).block(block), rect);
@@ -1674,9 +1883,11 @@ fn truncate_line(s: &str, max: usize) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::KEY_HELP;
+    use super::{App, View};
+    use crate::keymap::Keymap;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::collections::BTreeMap;
 
     // The web app's copy of the keymap. Read as source text rather than
     // executed: the point is to catch one surface's bindings moving
@@ -1684,25 +1895,167 @@ mod tests {
     // languages, so the string is the only shared artifact.
     const WEB_APP_JS: &str = include_str!("web/app.js");
 
-    /// Motion keys mean the same thing in the TUI and the web.
-    ///
-    /// These are the bindings a user carries between the two surfaces
-    /// without thinking, so they're the ones worth pinning. The web's
-    /// `?` overlay spells them identically or the surfaces have drifted.
+    fn app(overrides: &[(&str, &str)]) -> App {
+        let map: BTreeMap<String, String> = overrides
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        App::new(
+            Vec::new(),
+            crate::source::pick(crate::source::SourceKind::default()),
+            &map,
+        )
+    }
+
+    fn press(a: &mut App, code: KeyCode) {
+        a.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
     #[test]
-    fn motion_keys_match_the_web_overlay() {
-        let motion = ["j / k / ↑ / ↓", "g / G", "l / → / enter", "h / ← / q / esc"];
-        for keys in motion {
-            assert!(
-                KEY_HELP.iter().any(|(_, k, _)| *k == keys),
-                "the TUI keymap dropped `{keys}`"
-            );
-            // Quoted, so the match is the whole `KEY_HELP` cell rather
-            // than a substring of a longer one: bare `contains("g / G")`
-            // is still satisfied by `'gg / GG'`.
+    fn quit_key_exits_from_the_landing_view() {
+        let mut a = app(&[]);
+        press(&mut a, KeyCode::Char('q'));
+        assert!(a.quit);
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_though_it_is_not_in_the_keymap() {
+        let mut a = app(&[]);
+        a.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(a.quit);
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_while_typing_a_search() {
+        let mut a = app(&[]);
+        press(&mut a, KeyCode::Char('/'));
+        assert!(a.searching);
+        a.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(a.quit, "ctrl-c must not be swallowed as a search character");
+    }
+
+    #[test]
+    fn dashboard_key_round_trips() {
+        let mut a = app(&[]);
+        press(&mut a, KeyCode::Char('d'));
+        assert!(a.view == View::Dashboard);
+        press(&mut a, KeyCode::Char('d'));
+        assert!(a.view == View::Projects);
+    }
+
+    #[test]
+    fn a_rebound_key_drives_the_action_and_the_default_goes_quiet() {
+        let mut a = app(&[("dashboard", "D")]);
+        press(&mut a, KeyCode::Char('d'));
+        assert!(
+            a.view == View::Projects,
+            "`d` was rebound away and must be inert"
+        );
+        press(&mut a, KeyCode::Char('D'));
+        assert!(a.view == View::Dashboard);
+    }
+
+    #[test]
+    fn arrows_and_enter_keep_working_when_their_letters_are_rebound() {
+        let mut a = app(&[("back", "B"), ("open", "O")]);
+        press(&mut a, KeyCode::Char('d'));
+        assert!(a.view == View::Dashboard);
+        // Esc is a fixed alias for Quit, which closes the dashboard.
+        press(&mut a, KeyCode::Esc);
+        assert!(a.view == View::Projects);
+    }
+
+    #[test]
+    fn the_palette_opens_filters_and_runs_the_picked_action() {
+        let mut a = app(&[]);
+        press(&mut a, KeyCode::Char(':'));
+        assert!(a.palette_open);
+        for c in "dashboard".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        let rows = a.palette_rows();
+        assert_eq!(rows.len(), 1, "expected one match, got {rows:?}");
+        press(&mut a, KeyCode::Enter);
+        assert!(!a.palette_open);
+        assert!(
+            a.view == View::Dashboard,
+            "the palette must run what it highlighted"
+        );
+    }
+
+    #[test]
+    fn the_palette_reaches_actions_whose_key_was_rebound_away() {
+        let mut a = app(&[("dashboard", "ctrl-d")]);
+        press(&mut a, KeyCode::Char(':'));
+        for c in "dashboard".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        press(&mut a, KeyCode::Enter);
+        assert!(a.view == View::Dashboard);
+    }
+
+    #[test]
+    fn esc_closes_the_palette_without_running_anything() {
+        let mut a = app(&[]);
+        press(&mut a, KeyCode::Char(':'));
+        press(&mut a, KeyCode::Esc);
+        assert!(!a.palette_open);
+        assert!(a.view == View::Projects);
+    }
+
+    #[test]
+    fn the_help_overlay_swallows_exactly_one_key() {
+        let mut a = app(&[]);
+        press(&mut a, KeyCode::Char('?'));
+        assert!(a.keys_open);
+        press(&mut a, KeyCode::Char('q'));
+        assert!(!a.keys_open);
+        assert!(
+            !a.quit,
+            "the key that closes the overlay must not also fire"
+        );
+    }
+
+    #[test]
+    fn a_bad_rebind_surfaces_a_warning_rather_than_failing_silently() {
+        let a = app(&[("down", "not-a-key")]);
+        assert!(
+            a.warnings.iter().any(|w| w.contains("keys.down")),
+            "{:?}",
+            a.warnings
+        );
+    }
+
+    /// Every `?` row is spelled identically on both surfaces. Pinning
+    /// only the motion rows is how `PgDn / PgUp` came to be advertised
+    /// in both overlays while only the TUI implemented it.
+    #[test]
+    fn the_whole_key_overlay_matches_the_web() {
+        for (_, keys, _, in_web) in Keymap::default().help() {
+            if !in_web {
+                continue;
+            }
+            // Quoted, so the match is the whole cell rather than a
+            // substring of a longer one: bare `contains("g / G")` is
+            // still satisfied by `'gg / GG'`.
             assert!(
                 WEB_APP_JS.contains(&format!("'{keys}'")),
                 "src/web/app.js no longer lists `{keys}` — the two keymaps have drifted"
+            );
+        }
+    }
+
+    /// Keys the web `?` promises are keys the web actually handles.
+    #[test]
+    fn web_implements_the_keys_its_overlay_advertises() {
+        for (key, what) in [
+            ("PageDown", "page down"),
+            ("PageUp", "page up"),
+            ("Enter", "activate the focused control"),
+        ] {
+            assert!(
+                WEB_APP_JS.contains(&format!("key === '{key}'")),
+                "src/web/app.js advertises {what} but has no `{key}` handler"
             );
         }
     }
@@ -1723,11 +2076,52 @@ mod tests {
             ("'H'", "the dashboard's hour histogram"),
             ("'L'", "the dashboard's log-scale toggle"),
         ] {
-            let n = WEB_APP_JS.matches(&format!("e.key === {key}")).count();
+            let n = WEB_APP_JS.matches(&format!("key === {key}")).count();
             assert_eq!(
                 n, 1,
-                "expected exactly one `e.key === {key}` handler ({what}), found {n}"
+                "expected exactly one `key === {key}` handler ({what}), found {n}"
             );
         }
+    }
+
+    /// Click targets that aren't native controls keep a keyboard path:
+    /// a new `onclick` on a bare div/span/th joins `ACTIVATABLE` or it
+    /// is mouse-only again.
+    #[test]
+    fn non_native_click_targets_stay_keyboard_reachable() {
+        let activatable = WEB_APP_JS
+            .lines()
+            .skip_while(|l| !l.contains("const ACTIVATABLE"))
+            .take(3)
+            .collect::<String>();
+        for sel in [
+            "th.sortable",
+            "[data-msg-sort]",
+            ".crumb",
+            ".drop-item",
+            "tr.clickable",
+            "[data-day]",
+            "[data-model]",
+        ] {
+            assert!(
+                activatable.contains(sel),
+                "`{sel}` is clickable but dropped out of ACTIVATABLE — it is mouse-only again"
+            );
+        }
+    }
+
+    /// Roving tabindex: a 371-cell heatmap as tab stops buries the page.
+    #[test]
+    fn big_groups_rove_instead_of_becoming_tab_stops() {
+        for marker in ["ROVE_GROUPS", "'.heatmap'", "'.hist-wrap'", "'.pie-wrap'"] {
+            assert!(
+                WEB_APP_JS.contains(marker),
+                "src/web/app.js lost `{marker}`"
+            );
+        }
+        assert!(
+            WEB_APP_JS.contains("tabindex=\"-1\""),
+            "focusable cells must start at tabindex -1 and be promoted by retab()"
+        );
     }
 }

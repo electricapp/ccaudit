@@ -8,6 +8,7 @@
 pub mod cache;
 pub mod cli;
 pub mod config;
+pub mod keymap;
 pub mod parse;
 pub mod report;
 pub mod source;
