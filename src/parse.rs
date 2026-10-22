@@ -933,9 +933,15 @@ fn map_file(path: &Path) -> Option<memmap2::Mmap> {
     // Claude Code session files are append-only in practice, so this is
     // accepted rather than paying a defensive full read.
     #[allow(unsafe_code)]
-    unsafe {
-        memmap2::Mmap::map(&file).ok()
-    }
+    let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
+    // Every byte gets read (the newline scan), so ask for all of it up
+    // front. Without this a log that isn't in the page cache is read in
+    // single-page faults, each a synchronous SSD round trip — ~40 µs
+    // per 16 KiB, ~1.5 s for a 540 MB session — and even cached pages
+    // fault in ~30% slower.
+    #[cfg(unix)]
+    let _ = mmap.advise(memmap2::Advice::WillNeed);
+    Some(mmap)
 }
 
 /// The resume point for a session loaded from a per-session cache entry
