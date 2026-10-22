@@ -142,10 +142,12 @@ pub const UNKNOWN_PRICING: Pricing = Pricing {
 /// How confident a provider is in the rate it returned.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Resolution {
-    /// Priced from a family-name match, not a table entry. Breaks when a
-    /// new generation reprices, so it's worth surfacing.
+    /// Priced from a family-name match. No provider returns it — a
+    /// missing model fetches `LiteLLM` or bills at $0 — but `--json`
+    /// keeps "estimated" as a valid `resolution` value.
     Estimated,
-    /// No table entry, no recognizable family. Priced at zero.
+    /// No table entry. Priced at zero (and, on a networked run, a
+    /// `LiteLLM` fetch is attempted before the usage cache is kept).
     Unknown,
 }
 
@@ -174,6 +176,18 @@ pub fn model_resolutions() -> Vec<(String, Resolution)> {
         .and_then(|m| m.lock().ok())
         .map(|g| g.iter().map(|(k, v)| (k.clone(), *v)).collect())
         .unwrap_or_default()
+}
+
+pub(crate) fn has_unpriced_models() -> bool {
+    !model_resolutions().is_empty()
+}
+
+pub(crate) fn clear_model_resolutions() {
+    if let Some(m) = MODEL_RESOLUTIONS.get() {
+        if let Ok(mut g) = m.lock() {
+            g.clear();
+        }
+    }
 }
 
 // ── Source trait ──
@@ -702,7 +716,7 @@ pub fn sanitize_control(s: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::float_cmp)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
 mod tests {
     use super::{Pricing, Source, Tokens};
 
@@ -740,6 +754,51 @@ mod tests {
                 .iter()
                 .any(|(n, _)| n.contains("fable")),
             "an exact table hit must not be reported as estimated or unknown"
+        );
+    }
+
+    #[test]
+    fn fable_5_1_and_opus_5_5_are_in_the_builtin_table() {
+        let fable = super::prices::builtin_price("claude-fable-5-1")
+            .expect("fable-5-1 must be in the baked-in table");
+        assert_eq!(fable.input, 10.0);
+        assert_eq!(fable.output, 50.0);
+        assert_eq!(
+            fable.cache_read, 0.25,
+            "Fable 5.1 cache hits are 0.025× input"
+        );
+        let opus = super::prices::builtin_price("claude-opus-5-5")
+            .expect("opus-5-5 must be in the baked-in table");
+        assert_eq!(opus.input, 4.0);
+        assert_eq!(opus.output, 20.0);
+        assert_eq!(opus.cache_read, 0.20, "Opus 5.5 cache hits are 0.05× input");
+        // Dated log names strip to the same keys.
+        assert_eq!(
+            super::prices::builtin_price("claude-opus-5-5-20260922").map(|p| p.cache_read),
+            Some(0.20)
+        );
+    }
+
+    /// An opus-shaped name that no table knows must be $0, not a
+    /// family-tier guess (which would bill Opus 5.5 as Opus 5).
+    #[test]
+    fn unknown_opus_shaped_name_is_not_estimated() {
+        let name = "claude-opus-99-not-in-any-table";
+        let p = super::claude_code::ClaudeCode.price(Some(name));
+        assert_eq!(p.input, 0.0);
+        assert_eq!(p.cache_read, 0.0);
+        let found = super::model_resolutions();
+        assert!(
+            found
+                .iter()
+                .any(|(n, r)| n == name && *r == super::Resolution::Unknown),
+            "unpriced opus-shaped name must be unknown, not estimated: {found:?}"
+        );
+        assert!(
+            !found
+                .iter()
+                .any(|(_, r)| *r == super::Resolution::Estimated),
+            "no model may be family-estimated: {found:?}"
         );
     }
 

@@ -154,7 +154,7 @@ fn warn_about_unpriced_models(opts: &Options) {
             estimated.join(", ")
         );
     }
-    eprintln!("Run `ccaudit refresh-prices` to pull current rates from LiteLLM.");
+    eprintln!("A networked run fetches LiteLLM for these; `--offline` leaves them at $0.");
 }
 
 fn plural(n: usize, noun: &str) -> String {

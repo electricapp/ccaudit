@@ -53,6 +53,23 @@ fn main() {
         source::set_price_overrides(opts.config_prices.clone());
     }
 
+    // Unknown models fetch LiteLLM and rebuild the usage cache. Skip
+    // on statusline (must stay fast), --offline, --no-cost, and commands
+    // that never price.
+    source::prices::set_auto_refresh(
+        !opts.offline
+            && !opts.no_cost
+            && !matches!(
+                opts.cmd,
+                cli::Cmd::Statusline
+                    | cli::Cmd::Help
+                    | cli::Cmd::Version
+                    | cli::Cmd::Completion
+                    | cli::Cmd::RefreshPrices
+            ),
+        opts.quiet,
+    );
+
     // Resolve the color decision once and publish it to the report
     // layer. Order of precedence (clig.dev + NO_COLOR spec):
     //   1. explicit --no-color / --plain        → off
@@ -62,9 +79,8 @@ fn main() {
     //   5. otherwise: on iff stdout is a TTY
     report::fmt::set_color(resolve_color(&opts));
 
-    // --offline is ccaudit's default (reads never touch the network), and
-    // --mode display has no logged-cost field to show. Tell the user
-    // honestly rather than silently diverging — unless --quiet.
+    // --offline skips the LiteLLM auto-fetch used when a model isn't in
+    // the local tables. --mode display has no logged-cost field to show.
     if opts.mode == cli::CostMode::Display && !opts.quiet {
         eprintln!(
             "note: ccaudit computes costs from its cached price table; `--mode display` falls back to calculated costs."

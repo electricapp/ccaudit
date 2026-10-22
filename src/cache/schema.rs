@@ -38,10 +38,11 @@
 use bytemuck::{Pod, Zeroable};
 
 pub const MAGIC: u32 = 0x4343_5547; // "CCUG"
-// Bump on any change to the structs below or to what the build writes
-// into them; a mismatch forces one full rebuild, which is what keeps a
-// stale `.db` from being reinterpreted under a new layout.
-pub const VERSION: u32 = 0;
+// Bump on any change to the structs below, to what the build writes
+// into them, or to pricing rules that are baked into PreAgg costs; a
+// mismatch forces one full rebuild, which is what keeps a stale `.db`
+// from being reinterpreted under a new layout or an old rate.
+pub const VERSION: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]

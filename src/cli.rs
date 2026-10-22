@@ -170,12 +170,10 @@ pub struct Options {
     /// Row sort direction. `None` = per-bucket default (time ascending,
     /// sessions most-recent-first). `Some(_)` overrides for display.
     pub order: Option<Order>,
-    /// ccusage parity flag. ccusage re-fetches `LiteLLM` prices on every
-    /// run and `--offline` makes it use a bundled snapshot instead;
-    /// ccaudit *always* prices from its local cache (refreshed on demand
-    /// by `refresh-prices`), so reports are already offline-fast and this
-    /// flag is a documented no-op accepted so ccusage scripts/muscle
-    /// memory keep working.
+    /// ccusage parity flag. Without it, a model missing from the local
+    /// tables triggers a `LiteLLM` fetch and a usage-cache rebuild. With
+    /// it, those models stay at $0 and nothing hits the network —
+    /// `statusline` is always offline-fast either way.
     pub offline: bool,
     /// Cost-sourcing mode (ccusage parity). See [`CostMode`].
     pub mode: CostMode,
@@ -1019,8 +1017,9 @@ pub fn print_help() {
     println!("{i}Token usage and cost reports from local coding-agent logs — daily,");
     println!("{i}weekly, monthly, per session, or per 5-hour billing block, as");
     println!("{i}tables, JSON, an interactive TUI, or a web dashboard. Claude Code");
-    println!("{i}by default; --source lists the other providers. Refresh model");
-    println!("{i}prices anytime with ccaudit refresh-prices.");
+    println!("{i}by default; --source lists the other providers. A model with no");
+    println!("{i}local rate fetches LiteLLM automatically; refresh-prices does");
+    println!("{i}the same on demand, and offline mode skips the network.");
     println!();
 
     println!("COMMANDS:");
@@ -1085,6 +1084,7 @@ pub fn print_help() {
         ("", "--all", "report every provider that has logs, summed"),
         ("", "--by-agent", "like --all, one row per provider"),
         ("", "--no-cost", "omit every dollar figure from the output"),
+        ("", "--offline", "skip LiteLLM; unknown models stay at $0"),
         ("", "--no-color", "disable ANSI color (also: NO_COLOR env)"),
         ("-q", "--quiet", "suppress non-essential output"),
         ("-V", "--version", "print the version"),
@@ -1262,7 +1262,7 @@ fn print_report_help(name: &str, tagline: &str, extra: Option<&[(&str, &str)]>) 
     println!("  --tail N            keep only the N most-recent rows");
     println!("  --carbon            append energy / CO₂ / tree-year footer");
     println!("  --mode MODE         cost source: auto|calculate|display (ccusage parity)");
-    println!("  --offline           price from the local cache (always on; ccusage parity)");
+    println!("  --offline           skip LiteLLM; unknown models stay at $0");
     for (flag, desc) in extra.unwrap_or(&[]) {
         println!("  {flag:<19} {desc}");
     }

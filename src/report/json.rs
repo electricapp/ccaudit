@@ -26,8 +26,8 @@ struct JsonReport<'a> {
 #[derive(Serialize)]
 struct JsonUnpriced {
     model: String,
-    /// "unknown" — billed at zero — or "estimated", priced from the
-    /// model's family tier rather than an exact table entry.
+    /// "unknown" — billed at zero — or "estimated" (valid in the schema;
+    /// no provider emits it).
     resolution: &'static str,
 }
 

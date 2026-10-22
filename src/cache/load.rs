@@ -125,6 +125,15 @@ impl LoadedCache {
 /// `.db` if every source file's `(mtime, size)` still matches; rebuilds
 /// (parsing only the changed files) otherwise.
 pub fn load<S: Source + ?Sized>(source: &S) -> LoadedCache {
+    let cache = load_once(source);
+    if crate::source::prices::refresh_unpriced_if_needed() {
+        load_once(source)
+    } else {
+        cache
+    }
+}
+
+fn load_once<S: Source + ?Sized>(source: &S) -> LoadedCache {
     // Lazy mode: skip the filesystem scan and use the cache as-is. Opt-in
     // via CCAUDIT_LAZY=1 for status-bar integrations where one-run
     // staleness is OK in exchange for ~0ms startup.

@@ -260,8 +260,8 @@ Report subcommands accept `--json` (structured) or `--plain` (tab-separated) for
 - **Web dashboard** — tables with sortable columns, pie/histogram/heatmap charts, full message viewer, URL routing (`/p/{slug}/s/{uuid}`)
 - **Scope-aware**: press `d` from any view and the dashboard reflects just that project or session
 - **Per-token-type cost breakdown** on hover
-- **Accurate pricing** — ships with a LiteLLM-generated rate table and fetches newer rates on demand (`ccaudit refresh-prices`). Cache writes are billed per TTL: the 5-minute tier at 1.25× input, the 1-hour tier at 2×, read from the `cache_creation` split the logs carry.
-- **No invented prices** — a model in no rate table is billed at $0 and named on stderr (and in `unpriced_models` under `--json`), rather than silently charged at whichever tier the fallback happened to land on.
+- **Accurate pricing** — ships with a LiteLLM-generated rate table. A model missing from that table and from `~/.claude/ccaudit-cache/prices.json` fetches LiteLLM, writes the cache, and rebuilds costs (`ccaudit refresh-prices` does the same on demand; `--offline` skips the network). Cache writes are billed per TTL: the 5-minute tier at 1.25× input, the 1-hour tier at 2×, read from the `cache_creation` split the logs carry.
+- **No invented prices** — a model in no rate table is billed at $0 and named on stderr (and in `unpriced_models` under `--json`), rather than silently charged at a sibling or family rate. `opus-5-5` is not priced as `opus-5`.
 - **Carbon footer** (`--carbon`) — energy / CO₂ / tree-year estimate for the reported window
 - **Deterministic filters** — `--since YYYYMMDD`, `--until`, `--project`, `--timezone` (local by default, `UTC` or `±HH:MM` on request), `--locale`, `--source`
 - **Cross-provider reports** — `--all` sums every provider that has logs; `--by-agent` splits the rows per provider. Each is aggregated by its own `Source`, so nothing is ever priced against another provider's rate table.
@@ -341,14 +341,14 @@ ccaudit completion zsh > ~/.zfunc/_ccaudit      # shell completions
 ```
 
 - `--json` / `--plain` make output machine-readable; `--plain` is tab-separated with raw integers and no box-drawing or color.
-- `--order asc|desc`, `--offline`, and `--mode auto|calculate|display` are accepted for ccusage compatibility. ccaudit prices from its local cache on every run (update it online with `refresh-prices`), so `--offline` is already the default and `--mode display` falls back to calculated costs.
+- `--order asc|desc`, `--offline`, and `--mode auto|calculate|display` are accepted for ccusage compatibility. `--offline` skips the LiteLLM auto-fetch (unknown models stay at $0). `--mode display` falls back to calculated costs.
 - **Color** follows the [`NO_COLOR`](https://no-color.org) convention: ANSI color is emitted only when stdout is a terminal, and is disabled by `--no-color`, `NO_COLOR`, `CCAUDIT_NO_COLOR`, or `TERM=dumb` (force it back on with `FORCE_COLOR`). Piped output is always clean.
 - Mistyped a command or flag? ccaudit names the closest match (`ccaudit dialy` → _a similar command exists: ccaudit daily_).
 
 ## Development
 
 ```bash
-cargo test --release --all-features              # 74 tests across 5 suites
+cargo test --release --all-features              # tests across 6 suites
 cargo bench                                      # synthetic-corpus bench (ccaudit internals)
 BENCH_SIZE=large BENCH_RUNS=10 \
   cargo bench                                    # scaling stress

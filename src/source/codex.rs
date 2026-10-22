@@ -59,35 +59,23 @@ impl Source for Codex {
     fn base_price(&self, model: Option<&str>) -> &Pricing {
         // `model` first so `price(None)` never forces the LiteLLM table
         // load — see the matching note in `ClaudeCode::price`.
-        if let Some(name) = model {
-            if let Some(lookup) = super::prices::get() {
-                let candidates = openai_name_candidates(name);
-                if let Some(p) = lookup.lookup(&candidates) {
-                    return p;
-                }
-            }
-        }
-        // Family heuristic over the hardcoded tiers (April 2026 OpenAI
-        // list prices). `mini`/`nano` before the base tier: "gpt-5-mini"
-        // contains "gpt-5", and the modifier is the sharper signal.
         let Some(name) = model else {
             return &super::UNKNOWN_PRICING;
         };
-        let inferred = match name {
-            m if m.contains("mini") => Some(&GPT5_MINI),
-            m if m.contains("nano") => Some(&GPT5_NANO),
-            m if m.contains("gpt-5") => Some(&GPT5),
-            _ => None,
-        };
-        // Codex drives whatever model the user configured. Billing an
-        // unrecognized one at the GPT-5 rate looks right and isn't.
-        if let Some(p) = inferred {
-            super::note_model_resolution(name, super::Resolution::Estimated);
-            p
-        } else {
-            super::note_model_resolution(name, super::Resolution::Unknown);
-            &super::UNKNOWN_PRICING
+        if let Some(lookup) = super::prices::get() {
+            let candidates = openai_name_candidates(name);
+            if let Some(p) = lookup.lookup(&candidates) {
+                return p;
+            }
         }
+        if let Some(p) = super::prices::builtin_price(name) {
+            return p;
+        }
+        if let Some(p) = codex_known(name) {
+            return p;
+        }
+        super::note_model_resolution(name, super::Resolution::Unknown);
+        &super::UNKNOWN_PRICING
     }
 
     fn normalize_model<'a>(&self, model: &'a str) -> Cow<'a, str> {
@@ -100,6 +88,18 @@ impl Source for Codex {
 // LiteLLM keys OpenAI models both bare and with an `openai/` prefix; try both.
 fn openai_name_candidates(name: &str) -> [String; 2] {
     [name.to_string(), format!("openai/{name}")]
+}
+
+/// Exact keys for the GPT-5 stack, used when `LiteLLM` hasn't been
+/// fetched yet. Not a `contains` guess — `gpt-5.4` does not inherit
+/// `gpt-5` any more than `opus-5-5` inherits `opus-5`.
+fn codex_known(name: &str) -> Option<&'static Pricing> {
+    match name {
+        "gpt-5" => Some(&GPT5),
+        "gpt-5-mini" => Some(&GPT5_MINI),
+        "gpt-5-nano" => Some(&GPT5_NANO),
+        _ => None,
+    }
 }
 
 // OpenAI doesn't bill cache writes separately — the input rate covers

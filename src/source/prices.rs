@@ -1,16 +1,14 @@
-// LiteLLM pricing integration (optional, refresh-on-demand).
+// LiteLLM pricing integration.
 //
-// ccusage fetches https://github.com/BerriAI/litellm/.../model_prices_and_context_window.json
-// at runtime to keep model prices current. We do the same but on an
-// explicit user command (`ccaudit refresh-prices`) — the file is then
-// cached under ~/.claude/ccaudit-cache/prices.json.
+// Lookup order at `price()` time: the user's `prices.json` cache, then
+// the baked-in table. A model in neither is billed at $0 — never guessed
+// from a family name — and, unless `--offline` / `statusline`, the next
+// cache build fetches LiteLLM, writes `prices.json`, and rebuilds so a
+// newly shipped model picks up a real rate without `refresh-prices`.
 //
-// Providers (e.g. ClaudeCode) consult `lookup()` first at price() time;
-// a miss falls back to their hardcoded rate table. Since preaggs are
-// priced at cache-build time, `refresh-prices` also deletes every
-// provider usage cache (claude-code.db, codex.db) to force a rebuild with
-// fresh rates — prices.json is shared, so a stale rate would otherwise
-// linger in whichever provider wasn't rebuilt.
+// Preaggs freeze costs at build time, so any write to `prices.json`
+// (explicit `refresh-prices` or the auto-fetch) deletes every provider
+// usage cache (claude-code.db, codex.db).
 
 use super::{Pricing, SourceKind};
 use serde::Deserialize;
@@ -19,7 +17,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const LITELLM_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
@@ -62,13 +61,13 @@ pub struct PricesLookup {
 impl PricesLookup {
     /// Look up a model with a two-stage strategy:
     ///   1. Exact match against any provider-scoped candidate name.
-    ///   2. Word-boundary substring match: the candidate name contains
-    ///      the key as a segment delimited by `-` / `/` / `.` / `_` / `:`
-    ///      (or string ends). Among multiple matches, pick the longest
-    ///      key (most specific). Only this direction is allowed —
-    ///      accepting "key contains name" would mean a lookup for
-    ///      `gpt-5` returns the price for `gpt-5-mini`, since the
-    ///      latter contains the former.
+    ///   2. Word-boundary substring match whose extra suffix is only a
+    ///      date stamp (`-YYYYMMDD`, optionally `-v1:0`). That covers
+    ///      `claude-opus-4-7-20251205` → `claude-opus-4-7` without
+    ///      letting `claude-opus-5-5` inherit `claude-opus-5` (or
+    ///      `gpt-5.4` inherit `gpt-5`). Longest key wins. Only
+    ///      haystack-contains-key is allowed — the reverse would price
+    ///      `gpt-5` at `gpt-5-mini`.
     pub fn lookup(&self, candidates: &[String]) -> Option<&Pricing> {
         for c in candidates {
             if let Some(p) = self.entries.get(c) {
@@ -84,11 +83,17 @@ impl PricesLookup {
             if k_lower.len() > lower.len() {
                 continue;
             }
-            if contains_at_boundary(&lower, k_lower) {
-                let len = k_lower.len();
-                if best.is_none_or(|(b, _)| len > b) {
-                    best = Some((len, pricing));
-                }
+            let Some(start) = first_boundary_match(&lower, k_lower) else {
+                continue;
+            };
+            let after = start + k_lower.len();
+            let suffix = lower.get(after..).unwrap_or("");
+            if !suffix_is_date_variant(suffix) {
+                continue;
+            }
+            let len = k_lower.len();
+            if best.is_none_or(|(b, _)| len > b) {
+                best = Some((len, pricing));
             }
         }
         best.map(|(_, p)| p)
@@ -99,11 +104,11 @@ impl PricesLookup {
 // delimited by a model-name separator (or by the start/end of the
 // haystack). Keeps `claude-opus-4` matching `anthropic/claude-opus-4`
 // but stops `gpt-5` from matching `gpt-5-mini`.
-fn contains_at_boundary(haystack: &str, needle: &str) -> bool {
+fn first_boundary_match(haystack: &str, needle: &str) -> Option<usize> {
     let hb = haystack.as_bytes();
     let nb = needle.as_bytes();
     if nb.is_empty() || hb.len() < nb.len() {
-        return false;
+        return None;
     }
     let max = hb.len() - nb.len();
     let mut i = 0;
@@ -114,23 +119,149 @@ fn contains_at_boundary(haystack: &str, needle: &str) -> bool {
             let after_ok =
                 after == hb.len() || hb.get(after).copied().is_some_and(is_name_separator);
             if before_ok && after_ok {
-                return true;
+                return Some(i);
             }
         }
         i += 1;
     }
-    false
+    None
+}
+
+/// Extra characters after a boundary match: empty, or `-YYYYMMDD` with
+/// an optional trailing alias (`-v1:0`). A lone `-5` / `.4` / `-mini`
+/// is a different model, not a dated snapshot of the parent.
+fn suffix_is_date_variant(suffix: &str) -> bool {
+    if suffix.is_empty() {
+        return true;
+    }
+    let Some(rest) = suffix.strip_prefix('-') else {
+        return false;
+    };
+    if rest.len() < 8 {
+        return false;
+    }
+    let date = rest.get(..8).unwrap_or("");
+    if !date.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let tail = rest.get(8..).unwrap_or("");
+    tail.is_empty() || tail.starts_with('-') || tail.starts_with(':')
 }
 
 const fn is_name_separator(b: u8) -> bool {
     matches!(b, b'-' | b'/' | b'.' | b'_' | b':')
 }
 
-// One-time-per-process lazy load. Missing file → `None`, no error.
-static LOADED: OnceLock<Option<PricesLookup>> = OnceLock::new();
+#[derive(Clone, Copy)]
+enum LoadState {
+    Unloaded,
+    Missing,
+    Ready(&'static PricesLookup),
+}
+
+// Lazy load, resettable after an in-process refresh so auto-fetch can
+// reprice the same run. `Box::leak` keeps the `get()` signature a
+// `&'static` — at most one extra table per process (the stale copy
+// from before the fetch).
+static LOADED: Mutex<LoadState> = Mutex::new(LoadState::Unloaded);
 
 pub fn get() -> Option<&'static PricesLookup> {
-    LOADED.get_or_init(load).as_ref()
+    let mut slot = LOADED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if matches!(*slot, LoadState::Unloaded) {
+        *slot = match load() {
+            Some(lk) => LoadState::Ready(Box::leak(Box::new(lk))),
+            None => LoadState::Missing,
+        };
+    }
+    match *slot {
+        LoadState::Ready(p) => Some(p),
+        LoadState::Missing | LoadState::Unloaded => None,
+    }
+}
+
+fn invalidate() {
+    let mut slot = LOADED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = LoadState::Unloaded;
+}
+
+/// Exact-match probe into the generated table: the raw model name, then
+/// the same name minus its `-YYYYMMDD` suffix. Logs always carry the
+/// dated form; `LiteLLM` carries one form or both.
+pub fn builtin_price(name: &str) -> Option<&'static Pricing> {
+    let table = super::price_table::BUILTIN;
+    let find = |k: &str| {
+        table
+            .binary_search_by(|(key, _)| (*key).cmp(k))
+            .ok()
+            .and_then(|i| table.get(i))
+            .map(|(_, p)| p)
+    };
+    find(name).or_else(|| find(strip_date_suffix(name)))
+}
+
+/// `"claude-opus-4-8-20260601"` → `"claude-opus-4-8"`. Returns the input
+/// unchanged when there's no 8-digit trailing segment.
+pub(crate) fn strip_date_suffix(name: &str) -> &str {
+    let Some(idx) = name.rfind('-') else {
+        return name;
+    };
+    let tail = name.get(idx + 1..).unwrap_or_default();
+    if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit()) {
+        name.get(..idx).unwrap_or(name)
+    } else {
+        name
+    }
+}
+
+// ── Auto-fetch on unknown models ──
+
+static AUTO_REFRESH: AtomicBool = AtomicBool::new(false);
+static AUTO_REFRESH_QUIET: AtomicBool = AtomicBool::new(false);
+static AUTO_REFRESH_TRIED: AtomicBool = AtomicBool::new(false);
+
+/// Turn on the "unknown model → hit `LiteLLM` → rebuild usage cache" path.
+/// `statusline` and `--offline` leave this off so a prompt poll never
+/// waits on the network.
+pub fn set_auto_refresh(on: bool, quiet: bool) {
+    AUTO_REFRESH.store(on, Ordering::SeqCst);
+    AUTO_REFRESH_QUIET.store(quiet, Ordering::SeqCst);
+}
+
+/// If this run priced any model at zero for lack of a table entry, fetch
+/// `LiteLLM` once, reload the lookup, and delete usage DBs. Returns true
+/// when the caller should rebuild the usage cache.
+#[allow(clippy::print_stderr)]
+pub fn refresh_unpriced_if_needed() -> bool {
+    if !AUTO_REFRESH.load(Ordering::SeqCst) {
+        return false;
+    }
+    if !super::has_unpriced_models() {
+        return false;
+    }
+    if AUTO_REFRESH_TRIED.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let quiet = AUTO_REFRESH_QUIET.load(Ordering::SeqCst);
+    if !quiet {
+        eprintln!("note: unknown model — fetching current rates from LiteLLM…");
+    }
+    match refresh() {
+        Ok(_) => {
+            invalidate();
+            super::clear_model_resolutions();
+            true
+        }
+        Err(e) => {
+            if !quiet {
+                eprintln!("warning: could not refresh prices ({e}); unpriced models stay at $0.");
+            }
+            false
+        }
+    }
 }
 
 // A missing file is the normal "no refresh yet" case → silent None. A
@@ -267,6 +398,7 @@ pub fn refresh() -> Result<RefreshResult, String> {
             }
         }
     }
+    invalidate();
 
     Ok(RefreshResult {
         model_count,
@@ -350,7 +482,7 @@ const HEADER: &str = concat!(
     "// fallback: a user who ran `refresh-prices` gets their newer copy\n",
     "// first, and a model in neither is priced at zero and reported.\n",
     "//\n",
-    "// Sorted by key — `claude_code::builtin_price` binary-searches it.\n",
+    "// Sorted by key — `prices::builtin_price` binary-searches it.\n",
     "\n",
     "use super::Pricing;\n",
     "\n",
@@ -453,6 +585,41 @@ mod tests {
         // entry, no boundary-aligned substring match).
         let lk = mk_lookup(&["gpt-5-mini"]);
         assert!(lk.lookup(&["gpt-5".to_string()]).is_none());
+    }
+
+    #[test]
+    fn child_version_does_not_inherit_parent_rate() {
+        // `-` is a name separator, so `claude-opus-5` is a boundary-aligned
+        // prefix of `claude-opus-5-5`. The leftover `-5` is not a date
+        // stamp, so it must not match.
+        let lk = mk_lookup(&["claude-opus-5", "claude-fable-5", "gpt-5"]);
+        assert!(
+            lk.lookup(&["claude-opus-5-5".to_string()]).is_none(),
+            "opus-5-5 must not take opus-5's rate"
+        );
+        assert!(
+            lk.lookup(&["claude-fable-5-1".to_string()]).is_none(),
+            "fable-5-1 must not take fable-5's rate"
+        );
+        assert!(
+            lk.lookup(&["gpt-5.4".to_string()]).is_none(),
+            "gpt-5.4 must not take gpt-5's rate"
+        );
+        // Parent lookup is still an exact hit.
+        assert!(lk.lookup(&["claude-opus-5".to_string()]).is_some());
+    }
+
+    #[test]
+    fn dated_snapshot_still_matches_parent_key() {
+        let lk = mk_lookup(&["claude-opus-5-5"]);
+        let p = lk
+            .lookup(&["claude-opus-5-5-20260922".to_string()])
+            .expect("YYYYMMDD suffix is a snapshot of the same model");
+        assert!((p.input - 1.0).abs() < f64::EPSILON);
+        let p = lk
+            .lookup(&["claude-opus-5-5-20250929-v1:0".to_string()])
+            .expect("date plus -v1:0 alias still counts as the same model");
+        assert!((p.input - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

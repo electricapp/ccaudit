@@ -866,6 +866,59 @@ fn litellm_prices_override_hardcoded_rates() {
     );
 }
 
+/// A prices.json that only knows the parent model must not price the
+/// child (`opus-5-5`, `fable-5-1`) at the parent's rate. `--offline`
+/// keeps this off the network so it pins the lookup rule, not `LiteLLM`.
+#[test]
+fn child_model_does_not_inherit_parent_rate_from_prices_json() {
+    let h = Harness::new();
+    let _ = h.write_jsonl(
+        "-Users-test-code-alpha",
+        "sess_child",
+        &[
+            &summary_line("child model"),
+            &user_line("hello", "2026-09-22T12:00:00.000Z"),
+            &assistant_line(&AssistantLine {
+                msg_id: "msg_child",
+                model: "claude-opus-5-5",
+                iso_ts: "2026-09-22T12:00:01.000Z",
+                input: 0,
+                output: 0,
+                cache_read: 1_000_000,
+                cache_create: 0,
+                text: "hi",
+            }),
+        ],
+    );
+    let prices = serde_json::json!({
+        "claude-opus-5": {
+            "input_cost_per_token": 5e-6,
+            "output_cost_per_token": 2.5e-5,
+            "cache_creation_input_token_cost": 6.25e-6,
+            "cache_read_input_token_cost": 5e-7
+        }
+    });
+    std::fs::write(
+        h.home
+            .path()
+            .join(".claude")
+            .join("ccaudit-cache")
+            .join("prices.json"),
+        serde_json::to_vec(&prices).unwrap(),
+    )
+    .unwrap();
+
+    let out = h.run(&["--json", "--offline"]);
+    require_success(&out, "child model vs parent prices.json");
+    let v: Value = serde_json::from_str(&read_stdout(&out)).unwrap();
+    let cost = v["totals"]["cost_usd"].as_f64().unwrap();
+    // Builtin / Anthropic Opus 5.5 cache read is $0.20/M, not Opus 5's $0.50/M.
+    assert!(
+        (cost - 0.20).abs() < 1e-9,
+        "opus-5-5 cache read should be $0.20, not opus-5's $0.50; got {cost}"
+    );
+}
+
 // ── Env vars ──
 
 #[test]
@@ -1227,10 +1280,10 @@ fn subcommand_list_is_identical_in_help_and_completion() {
 
 /// Give the harness both providers with real, distinct numbers.
 /// Claude: 1500 in / 2500 out / 10000 cw / 1000 cr on opus-4-7.
-/// Codex:  800 uncached in / 200 cached / 100 out on gpt-5.4.
+/// Codex:  800 uncached in / 200 cached / 100 out on gpt-5.
 fn setup_two_providers(h: &Harness) {
     setup_single_project(h);
-    let lines = codex_session("cx1", "gpt-5.4", 1000, 200, 100);
+    let lines = codex_session("cx1", "gpt-5", 1000, 200, 100);
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
     let _ = h.write_codex_rollout(("2026", "04", "01"), "a", &refs);
 }

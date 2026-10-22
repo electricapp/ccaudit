@@ -87,54 +87,28 @@ impl Source for ClaudeCode {
     }
 
     fn base_price(&self, model: Option<&str>) -> &Pricing {
-        // 1. Try the user's refreshed LiteLLM cache (if present). This
-        //    matches ccusage's approach and keeps prices current without
-        //    a code change. Multiple name variants are tried (exact +
-        //    `anthropic/` prefix + date-stripped form) to cover how
-        //    LiteLLM tends to key Claude models.
-        // `model` first: `price(None)` has nothing to look up, and
-        // `prices::get()` would force the whole LiteLLM table to load just
-        // to fall through. `ModelRates::build` calls it on every run.
-        if let Some(name) = model {
-            if let Some(lookup) = super::prices::get() {
-                let (candidates, len) = claude_name_candidates(name);
-                #[allow(clippy::indexing_slicing)]
-                if let Some(p) = lookup.lookup(&candidates[..len]) {
-                    return p;
-                }
-            }
-        }
-        // 2. The generated table — same LiteLLM rates, snapshotted at
-        //    release. An exact hit is a fact, so nothing is reported.
-        if let Some(name) = model {
-            if let Some(p) = builtin_price(name) {
+        // 1. User's LiteLLM cache. `model` first: `price(None)` has
+        //    nothing to look up, and `prices::get()` would force the
+        //    whole table to load just to fall through.
+        let Some(name) = model else {
+            return &super::UNKNOWN_PRICING;
+        };
+        if let Some(lookup) = super::prices::get() {
+            let (candidates, len) = claude_name_candidates(name);
+            #[allow(clippy::indexing_slicing)]
+            if let Some(p) = lookup.lookup(&candidates[..len]) {
                 return p;
             }
         }
-        // 3. Family heuristic, for a model newer than the table. Claude
-        //    3.x rates differ sharply from 4.x (3-opus is 3× the 4.x
-        //    price), so match generation before family.
-        let Some(name) = model else {
-            // No model on the line: nothing to look up or report.
-            return &super::UNKNOWN_PRICING;
-        };
-        let inferred = match name {
-            m if m.contains("3-opus") => Some(&OPUS_3),
-            m if m.contains("3-5-haiku") => Some(&HAIKU_3_5),
-            m if m.contains("3-haiku") => Some(&HAIKU_3),
-            m if m.contains("opus") => Some(&OPUS),
-            m if m.contains("sonnet") => Some(&SONNET),
-            m if m.contains("haiku") => Some(&HAIKU),
-            _ => None,
-        };
-        // 4. Nothing recognizable. Zero, and named in the report.
-        if let Some(p) = inferred {
-            super::note_model_resolution(name, super::Resolution::Estimated);
-            p
-        } else {
-            super::note_model_resolution(name, super::Resolution::Unknown);
-            &super::UNKNOWN_PRICING
+        // 2. Baked-in table — same LiteLLM rates, snapshotted at
+        //    release. An exact hit is a fact, so nothing is reported.
+        if let Some(p) = super::prices::builtin_price(name) {
+            return p;
         }
+        // 3. Unknown. Zero, named on stderr. A networked run then
+        //    fetches LiteLLM and rebuilds rather than guessing a family.
+        super::note_model_resolution(name, super::Resolution::Unknown);
+        &super::UNKNOWN_PRICING
     }
 
     fn normalize_model<'a>(&self, model: &'a str) -> Cow<'a, str> {
@@ -158,35 +132,6 @@ impl Source for ClaudeCode {
     }
 }
 
-/// Exact-match probe into the generated table: the raw model name, then
-/// the same name minus its `-YYYYMMDD` suffix. Logs always carry the
-/// dated form; `LiteLLM` carries one form or both.
-fn builtin_price(name: &str) -> Option<&'static Pricing> {
-    let table = super::price_table::BUILTIN;
-    let find = |k: &str| {
-        table
-            .binary_search_by(|(key, _)| (*key).cmp(k))
-            .ok()
-            .and_then(|i| table.get(i))
-            .map(|(_, p)| p)
-    };
-    find(name).or_else(|| find(strip_date_suffix(name)))
-}
-
-/// `"claude-opus-4-8-20260601"` → `"claude-opus-4-8"`. Returns the input
-/// unchanged when there's no 8-digit trailing segment.
-fn strip_date_suffix(name: &str) -> &str {
-    let Some(idx) = name.rfind('-') else {
-        return name;
-    };
-    let tail = name.get(idx + 1..).unwrap_or_default();
-    if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit()) {
-        name.get(..idx).unwrap_or(name)
-    } else {
-        name
-    }
-}
-
 // Build candidate names to probe against LiteLLM's keyspace. LiteLLM
 // tends to store Claude models under several forms; try the raw name
 // first, then with common prefixes, then with the date suffix stripped.
@@ -198,79 +143,17 @@ fn claude_name_candidates(name: &str) -> ([String; 4], usize) {
         String::new(),
     ];
     let mut len = 2;
-    if let Some(idx) = name.rfind('-') {
-        let tail = &name[idx + 1..];
-        if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit()) {
-            let base = &name[..idx];
-            #[allow(clippy::indexing_slicing)]
-            {
-                if len < 4 {
-                    out[len] = base.to_string();
-                    len += 1;
-                }
-                if len < 4 {
-                    out[len] = format!("anthropic/{base}");
-                    len += 1;
-                }
-            }
+    let stripped = super::prices::strip_date_suffix(name);
+    if stripped != name {
+        #[allow(clippy::indexing_slicing)]
+        {
+            out[2] = stripped.to_string();
+            out[3] = format!("anthropic/{stripped}");
         }
+        len = 4;
     }
     (out, len)
 }
-
-// Per-family tier rates, per-million tokens.
-//
-// Not the price table — that's `price_table::BUILTIN`. These are the
-// last resort for a model whose name announces a family but which no
-// table knows yet. Anthropic has held each family's rates steady across
-// 4.x, which is what makes the guess worth making; it's still recorded
-// as `Resolution::Estimated` so a repricing shows up.
-const OPUS: Pricing = Pricing {
-    input: 5.0,
-    output: 25.0,
-    cache_write: 6.25,
-    cache_write_1h: 10.0,
-    cache_read: 0.50,
-};
-const SONNET: Pricing = Pricing {
-    input: 3.0,
-    output: 15.0,
-    cache_write: 3.75,
-    cache_write_1h: 6.0,
-    cache_read: 0.30,
-};
-const HAIKU: Pricing = Pricing {
-    input: 1.0,
-    output: 5.0,
-    cache_write: 1.25,
-    cache_write_1h: 2.0,
-    cache_read: 0.10,
-};
-// Claude 3.x generations (legacy logs). Keys: claude-3-opus,
-// claude-3-5-haiku, claude-3-haiku in the same LiteLLM table.
-const OPUS_3: Pricing = Pricing {
-    input: 15.0,
-    output: 75.0,
-    cache_write: 18.75,
-    cache_write_1h: 30.0,
-    cache_read: 1.50,
-};
-const HAIKU_3_5: Pricing = Pricing {
-    input: 0.80,
-    output: 4.0,
-    cache_write: 1.0,
-    cache_write_1h: 1.6,
-    cache_read: 0.08,
-};
-const HAIKU_3: Pricing = Pricing {
-    input: 0.25,
-    output: 1.25,
-    cache_write: 0.30,
-    cache_write_1h: 0.5,
-    cache_read: 0.03,
-};
-
-// ── Claude Code-specific project name prettifier ──
 
 // Logs live in `~/.claude/projects/-Users-<username>-<rest>/`. The dir
 // name is dash-encoded and lossy when the real path contains hyphens
