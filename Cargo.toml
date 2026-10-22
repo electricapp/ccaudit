@@ -44,7 +44,11 @@ serde = { version = "1", features = ["derive"] }
 # only deserialized for the line types we act on.
 serde_json = { version = "1", features = ["raw_value"] }
 postcard = { version = "1", features = ["alloc"], default-features = false }
-chrono = { version = "0.4", features = ["serde"] }
+# No `clock`: on macOS it links CoreFoundation (via iana-time-zone), and
+# dyld loading that costs ~0.7 ms per launch — a tenth of a warm
+# `statusline`. The one local-offset lookup goes through libc instead
+# (`cli::local_offset_now`); non-Unix builds keep `clock` below.
+chrono = { version = "0.4", default-features = false, features = ["std", "now", "serde"] }
 dirs = "7"
 memmap2 = "0.9"
 memchr = "2"
@@ -62,6 +66,14 @@ crossterm = { version = "0.29", optional = true }
 nucleo-matcher = { version = "0.3", optional = true }
 # --- Optional (--features simd-json) ---
 simd-json = { version = "0.18", optional = true, default-features = false, features = ["serde_impl"] }
+
+[target.'cfg(unix)'.dependencies]
+# `localtime_r` for the system UTC offset. Already in the graph (dirs,
+# memmap2), so no new crate.
+libc = "0.2"
+
+[target.'cfg(not(unix))'.dependencies]
+chrono = { version = "0.4", features = ["clock"] }
 
 [build-dependencies]
 # Only for formatting the UTC build timestamp in build.rs; chrono is

@@ -866,6 +866,29 @@ fn parse_date(s: &str) -> Result<i32, String> {
     Ok(d.signed_duration_since(epoch).num_days() as i32)
 }
 
+/// The system's offset from UTC right now, in seconds east — what
+/// `chrono::Local` reports, read from libc so the binary needn't link
+/// chrono's `clock` feature (see Cargo.toml). `0` if libc can't say.
+#[cfg(unix)]
+fn local_offset_now() -> i32 {
+    // SAFETY: `time(NULL)` only returns a value; `localtime_r` writes
+    // into the `tm` we own and initializes the zone itself.
+    #[allow(unsafe_code)]
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&raw const now, &raw mut tm).is_null() {
+            return 0;
+        }
+        i32::try_from(tm.tm_gmtoff).unwrap_or(0)
+    }
+}
+
+#[cfg(not(unix))]
+fn local_offset_now() -> i32 {
+    chrono::Local::now().offset().local_minus_utc()
+}
+
 // Returns (offset_secs_from_utc, display_label).
 //
 // Supported forms: "UTC", "Local", "+HH:MM", "-HH:MM", "+HHMM", "-HHMM".
@@ -877,9 +900,7 @@ fn parse_timezone(s: &str) -> Result<(i32, String), String> {
         return Ok((0, "UTC".to_string()));
     }
     if t.eq_ignore_ascii_case("local") {
-        // Use system local offset at "now". Chrono returns this cheaply.
-        let now = chrono::Local::now();
-        let off = now.offset().local_minus_utc();
+        let off = local_offset_now();
         // No inner parens: report titles wrap the label in parens already,
         // so "Local +02:00" reads as "(Local +02:00)" not "(Local (+02:00))".
         return Ok((off, format!("Local {}", format_offset(off))));
