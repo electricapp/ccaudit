@@ -894,11 +894,25 @@ mod tests {
                 .map(|s| (s.path.clone(), s.path_hash, s.mtime, s.size))
                 .collect()
         };
-        let mut std_walk = Vec::new();
-        super::scan_dir_recursive(r, super::MAX_SCAN_DEPTH, &mut std_walk);
-        let fd_walk = super::default_scan(r);
-        assert_eq!(key(&fd_walk), key(&std_walk));
-        let found = |suffix: &str| fd_walk.iter().any(|s| s.path.ends_with(suffix));
+        let std_walk = || {
+            let mut v = Vec::new();
+            super::scan_dir_recursive(r, super::MAX_SCAN_DEPTH, &mut v);
+            key(&v)
+        };
+        let snap_dir = tempfile::tempdir().expect("tempdir");
+        let snap = snap_dir.path().join("scan.bin");
+        // (listed anything?, result)
+        let fd_walk = || {
+            let mut v = Vec::new();
+            let listed =
+                super::scan_unix::scan_with_snapshot(r, super::MAX_SCAN_DEPTH, &mut v, Some(&snap));
+            (listed, v)
+        };
+
+        let (listed, first) = fd_walk();
+        assert!(listed);
+        assert_eq!(key(&first), std_walk(), "first walk, no snapshot");
+        let found = |suffix: &str| first.iter().any(|s| s.path.ends_with(suffix));
         assert!(
             found("subagents/agent-1.jsonl"),
             "nested sessions are found"
@@ -906,12 +920,83 @@ mod tests {
         assert!(found("f/deepest.jsonl"), "the 8th level is listed");
         assert!(!found("too-deep.jsonl"), "the 9th level is not");
         assert!(
-            !fd_walk
+            !first
                 .iter()
                 .any(|s| s.path.starts_with(r.join("proj-c")) || s.path.ends_with("link.jsonl")),
             "symlinks aren't followed"
         );
-        assert_eq!(fd_walk.len(), 5);
+        assert_eq!(first.len(), 5);
+
+        // A coarse-timestamp filesystem can add an entry in the same tick
+        // as the listing, leaving the mtime as recorded. Simulated by
+        // restoring the mtime; a just-listed directory isn't trusted, so
+        // the file is still found.
+        let proj_a = r.join("proj-a");
+        let recorded = fs::metadata(&proj_a)
+            .and_then(|m| m.modified())
+            .expect("mtime");
+        touch("proj-a/same-tick.jsonl", "{}\n");
+        fs::File::open(&proj_a)
+            .and_then(|f| f.set_modified(recorded))
+            .expect("restore mtime");
+        let (_, same_tick) = fd_walk();
+        assert_eq!(
+            key(&same_tick),
+            std_walk(),
+            "entry added within the mtime tick"
+        );
+        fs::remove_file(r.join("proj-a/same-tick.jsonl")).expect("rm");
+
+        // Freshly written directories are too recent to trust; age them
+        // all so the snapshot's listings get reused.
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_hours(1);
+        let age_dirs = || {
+            for e in walk_dirs(r) {
+                fs::File::open(&e)
+                    .and_then(|f| f.set_modified(hour_ago))
+                    .expect("age dir");
+            }
+        };
+        age_dirs();
+        let (listed, _) = fd_walk();
+        assert!(listed, "aged mtimes differ from the recorded ones");
+        let (listed, replayed) = fd_walk();
+        assert!(!listed, "nothing changed: every listing is reused");
+        assert_eq!(key(&replayed), std_walk(), "replayed walk");
+
+        // An append changes the file, not its directory.
+        fs::write(r.join("proj-a/s2.jsonl"), "{}\n{}\n{}\n").expect("append");
+        let (listed, after_append) = fd_walk();
+        assert!(!listed);
+        assert_eq!(
+            key(&after_append),
+            std_walk(),
+            "append seen through a reused listing"
+        );
+
+        // A new or removed file changes its directory's mtime.
+        touch("proj-a/u1/subagents/agent-2.jsonl", "{}\n");
+        fs::remove_file(r.join("proj-b/a/b/c/d/e/f/deepest.jsonl")).expect("rm");
+        let (listed, after_change) = fd_walk();
+        assert!(listed);
+        assert_eq!(key(&after_change), std_walk(), "added + removed files");
+        assert_eq!(after_change.len(), 5);
+    }
+
+    /// Every directory under `root` (not following symlinks), root included.
+    #[cfg(unix)]
+    fn walk_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = vec![root.to_path_buf()];
+        let mut i = 0;
+        while let Some(d) = out.get(i).cloned() {
+            for e in std::fs::read_dir(&d).expect("read_dir").flatten() {
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    out.push(e.path());
+                }
+            }
+            i += 1;
+        }
+        out
     }
 
     /// `fable-5` carries no family token, so any family-name fallback
