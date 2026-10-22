@@ -3,12 +3,14 @@
 // Two paths:
 //   • UTC day/week/month → summed directly from pre-aggregated rows. No
 //     per-line walk, no dedup hashset, zero provider calls.
-//   • Everything else (session, block, non-UTC) → walks per-line data
-//     with cross-session dedup, pricing each row via `source.price_columns`.
+//   • Everything else (session, block, non-UTC) → walks per-line data,
+//     skipping rows the build marked as cross-session duplicates and
+//     pricing each at the rates the cache was built with.
 
 use super::load::LoadedCache;
+use super::schema::LINE_DUPLICATE;
 use crate::source::{Source, day_to_date};
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 /// How an aggregation groups its rows.
 #[derive(Clone, Copy, Debug)]
@@ -188,17 +190,11 @@ pub fn per_session_totals<S: Source + ?Sized>(
     let lines_s = cache.lines();
     let ts_s = cache.ts_unix();
 
-    // Cross-session dedup hashset shared across the whole walk so a
-    // checkpointed message_id appearing in multiple sessions only counts
-    // once (toward the earliest session, since sessions are stored
-    // chronologically at build time).
-    let mut seen: FxHashSet<u64> =
-        FxHashSet::with_capacity_and_hasher(lines_s.len(), FxBuildHasher);
     let mut out: FxHashMap<u64, SessionTotals> =
         FxHashMap::with_capacity_and_hasher(sessions_s.len(), FxBuildHasher);
 
-    // One rate lookup per distinct model, reused for every line.
-    let rates = crate::source::ModelRates::build(source, &cache.models);
+    // The rates the cache was built with, one per model id.
+    let rates = cache.model_rates(source);
 
     for sess in sessions_s {
         let lo = sess.line_start as usize;
@@ -208,7 +204,9 @@ pub fn per_session_totals<S: Source + ?Sized>(
         let mut totals = SessionTotals::default();
 
         for (off, line) in lines_s.get(line_range).unwrap_or(&[]).iter().enumerate() {
-            if (line.flags & 1) != 0 && !seen.insert(line.msg_id_hash) {
+            // A checkpointed message_id appearing in several sessions
+            // counts once, toward the earliest (resolved at build).
+            if line.flags & LINE_DUPLICATE != 0 {
                 continue;
             }
             let mid = if line.model_id == u16::MAX {
@@ -269,10 +267,6 @@ pub fn aggregate<S: Source + ?Sized>(
     let lines_s = cache.lines();
     let ts_s = cache.ts_unix();
 
-    // At most one insert per line, and `with_capacity(n)` reserves enough
-    // for `n` inserts without rehashing — so size at the line count, not 2×.
-    let mut seen: FxHashSet<u64> =
-        FxHashSet::with_capacity_and_hasher(lines_s.len().max(1024), FxBuildHasher);
     // Pre-size to a realistic ceiling rather than the line count — live
     // aggregate folds 50k lines into ~30–500 bucket rows. Starting at 64
     // covers the common case (daily/monthly) without rehashing; larger
@@ -280,19 +274,24 @@ pub fn aggregate<S: Source + ?Sized>(
     let mut out: FxHashMap<BreakdownKey, BucketUsage> =
         FxHashMap::with_capacity_and_hasher(64, FxBuildHasher);
 
-    // One rate lookup per distinct model, reused for every line.
-    let rates = crate::source::ModelRates::build(source, &cache.models);
+    // The rates the cache was built with, one per model id.
+    let rates = cache.model_rates(source);
 
-    // Sessions are stored chronologically at cache-build time so walking
-    // in natural order is the same as sorting by `started_at`. Skipping
-    // the per-call sort saves ~1ms on 100+ session corpora.
+    // Cross-session dedup was resolved at build — each message counts at
+    // its earliest copy regardless of any filter, so a message whose
+    // earliest copy falls outside --since/--until (or in a filtered-out
+    // project) is never recounted on a later in-window duplicate. That
+    // leaves every row's fate independent of the others, so whole
+    // sessions outside the project or before --since are skipped.
     for sess in sessions_s {
-        // The project filter is applied per-line AFTER the dedup insert
-        // (see below) — skipping whole sessions here would leave their
-        // msg_ids unclaimed, letting a message duplicated into another
-        // project be counted there. Same dedup-before-filter rule the
-        // date filter follows and build-time preagg dedup uses.
-        let project_matches = project_filter_id.matches(sess.project_id);
+        if !project_filter_id.matches(sess.project_id) {
+            continue;
+        }
+        if let Some(since) = opts.since_day {
+            if latest_effective_day(sess.max_day, opts.tz_offset_secs) < since {
+                continue;
+            }
+        }
         let line_range =
             sess.line_start as usize..(sess.line_start as usize + sess.line_count as usize);
         let fallback_model_id = sess.session_model_id;
@@ -303,17 +302,7 @@ pub fn aggregate<S: Source + ?Sized>(
             .iter()
             .enumerate()
         {
-            // Cross-session dedup FIRST, before any filter — claim
-            // each message at its earliest occurrence regardless of the
-            // window. This matches the build-time preagg dedup (which runs
-            // before any filtering); filtering first would let a message
-            // whose earliest copy falls outside --since/--until (or in a
-            // filtered-out project) reappear and be counted on a later
-            // in-window duplicate.
-            if (line.flags & 1) != 0 && !seen.insert(line.msg_id_hash) {
-                continue;
-            }
-            if !project_matches {
+            if line.flags & LINE_DUPLICATE != 0 {
                 continue;
             }
             let line_global_idx = sess.line_start as usize + local_i;
@@ -388,6 +377,13 @@ pub fn aggregate<S: Source + ?Sized>(
         }
     }
     out
+}
+
+/// Upper bound on the effective (`--timezone`-shifted) day of any row in
+/// a session whose rows all fall on or before UTC day `max_day`.
+fn latest_effective_day(max_day: i32, tz_offset_secs: i32) -> i32 {
+    let last_ts = i64::from(max_day) * 86_400 + 86_399;
+    (last_ts + i64::from(tz_offset_secs)).div_euclid(86_400) as i32
 }
 
 /// Outcome of resolving `--project NAME`.

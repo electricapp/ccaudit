@@ -219,6 +219,10 @@ pub fn model_resolutions() -> Vec<(String, Resolution)> {
         .unwrap_or_default()
 }
 
+fn resolution_of(name: &str) -> Option<Resolution> {
+    MODEL_RESOLUTIONS.get()?.lock().ok()?.get(name).copied()
+}
+
 pub(crate) fn has_unpriced_models() -> bool {
     !model_resolutions().is_empty()
 }
@@ -408,7 +412,18 @@ pub trait Source: Sync + Send {
 pub struct ModelRates {
     pricing: Vec<Pricing>,
     skip: Vec<bool>,
+    /// No table priced the model (it bills at zero).
+    unpriced: Vec<bool>,
     unknown: Pricing,
+}
+
+/// One model's resolved rate, as [`ModelRates::resolved`] hands it out
+/// for storage and [`ModelRates::from_resolved`] takes it back.
+#[derive(Clone, Copy)]
+pub struct ResolvedRate {
+    pub pricing: Pricing,
+    pub skip: bool,
+    pub unpriced: bool,
 }
 
 impl ModelRates {
@@ -429,11 +444,51 @@ impl ModelRates {
                 }
             })
             .collect();
+        // A provider notes each model it couldn't price while pricing it.
+        let unpriced = models
+            .iter()
+            .zip(&skip)
+            .map(|(m, skipped)| !skipped && resolution_of(m) == Some(Resolution::Unknown))
+            .collect();
         Self {
             pricing,
             skip,
+            unpriced,
             unknown: *source.price(None),
         }
+    }
+
+    /// Rates resolved earlier for `models` (same order), plus the
+    /// no-model rate. Notes each unpriced model, as resolving it afresh
+    /// would, so the report's unpriced-models note is unchanged.
+    pub fn from_resolved(models: &[String], rates: &[ResolvedRate], unknown: Pricing) -> Self {
+        for (m, r) in models.iter().zip(rates) {
+            if r.unpriced {
+                note_model_resolution(m, Resolution::Unknown);
+            }
+        }
+        Self {
+            pricing: rates.iter().map(|r| r.pricing).collect(),
+            skip: rates.iter().map(|r| r.skip).collect(),
+            unpriced: rates.iter().map(|r| r.unpriced).collect(),
+            unknown,
+        }
+    }
+
+    /// Each model id's rate, in id order, and the no-model rate.
+    pub fn resolved(&self) -> (Vec<ResolvedRate>, Pricing) {
+        let rates = self
+            .pricing
+            .iter()
+            .zip(&self.skip)
+            .zip(&self.unpriced)
+            .map(|((p, s), u)| ResolvedRate {
+                pricing: *p,
+                skip: *s,
+                unpriced: *u,
+            })
+            .collect();
+        (rates, self.unknown)
     }
 
     /// `mid == u16::MAX` means "no model" — never skipped (matches the

@@ -3,9 +3,10 @@
 // Runs only on cold-rebuild. The hot path doesn't touch this file.
 
 use super::schema::{
-    Header, LineEntry, MAGIC, PreAgg, RESUMABLE, SessionEntry, SessionExt, VERSION,
+    Header, LINE_DUPLICATE, LINE_HAS_ID, LineEntry, MAGIC, ModelRate, PreAgg, RATE_SKIP,
+    RATE_UNKNOWN, RESUMABLE, SessionEntry, SessionExt, VERSION,
 };
-use crate::source::{ParsedSession, Source};
+use crate::source::{ModelRates, ParsedSession, Pricing, ResolvedRate, Source};
 use rustc_hash::FxHashMap;
 use std::fs;
 use std::io::Write;
@@ -20,6 +21,62 @@ pub struct BuiltCache {
     pub strings: Vec<u8>,
     pub ts_unix: Vec<i64>,
     pub preaggs: Vec<PreAgg>,
+    /// One per model id, then the no-model rate.
+    pub rates: Vec<ModelRate>,
+}
+
+/// `rates` in the on-disk form: one record per model id, then the
+/// no-model rate.
+pub fn rates_to_stored(rates: &ModelRates) -> Vec<ModelRate> {
+    let (per_model, unknown) = rates.resolved();
+    let record = |p: Pricing, flags: u32| ModelRate {
+        input: p.input,
+        output: p.output,
+        cache_write: p.cache_write,
+        cache_write_1h: p.cache_write_1h,
+        cache_read: p.cache_read,
+        flags,
+        _pad: 0,
+    };
+    per_model
+        .iter()
+        .map(|r| {
+            let mut flags = 0;
+            if r.skip {
+                flags |= RATE_SKIP;
+            }
+            if r.unpriced {
+                flags |= RATE_UNKNOWN;
+            }
+            record(r.pricing, flags)
+        })
+        .chain(std::iter::once(record(unknown, 0)))
+        .collect()
+}
+
+/// Inverse of [`rates_to_stored`]. `None` unless there is exactly one
+/// record per model plus the no-model one.
+pub fn rates_from_stored(models: &[String], stored: &[ModelRate]) -> Option<ModelRates> {
+    let (last, per_model) = stored.split_last()?;
+    if per_model.len() != models.len() {
+        return None;
+    }
+    let pricing = |r: &ModelRate| Pricing {
+        input: r.input,
+        output: r.output,
+        cache_write: r.cache_write,
+        cache_write_1h: r.cache_write_1h,
+        cache_read: r.cache_read,
+    };
+    let resolved: Vec<ResolvedRate> = per_model
+        .iter()
+        .map(|r| ResolvedRate {
+            pricing: pricing(r),
+            skip: r.flags & RATE_SKIP != 0,
+            unpriced: r.flags & RATE_UNKNOWN != 0,
+        })
+        .collect();
+    Some(ModelRates::from_resolved(models, &resolved, pricing(last)))
 }
 
 pub fn build<S: Source + ?Sized>(mut parsed: Vec<ParsedSession>, source: &S) -> BuiltCache {
@@ -73,10 +130,19 @@ pub fn build<S: Source + ?Sized>(mut parsed: Vec<ParsedSession>, source: &S) -> 
 
     for p in &parsed {
         let line_start = lines.len() as u32;
+        // Bounds both the UTC `day` and the day derived from `ts_unix`,
+        // which is what a `--timezone` walk buckets by.
+        let max_day = p
+            .lines
+            .iter()
+            .zip(&p.ts_unix)
+            .map(|(l, &ts)| l.day.max(ts.div_euclid(86_400) as i32))
+            .max()
+            .unwrap_or(i32::MIN);
         for l in &p.lines {
             let model_id = l.model.as_deref().map_or(u16::MAX, &mut intern_model);
             let (msg_id_hash, flags) = match l.msg_id_hash {
-                Some(h) => (h, 1u16),
+                Some(h) => (h, LINE_HAS_ID),
                 None => (0, 0u16),
             };
             lines.push(LineEntry {
@@ -128,7 +194,7 @@ pub fn build<S: Source + ?Sized>(mut parsed: Vec<ParsedSession>, source: &S) -> 
             line_count: (lines.len() as u32) - line_start,
             session_model_id,
             project_id,
-            _pad: 0,
+            max_day,
         });
         let (resume_flags, resume_offset, resume_tail_hash) = match p.resume {
             Some(r) => (r.flags | RESUMABLE, r.offset, r.tail_hash),
@@ -145,10 +211,28 @@ pub fn build<S: Source + ?Sized>(mut parsed: Vec<ParsedSession>, source: &S) -> 
         });
     }
 
-    // Build the pre-aggregated summary. Cross-session dedup is the same
-    // logic as live aggregate() — we do it once here during build so the
-    // hot path just sums pre-reduced rows.
-    let preaggs = build_preaggs(&sessions, &lines, &model_table, source);
+    // Cross-session dedup: a message checkpointed into several sessions
+    // counts once, at its earliest copy. `lines` is laid out session by
+    // session in chronological order — the order every aggregation walks
+    // — so one pass in index order claims the same copy they would.
+    // At most one insert per line, and `with_capacity(n)` reserves enough
+    // for `n` inserts without rehashing — so size at the line count, not 2×.
+    let mut seen: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::with_capacity_and_hasher(
+        lines.len().max(1024),
+        rustc_hash::FxBuildHasher,
+    );
+    for l in &mut lines {
+        if l.flags & LINE_HAS_ID != 0 && !seen.insert(l.msg_id_hash) {
+            l.flags |= LINE_DUPLICATE;
+        }
+    }
+
+    // Resolve each model's rate + skip flag once (one LiteLLM lookup per
+    // distinct model) rather than rebuilding candidate lists per line.
+    let rates = ModelRates::build(source, &model_table);
+    // Build the pre-aggregated summary — the same dedup and pricing as
+    // live aggregate(), done once here so the hot path just sums rows.
+    let preaggs = build_preaggs(&sessions, &lines, &rates);
 
     BuiltCache {
         sessions,
@@ -159,32 +243,17 @@ pub fn build<S: Source + ?Sized>(mut parsed: Vec<ParsedSession>, source: &S) -> 
         strings,
         ts_unix,
         preaggs,
+        rates: rates_to_stored(&rates),
     }
 }
 
-fn build_preaggs<S: Source + ?Sized>(
+fn build_preaggs(
     sessions: &[SessionEntry],
     lines: &[LineEntry],
-    models: &[String],
-    source: &S,
+    rates: &ModelRates,
 ) -> Vec<PreAgg> {
-    // Sessions are already stored in chronological order (see `build`),
-    // so walking them in natural order is enough — no sort needed. The
-    // cross-session dedup below still picks the earliest occurrence of
-    // each `msg_id` because we visit sessions oldest-first.
-    // At most one insert per line, and `with_capacity(n)` reserves enough
-    // for `n` inserts without rehashing — so size at the line count, not 2×.
-    let mut seen: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::with_capacity_and_hasher(
-        lines.len().max(1024),
-        rustc_hash::FxBuildHasher,
-    );
-
     // Key = (day, model_id, project_id) packed into u64 for FxHashMap.
     let mut bucket: FxHashMap<u64, PreAgg> = FxHashMap::default();
-
-    // Resolve each model's rate + skip flag once (one LiteLLM lookup per
-    // distinct model) rather than rebuilding candidate lists per line.
-    let rates = crate::source::ModelRates::build(source, models);
 
     for sess in sessions {
         let line_range =
@@ -193,8 +262,7 @@ fn build_preaggs<S: Source + ?Sized>(
         let project_id = sess.project_id;
 
         for line in lines.get(line_range).unwrap_or(&[]) {
-            // Cross-session dedup (canonical, UTC-day based).
-            if (line.flags & 1) != 0 && !seen.insert(line.msg_id_hash) {
+            if line.flags & LINE_DUPLICATE != 0 {
                 continue;
             }
             let mid = if line.model_id != u16::MAX {
@@ -289,6 +357,7 @@ fn write_cache_to(b: &BuiltCache, tmp: &Path) -> std::io::Result<()> {
     f.write_all(bytemuck::cast_slice(&b.lines))?;
     f.write_all(bytemuck::cast_slice(&b.ts_unix))?;
     f.write_all(bytemuck::cast_slice(&b.preaggs))?;
+    f.write_all(bytemuck::cast_slice(&b.rates))?;
     write_string_vec(&mut f, &b.models)?;
     write_string_vec(&mut f, &b.projects)?;
     let slen: u32 = b.strings.len() as u32;

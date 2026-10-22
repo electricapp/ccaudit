@@ -6,10 +6,10 @@
 
 use super::build::{self, BuiltCache};
 use super::schema::{
-    HDR_SZ, Header, LINE_SZ, LineEntry, MAGIC, PREAGG_SZ, PreAgg, SESS_EXT_SZ, SESS_SZ,
-    SessionEntry, SessionExt, VERSION,
+    HDR_SZ, Header, LINE_HAS_ID, LINE_SZ, LineEntry, MAGIC, ModelRate, PREAGG_SZ, PreAgg, RATE_SZ,
+    SESS_EXT_SZ, SESS_SZ, SessionEntry, SessionExt, VERSION,
 };
-use crate::source::{ParsedLine, ParsedSession, Source, SourceFile};
+use crate::source::{ModelRates, ParsedLine, ParsedSession, Source, SourceFile};
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -26,6 +26,7 @@ pub enum CacheStorage {
         lines: (usize, usize),
         ts: (usize, usize),
         preaggs: (usize, usize),
+        rates: (usize, usize),
         strings: (usize, usize), // raw strings pool, sliced lazily
     },
     // Cold rebuild or `empty()`: owned Vecs.
@@ -35,6 +36,7 @@ pub enum CacheStorage {
         lines: Vec<LineEntry>,
         ts_unix: Vec<i64>,
         preaggs: Vec<PreAgg>,
+        rates: Vec<ModelRate>,
         strings: Vec<u8>,
     },
 }
@@ -82,6 +84,21 @@ impl LoadedCache {
             }
             CacheStorage::Owned { preaggs, .. } => preaggs,
         }
+    }
+    fn stored_rates(&self) -> &[ModelRate] {
+        match &self.storage {
+            CacheStorage::Mmap { mmap, rates, .. } => bytemuck::cast_slice(&mmap[rates.0..rates.1]),
+            CacheStorage::Owned { rates, .. } => rates,
+        }
+    }
+
+    /// Per-model rates for pricing this cache's rows: the ones it was
+    /// built with, so no price table (or `prices.json`) is consulted.
+    /// Falls back to resolving through `source` for a cache that carries
+    /// none (the cross-source union's name-only cache).
+    pub fn model_rates<S: Source + ?Sized>(&self, source: &S) -> ModelRates {
+        build::rates_from_stored(&self.models, self.stored_rates())
+            .unwrap_or_else(|| ModelRates::build(source, &self.models))
     }
     fn strings(&self) -> &[u8] {
         match &self.storage {
@@ -235,6 +252,7 @@ const fn empty() -> LoadedCache {
             lines: Vec::new(),
             ts_unix: Vec::new(),
             preaggs: Vec::new(),
+            rates: Vec::new(),
             strings: Vec::new(),
         },
         models: Vec::new(),
@@ -250,6 +268,7 @@ struct CacheLayout {
     lines_range: (usize, usize),
     ts_range: (usize, usize),
     preagg_range: (usize, usize),
+    rates_range: (usize, usize),
     strings_range: (usize, usize),
     models: Vec<String>,
     projects: Vec<String>,
@@ -270,17 +289,22 @@ fn parse_cache_layout(bytes: &[u8]) -> Option<CacheLayout> {
     let n_sess = header.num_sessions as usize;
     let n_lines = header.num_lines as usize;
     let n_preaggs = header.num_preaggs as usize;
+    let n_models = header.num_models as usize;
 
     let sess_end = HDR_SZ + n_sess * SESS_SZ;
     let sess_ext_end = sess_end + n_sess * SESS_EXT_SZ;
     let lines_end = sess_ext_end + n_lines * LINE_SZ;
     let ts_end = lines_end + n_lines * 8;
     let preagg_end = ts_end + n_preaggs * PREAGG_SZ;
-    if bytes.len() < preagg_end {
+    let rates_end = preagg_end + (n_models + 1) * RATE_SZ;
+    if bytes.len() < rates_end {
         return None;
     }
 
-    let (models, after_models) = read_string_vec(bytes, preagg_end)?;
+    let (models, after_models) = read_string_vec(bytes, rates_end)?;
+    if models.len() != n_models {
+        return None;
+    }
     let (projects, after_projects) = read_string_vec(bytes, after_models)?;
     if after_projects + 4 > bytes.len() {
         return None;
@@ -305,6 +329,7 @@ fn parse_cache_layout(bytes: &[u8]) -> Option<CacheLayout> {
         lines_range: (sess_ext_end, lines_end),
         ts_range: (lines_end, ts_end),
         preagg_range: (ts_end, preagg_end),
+        rates_range: (preagg_end, rates_end),
         strings_range: (strings_start, strings_end),
         models,
         projects,
@@ -321,39 +346,8 @@ fn cache_from_mmap(mmap: memmap2::Mmap) -> Option<LoadedCache> {
             lines: p.lines_range,
             ts: p.ts_range,
             preaggs: p.preagg_range,
+            rates: p.rates_range,
             strings: p.strings_range,
-        },
-        models: p.models,
-        projects: p.projects,
-    })
-}
-
-fn cache_from_mmap_owned(mmap: &memmap2::Mmap) -> Option<LoadedCache> {
-    // Owned variant for the cold-rebuild path: copy out the slices and
-    // drop the mmap so we don't keep it alive longer than needed.
-    let bytes = &mmap[..];
-    let p = parse_cache_layout(bytes)?;
-    Some(LoadedCache {
-        storage: CacheStorage::Owned {
-            sessions: bytemuck::cast_slice::<u8, SessionEntry>(
-                bytes.get(p.sess_range.0..p.sess_range.1)?,
-            )
-            .to_vec(),
-            sessions_ext: bytemuck::cast_slice::<u8, SessionExt>(
-                bytes.get(p.sess_ext_range.0..p.sess_ext_range.1)?,
-            )
-            .to_vec(),
-            lines: bytemuck::cast_slice::<u8, LineEntry>(
-                bytes.get(p.lines_range.0..p.lines_range.1)?,
-            )
-            .to_vec(),
-            ts_unix: bytemuck::cast_slice::<u8, i64>(bytes.get(p.ts_range.0..p.ts_range.1)?)
-                .to_vec(),
-            preaggs: bytemuck::cast_slice::<u8, PreAgg>(
-                bytes.get(p.preagg_range.0..p.preagg_range.1)?,
-            )
-            .to_vec(),
-            strings: bytes.get(p.strings_range.0..p.strings_range.1)?.to_vec(),
         },
         models: p.models,
         projects: p.projects,
@@ -368,8 +362,10 @@ fn cache_from_mmap_owned(mmap: &memmap2::Mmap) -> Option<LoadedCache> {
 // reparse only the ones that actually differ — and of those, only the
 // appended bytes when the old entry carries a resume point.
 fn cold_rebuild<S: Source + ?Sized>(source: &S, sources: Vec<SourceFile>) -> LoadedCache {
-    let existing: Option<LoadedCache> =
-        try_load_mmap(source).and_then(|m| cache_from_mmap_owned(&m));
+    // Read in place: only the reused rows are copied (into the parsed
+    // sessions `build` takes), and the map is dropped before
+    // `finalize` renames the new `.db` over it.
+    let existing: Option<LoadedCache> = try_load_mmap(source).and_then(cache_from_mmap);
 
     let old_by_hash: FxHashMap<u64, usize> = existing
         .as_ref()
@@ -445,6 +441,7 @@ fn finalize<S: Source + ?Sized>(parsed: Vec<ParsedSession>, source: &S) -> Loade
             lines: built.lines,
             ts_unix: built.ts_unix,
             preaggs: built.preaggs,
+            rates: built.rates,
             strings: built.strings,
         },
         models: built.models,
@@ -472,7 +469,7 @@ fn reconstruct_from_cache(
         } else {
             cache.models.get(l.model_id as usize).cloned()
         };
-        let msg_id_hash = if (l.flags & 1) != 0 {
+        let msg_id_hash = if l.flags & LINE_HAS_ID != 0 {
             Some(l.msg_id_hash)
         } else {
             None

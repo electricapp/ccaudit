@@ -1731,6 +1731,98 @@ fn help_names_every_registered_source() {
     }
 }
 
+// ── Cross-session dedup vs filters ──
+
+/// A message resumed into a later session counts once, at its earliest
+/// copy — even when a `--since` window or `--project` filter excludes
+/// that copy and admits the later one. Covers the per-line walk
+/// (`--timezone` other than UTC, `session`) and the pre-aggregated path.
+#[test]
+fn duplicate_outside_the_filter_is_not_recounted() {
+    let h = Harness::new();
+    let _ = h.write_jsonl(
+        "-Users-test-code-alpha",
+        "sess_first",
+        &[
+            &user_line_with_cwd(
+                "start",
+                "2026-04-01T10:00:00.000Z",
+                "/Users/test/code/alpha",
+            ),
+            &usage_line(
+                "msg_X",
+                "claude-opus-4-7",
+                "2026-04-01T10:00:01.000Z",
+                1000,
+                100,
+            ),
+        ],
+    );
+    let _ = h.write_jsonl(
+        "-Users-test-code-beta",
+        "sess_resumed",
+        &[
+            &user_line_with_cwd(
+                "resume",
+                "2026-04-05T09:00:00.000Z",
+                "/Users/test/code/beta",
+            ),
+            // The carried-over copy, stamped inside the window below.
+            &usage_line(
+                "msg_X",
+                "claude-opus-4-7",
+                "2026-04-05T09:00:01.000Z",
+                1000,
+                100,
+            ),
+            &usage_line("msg_Y", "claude-opus-4-7", "2026-04-05T09:00:02.000Z", 7, 3),
+        ],
+    );
+    let input = |args: &[&str]| -> u64 {
+        let out = h.run(args);
+        require_success(&out, &args.join(" "));
+        let v: Value = serde_json::from_str(&read_stdout(&out)).unwrap();
+        v["totals"]["input"].as_u64().unwrap()
+    };
+    for tz in ["UTC", "+02:00"] {
+        assert_eq!(
+            input(&[
+                "daily",
+                "--json",
+                "--offline",
+                "--since",
+                "20260403",
+                "--timezone",
+                tz
+            ]),
+            7,
+            "--since must not admit msg_X's later copy (tz {tz})"
+        );
+        assert_eq!(
+            input(&[
+                "daily",
+                "--json",
+                "--offline",
+                "--project",
+                "code/beta",
+                "--timezone",
+                tz
+            ]),
+            7,
+            "--project must not admit msg_X's copy in beta (tz {tz})"
+        );
+    }
+    assert_eq!(
+        input(&["session", "--json", "--offline", "--project", "code/beta"]),
+        7
+    );
+    assert_eq!(
+        input(&["daily", "--json", "--offline"]),
+        1007,
+        "unfiltered: msg_X once"
+    );
+}
+
 // ── Incremental append ──
 //
 // A session whose log only grew is extended by parsing the appended bytes

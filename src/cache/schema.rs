@@ -18,9 +18,11 @@
 //   Header                   (32 B)
 //   Sessions (hot)           (num_sessions × 48 B, sorted by path_hash)
 //   SessionsExt (cold)       (num_sessions × 32 B, parallel to Sessions)
-//   Lines                    (num_lines × 32 B)
+//   Lines                    (num_lines × 40 B)
 //   ts_unix                  (num_lines × 8 B — parallel to Lines)
 //   PreAggs                  (num_preaggs × 64 B, already deduped)
+//   ModelRates               ((num_models + 1) × 48 B — per model id, then
+//                             the no-model rate)
 //   Models pool              (u32 count + for each: u16 len + utf8)
 //   Projects pool            (u32 count + for each: u16 len + utf8)
 //   Strings pool             (u32 total_len + bytes — display names + session ids)
@@ -42,7 +44,7 @@ pub const MAGIC: u32 = 0x4343_5547; // "CCUG"
 // into them, or to pricing rules that are baked into PreAgg costs; a
 // mismatch forces one full rebuild, which is what keeps a stale `.db`
 // from being reinterpreted under a new layout or an old rate.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -72,7 +74,9 @@ pub struct SessionEntry {
     pub line_count: u32,
     pub session_model_id: u16, // u16::MAX if unknown
     pub project_id: u16,       // u16::MAX if the provider has no project concept
-    pub(crate) _pad: u32,
+    /// Latest UTC day of any of this session's lines (`i32::MIN` when it
+    /// has none). Lets a `--since`-bounded walk skip whole sessions.
+    pub max_day: i32,
 }
 
 // Cold half — only touched when rendering the `session` report or
@@ -109,13 +113,21 @@ impl SessionExt {
     }
 }
 
+/// `LineEntry::flags`: the row carries a message id.
+pub const LINE_HAS_ID: u16 = 1 << 0;
+/// `LineEntry::flags`: an earlier row — sessions in stored (chronological)
+/// order, rows in order — has the same message id. Cross-session dedup
+/// resolved once at build, so aggregations skip the row instead of
+/// re-deriving it through a hash set of every id.
+pub const LINE_DUPLICATE: u16 = 1 << 1;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct LineEntry {
-    pub msg_id_hash: u64, // 0 if no message_id (flags bit 0 still set)
+    pub msg_id_hash: u64, // 0 if no message_id
     pub day: i32,         // days since 1970-01-01 UTC
     pub model_id: u16,    // u16::MAX if unknown
-    pub flags: u16,       // bit 0: has_msg_id
+    pub flags: u16,       // LINE_HAS_ID | LINE_DUPLICATE
     pub input: u32,
     pub output: u32,
     pub cache_read: u32,
@@ -160,6 +172,33 @@ pub struct PreAgg {
     pub cache_create_1h: u32,
 }
 
+/// One model's rate as resolved when the cache was built, indexed by
+/// `model_id` (the extra last record is the rate for rows with no model).
+///
+/// Renders price per-line rows from these rather than re-resolving each
+/// model, which would parse `prices.json` (~3 MB) on every run. They're
+/// the same rates the `PreAgg` costs were frozen with: anything that
+/// changes a rate (`prices.json`, config overrides, the built-in table)
+/// already forces a rebuild or a different cache file.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct ModelRate {
+    pub input: f64,
+    pub output: f64,
+    pub cache_write: f64,
+    pub cache_write_1h: f64,
+    pub cache_read: f64,
+    /// `RATE_SKIP` | `RATE_UNKNOWN`.
+    pub flags: u32,
+    pub(crate) _pad: u32,
+}
+
+/// `ModelRate::flags`: the provider drops this model's rows entirely.
+pub const RATE_SKIP: u32 = 1 << 0;
+/// `ModelRate::flags`: no table priced the model; it bills at zero and
+/// is named in the report's unpriced-models note.
+pub const RATE_UNKNOWN: u32 = 1 << 1;
+
 impl LineEntry {
     /// Token counts for pricing this row. Every aggregation loop prices
     /// through this, so a new token column can't be added to the row and
@@ -187,6 +226,7 @@ pub const SESS_SZ: usize = size_of::<SessionEntry>();
 pub const SESS_EXT_SZ: usize = size_of::<SessionExt>();
 pub const LINE_SZ: usize = size_of::<LineEntry>();
 pub const PREAGG_SZ: usize = size_of::<PreAgg>();
+pub const RATE_SZ: usize = size_of::<ModelRate>();
 
 const _: () = {
     // If struct sizes drift the on-disk format is broken and VERSION
@@ -196,4 +236,5 @@ const _: () = {
     assert!(SESS_EXT_SZ == 32);
     assert!(LINE_SZ == 40);
     assert!(PREAGG_SZ == 64);
+    assert!(RATE_SZ == 48);
 };
