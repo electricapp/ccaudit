@@ -426,36 +426,46 @@ pub struct ResolvedRate {
     pub unpriced: bool,
 }
 
+fn resolve<S: Source + ?Sized>(source: &S, model: &str) -> ResolvedRate {
+    // Skipped models are never priced. `<synthetic>` isn't a real model
+    // and has no rate anywhere, so pricing it would report it as unpriced
+    // on every run — a warning about a line the report deliberately drops.
+    if source.skip_model(model) {
+        return ResolvedRate {
+            pricing: UNKNOWN_PRICING,
+            skip: true,
+            unpriced: false,
+        };
+    }
+    let pricing = *source.price(Some(model));
+    ResolvedRate {
+        pricing,
+        skip: false,
+        // A provider notes each model it couldn't price while pricing it.
+        unpriced: resolution_of(model) == Some(Resolution::Unknown),
+    }
+}
+
 impl ModelRates {
     pub fn build<S: Source + ?Sized>(source: &S, models: &[String]) -> Self {
-        let skip: Vec<bool> = models.iter().map(|m| source.skip_model(m)).collect();
-        // Skipped models are never priced. `<synthetic>` isn't a real
-        // model and has no rate anywhere, so pricing it would report it
-        // as unpriced on every run — a warning about a line the report
-        // deliberately drops.
-        let pricing = models
+        Self::build_with_prior(source, models, &rustc_hash::FxHashMap::default())
+    }
+
+    /// [`ModelRates::build`], taking a model's rate from `prior` (rates
+    /// resolved earlier under the same price tables) instead of resolving
+    /// it again. Resolving any model the bundled table lacks loads
+    /// `prices.json`, so a rebuild that only appended rows to known
+    /// models then never parses it.
+    pub fn build_with_prior<S: Source + ?Sized>(
+        source: &S,
+        models: &[String],
+        prior: &rustc_hash::FxHashMap<String, ResolvedRate>,
+    ) -> Self {
+        let rates: Vec<ResolvedRate> = models
             .iter()
-            .zip(&skip)
-            .map(|(m, skipped)| {
-                if *skipped {
-                    UNKNOWN_PRICING
-                } else {
-                    *source.price(Some(m))
-                }
-            })
+            .map(|m| prior.get(m).copied().unwrap_or_else(|| resolve(source, m)))
             .collect();
-        // A provider notes each model it couldn't price while pricing it.
-        let unpriced = models
-            .iter()
-            .zip(&skip)
-            .map(|(m, skipped)| !skipped && resolution_of(m) == Some(Resolution::Unknown))
-            .collect();
-        Self {
-            pricing,
-            skip,
-            unpriced,
-            unknown: *source.price(None),
-        }
+        Self::from_resolved(models, &rates, *source.price(None))
     }
 
     /// Rates resolved earlier for `models` (same order), plus the

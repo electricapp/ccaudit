@@ -57,6 +57,16 @@ pub fn rates_to_stored(rates: &ModelRates) -> Vec<ModelRate> {
 /// Inverse of [`rates_to_stored`]. `None` unless there is exactly one
 /// record per model plus the no-model one.
 pub fn rates_from_stored(models: &[String], stored: &[ModelRate]) -> Option<ModelRates> {
+    let (per_model, unknown) = resolved_from_stored(models, stored)?;
+    Some(ModelRates::from_resolved(models, &per_model, unknown))
+}
+
+/// The per-model rates and no-model rate in `stored`, decoded only —
+/// unlike [`rates_from_stored`], nothing is noted as unpriced.
+pub fn resolved_from_stored(
+    models: &[String],
+    stored: &[ModelRate],
+) -> Option<(Vec<ResolvedRate>, Pricing)> {
     let (last, per_model) = stored.split_last()?;
     if per_model.len() != models.len() {
         return None;
@@ -68,7 +78,7 @@ pub fn rates_from_stored(models: &[String], stored: &[ModelRate]) -> Option<Mode
         cache_write_1h: r.cache_write_1h,
         cache_read: r.cache_read,
     };
-    let resolved: Vec<ResolvedRate> = per_model
+    let resolved = per_model
         .iter()
         .map(|r| ResolvedRate {
             pricing: pricing(r),
@@ -76,10 +86,17 @@ pub fn rates_from_stored(models: &[String], stored: &[ModelRate]) -> Option<Mode
             unpriced: r.flags & RATE_UNKNOWN != 0,
         })
         .collect();
-    Some(ModelRates::from_resolved(models, &resolved, pricing(last)))
+    Some((resolved, pricing(last)))
 }
 
-pub fn build<S: Source + ?Sized>(mut parsed: Vec<ParsedSession>, source: &S) -> BuiltCache {
+/// Build the cache buffers. `prior` holds rates the previous `.db`
+/// resolved under the same price tables, reused by model name — see
+/// [`ModelRates::build_with_prior`].
+pub fn build<S: Source + ?Sized>(
+    mut parsed: Vec<ParsedSession>,
+    source: &S,
+    prior: &FxHashMap<String, ResolvedRate>,
+) -> BuiltCache {
     // u16::MAX is the "unknown model" / "no project" sentinel, so a table
     // holds at most that many real entries. Past it `len() as u16` wraps
     // onto ids already in use, mispricing every line that referenced them;
@@ -229,7 +246,7 @@ pub fn build<S: Source + ?Sized>(mut parsed: Vec<ParsedSession>, source: &S) -> 
 
     // Resolve each model's rate + skip flag once (one LiteLLM lookup per
     // distinct model) rather than rebuilding candidate lists per line.
-    let rates = ModelRates::build(source, &model_table);
+    let rates = ModelRates::build_with_prior(source, &model_table, prior);
     // Build the pre-aggregated summary — the same dedup and pricing as
     // live aggregate(), done once here so the hot path just sums rows.
     let preaggs = build_preaggs(&sessions, &lines, &rates);

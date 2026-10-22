@@ -9,7 +9,7 @@ use super::schema::{
     HDR_SZ, Header, LINE_HAS_ID, LINE_SZ, LineEntry, MAGIC, ModelRate, PREAGG_SZ, PreAgg, RATE_SZ,
     SESS_EXT_SZ, SESS_SZ, SessionEntry, SessionExt, VERSION,
 };
-use crate::source::{ModelRates, ParsedLine, ParsedSession, Source, SourceFile};
+use crate::source::{ModelRates, ParsedLine, ParsedSession, ResolvedRate, Source, SourceFile};
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -182,23 +182,28 @@ fn try_load_mmap<S: Source + ?Sized>(source: &S) -> Option<memmap2::Mmap> {
     Some(mmap)
 }
 
+/// Whether `prices.json` is newer than the `.db`, so the rates (and the
+/// `PreAgg` costs) it was built with may be out of date.
+///
+/// `PreAgg` costs are frozen at build time, so a prices.json newer than
+/// the .db (dropped in manually — a path the refresh-prices error text
+/// recommends) must invalidate the cache even though every JSONL
+/// fingerprint still matches. `refresh-prices` itself deletes the .db,
+/// but a hand-copied file doesn't.
+fn prices_newer_than_db<S: Source + ?Sized>(source: &S) -> bool {
+    let mtime = |p: Option<std::path::PathBuf>| fs::metadata(p?).ok()?.modified().ok();
+    match (
+        mtime(source.cache_path()),
+        mtime(crate::source::prices::cache_path()),
+    ) {
+        (Some(db), Some(prices)) => prices > db,
+        _ => false,
+    }
+}
+
 fn try_hot_path<S: Source + ?Sized>(source: &S, sources: &[SourceFile]) -> Option<LoadedCache> {
-    // PreAgg costs are frozen at build time, so a prices.json newer than
-    // the .db (dropped in manually — a path the refresh-prices error text
-    // recommends) must invalidate the cache even though every JSONL
-    // fingerprint still matches. `refresh-prices` itself deletes the .db,
-    // but a hand-copied file doesn't.
-    if let (Some(db_path), Some(prices_path)) =
-        (source.cache_path(), crate::source::prices::cache_path())
-    {
-        if let (Ok(db_meta), Ok(prices_meta)) = (fs::metadata(&db_path), fs::metadata(&prices_path))
-        {
-            if let (Ok(db_mtime), Ok(prices_mtime)) = (db_meta.modified(), prices_meta.modified()) {
-                if prices_mtime > db_mtime {
-                    return None;
-                }
-            }
-        }
+    if prices_newer_than_db(source) {
+        return None;
     }
     let mmap = try_load_mmap(source)?;
     let cache = cache_from_mmap(mmap)?;
@@ -418,19 +423,31 @@ fn cold_rebuild<S: Source + ?Sized>(source: &S, sources: Vec<SourceFile>) -> Loa
     };
 
     let mut all_parsed: Vec<ParsedSession> = freshly_parsed;
+    let mut prior_rates: FxHashMap<String, ResolvedRate> = FxHashMap::default();
     if let Some(old) = existing {
         for (src, old_idx) in reusable {
             if let Some(p) = reconstruct_from_cache(&old, old_idx, &src) {
                 all_parsed.push(p);
             }
         }
+        // The old rates hold unless prices.json changed since they were
+        // resolved; any other rate change is a different file or VERSION.
+        if !prices_newer_than_db(source) {
+            if let Some((rates, _)) = build::resolved_from_stored(&old.models, old.stored_rates()) {
+                prior_rates = old.models.iter().cloned().zip(rates).collect();
+            }
+        }
     }
 
-    finalize(all_parsed, source)
+    finalize(all_parsed, source, &prior_rates)
 }
 
-fn finalize<S: Source + ?Sized>(parsed: Vec<ParsedSession>, source: &S) -> LoadedCache {
-    let built: BuiltCache = build::build(parsed, source);
+fn finalize<S: Source + ?Sized>(
+    parsed: Vec<ParsedSession>,
+    source: &S,
+    prior_rates: &FxHashMap<String, ResolvedRate>,
+) -> LoadedCache {
+    let built: BuiltCache = build::build(parsed, source, prior_rates);
     if let Some(path) = source.cache_path() {
         let _ = build::write_cache(&built, &path);
     }
