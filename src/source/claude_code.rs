@@ -30,11 +30,14 @@ impl Source for ClaudeCode {
     fn scan_sources(&self) -> Vec<SourceFile> {
         let mut out: Vec<SourceFile> = Vec::new();
         for dir in self.log_roots() {
-            // Opt-in fast path: macOS getattrlistbulk batches readdir +
-            // stat into one kernel round-trip per directory, shaving
-            // ~500μs off the hot path (~2.8ms → ~2.1ms on a typical
-            // project tree). Set CCAUDIT_BULK_SCAN=1 to try it; any FFI
-            // error falls back silently to the portable default_scan.
+            // Opt-in alternative: macOS getattrlistbulk batches readdir +
+            // stat into one kernel round-trip per directory. It fetches
+            // attributes for every entry, though, while `default_scan`
+            // stats only `*.jsonl` (fd-relative), so on a tree with many
+            // non-session files it is the slower of the two — ~10 ms vs
+            // ~7 ms per `statusline` over 2400 entries. Set
+            // CCAUDIT_BULK_SCAN=1 to use it; any FFI error falls back
+            // silently to the portable default_scan.
             #[cfg(target_os = "macos")]
             if std::env::var_os("CCAUDIT_BULK_SCAN").is_some() {
                 if let Some(files) = scan_with_bulk(&dir) {

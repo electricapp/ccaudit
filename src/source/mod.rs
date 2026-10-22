@@ -8,7 +8,6 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -19,6 +18,8 @@ pub mod prices;
 
 #[cfg(target_os = "macos")]
 pub mod bulk_scan_darwin;
+#[cfg(unix)]
+mod scan_unix;
 
 // ── Canonical records ──
 // These are what every layer above `source` sees. Providers produce
@@ -481,19 +482,26 @@ pub const MAX_SCAN_DEPTH: usize = 8;
 /// traversal or the two disagree on which sessions exist.
 pub fn default_scan(dir: &Path) -> Vec<SourceFile> {
     let mut out: Vec<SourceFile> = Vec::with_capacity(256);
+    #[cfg(unix)]
+    scan_unix::scan(dir, MAX_SCAN_DEPTH, &mut out);
+    #[cfg(not(unix))]
     scan_dir_recursive(dir, MAX_SCAN_DEPTH, &mut out);
     out
 }
 
-// Sequential on purpose: a rayon fan-out saves ~1.7 ms of wall time on a
-// 350-directory tree but quadruples CPU time (idle workers spinning,
-// kernel lookup contention) — a poor trade for `statusline`, which a live
-// session invokes on every update.
+// The `std::fs` walk — what `scan_unix` reproduces with fd-relative
+// lookups, and the reference its test compares against.
+//
+// Both are sequential on purpose: a rayon fan-out saves ~1.7 ms of wall
+// time on a 350-directory tree but quadruples CPU time (idle workers
+// spinning, kernel lookup contention) — a poor trade for `statusline`,
+// which a live session invokes on every update.
+#[cfg(any(not(unix), test))]
 fn scan_dir_recursive(dir: &Path, depth_left: usize, out: &mut Vec<SourceFile>) {
     if depth_left == 0 {
         return;
     }
-    let Ok(entries) = fs::read_dir(dir) else {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for e in entries.flatten() {
@@ -796,8 +804,63 @@ mod tests {
         );
     }
 
-    /// `fable-5` carries no family token, so it billed at the Sonnet
-    /// tier — 30% of true cost — until a ccusage diff caught it.
+    /// The fd-relative Unix walk must see exactly what the `std::fs` one
+    /// does, in the same order: the cache validates by session count, and
+    /// build order breaks `started_at` ties.
+    #[cfg(unix)]
+    #[test]
+    fn unix_scan_matches_std_walk() {
+        use std::fs;
+        let root = tempfile::tempdir().expect("tempdir");
+        let r = root.path();
+        let touch = |rel: &str, body: &str| {
+            let p = r.join(rel);
+            fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            fs::write(p, body).expect("write");
+        };
+        touch("proj-a/s1.jsonl", "{}\n");
+        touch("proj-a/s2.jsonl", "");
+        touch("proj-a/notes.md", "x");
+        touch("proj-a/tool-results/out.txt", "x");
+        touch("proj-a/u1/subagents/agent-1.jsonl", "{}\n{}\n");
+        touch("proj-b/.jsonl", "hidden, no extension");
+        touch("proj-b/UPPER.JSONL", "wrong case");
+        touch("proj-b/s3.jsonl.bak", "not jsonl");
+        // MAX_SCAN_DEPTH = 8 lists `f` (the 8th level) but not `g`.
+        touch("proj-b/a/b/c/d/e/f/deepest.jsonl", "{}\n");
+        touch("proj-b/a/b/c/d/e/f/g/too-deep.jsonl", "{}\n");
+        touch("elsewhere/linked.jsonl", "{}\n");
+        std::os::unix::fs::symlink(r.join("elsewhere"), r.join("proj-c")).expect("dir symlink");
+        std::os::unix::fs::symlink(r.join("proj-a/s1.jsonl"), r.join("proj-b/link.jsonl"))
+            .expect("file symlink");
+
+        let key = |v: &[super::SourceFile]| -> Vec<(std::path::PathBuf, u64, u64, u64)> {
+            v.iter()
+                .map(|s| (s.path.clone(), s.path_hash, s.mtime, s.size))
+                .collect()
+        };
+        let mut std_walk = Vec::new();
+        super::scan_dir_recursive(r, super::MAX_SCAN_DEPTH, &mut std_walk);
+        let fd_walk = super::default_scan(r);
+        assert_eq!(key(&fd_walk), key(&std_walk));
+        let found = |suffix: &str| fd_walk.iter().any(|s| s.path.ends_with(suffix));
+        assert!(
+            found("subagents/agent-1.jsonl"),
+            "nested sessions are found"
+        );
+        assert!(found("f/deepest.jsonl"), "the 8th level is listed");
+        assert!(!found("too-deep.jsonl"), "the 9th level is not");
+        assert!(
+            !fd_walk
+                .iter()
+                .any(|s| s.path.starts_with(r.join("proj-c")) || s.path.ends_with("link.jsonl")),
+            "symlinks aren't followed"
+        );
+        assert_eq!(fd_walk.len(), 5);
+    }
+
+    /// `fable-5` carries no family token, so any family-name fallback
+    /// would bill it at the Sonnet tier — 30% of true cost.
     #[test]
     fn fable_is_priced_from_the_table_not_a_family_guess() {
         let p = super::claude_code::ClaudeCode.price(Some("claude-fable-5-20260601"));
