@@ -293,7 +293,9 @@ fn parse_cache_layout(bytes: &[u8]) -> Option<CacheLayout> {
     ) as usize;
     let strings_start = after_projects + 4;
     let strings_end = strings_start + slen;
-    if bytes.len() < strings_end {
+    // Exact, not `<`: the strings pool is the last section, so any other
+    // length is a torn or foreign file (the writer doesn't fsync).
+    if bytes.len() != strings_end {
         return None;
     }
 
@@ -363,7 +365,8 @@ fn cache_from_mmap_owned(mmap: &memmap2::Mmap) -> Option<LoadedCache> {
 // When a live session appends a few lines, only one JSONL's (mtime,
 // size) changes. We load the old cache (structurally, without full
 // validation), keep every session whose fingerprint still matches, and
-// reparse only the ones that actually differ.
+// reparse only the ones that actually differ — and of those, only the
+// appended bytes when the old entry carries a resume point.
 fn cold_rebuild<S: Source + ?Sized>(source: &S, sources: Vec<SourceFile>) -> LoadedCache {
     let existing: Option<LoadedCache> =
         try_load_mmap(source).and_then(|m| cache_from_mmap_owned(&m));
@@ -379,33 +382,43 @@ fn cold_rebuild<S: Source + ?Sized>(source: &S, sources: Vec<SourceFile>) -> Loa
         })
         .unwrap_or_default();
 
-    let mut to_parse: Vec<SourceFile> = Vec::new();
+    // Changed files carry their old index, if any, for the append path.
+    let mut to_parse: Vec<(SourceFile, Option<usize>)> = Vec::new();
     let mut reusable: Vec<(SourceFile, usize)> = Vec::new();
     for src in sources {
-        let reuse_idx = old_by_hash.get(&src.path_hash).copied().and_then(|i| {
-            let s = existing.as_ref()?.sessions().get(i)?;
-            (s.mtime == src.mtime && s.size == src.size).then_some(i)
-        });
-        match reuse_idx {
-            Some(i) => reusable.push((src, i)),
-            None => to_parse.push(src),
+        let old = old_by_hash
+            .get(&src.path_hash)
+            .copied()
+            .and_then(|i| Some((i, existing.as_ref()?.sessions().get(i)?)));
+        match old {
+            Some((i, s)) if s.mtime == src.mtime && s.size == src.size => {
+                reusable.push((src, i));
+            }
+            Some((i, _)) => to_parse.push((src, Some(i))),
+            None => to_parse.push((src, None)),
         }
     }
+
+    let parse = |(src, old_idx): &(SourceFile, Option<usize>)| -> Option<ParsedSession> {
+        let appended = old_idx.zip(existing.as_ref()).and_then(|(i, old)| {
+            let resume = old.sessions_ext().get(i)?.resume()?;
+            if src.size < resume.offset {
+                return None;
+            }
+            let prev = reconstruct_from_cache(old, i, src)?;
+            source.parse_appended(src, prev)
+        });
+        appended.or_else(|| source.parse_session(src))
+    };
 
     // Skip rayon for small batches: spawning + thread-pool overhead
     // dominates on a handful of sessions (typical "warm" reparse touches
     // 1–3 changed files). Threshold picked to amortize spinup roughly.
     const PAR_THRESHOLD: usize = 8;
     let freshly_parsed: Vec<ParsedSession> = if to_parse.len() >= PAR_THRESHOLD {
-        to_parse
-            .par_iter()
-            .filter_map(|s| source.parse_session(s))
-            .collect()
+        to_parse.par_iter().filter_map(parse).collect()
     } else {
-        to_parse
-            .iter()
-            .filter_map(|s| source.parse_session(s))
-            .collect()
+        to_parse.iter().filter_map(parse).collect()
     };
 
     let mut all_parsed: Vec<ParsedSession> = freshly_parsed;
@@ -500,6 +513,10 @@ fn reconstruct_from_cache(
         },
         lines,
         ts_unix: ts_slice.to_vec(),
+        resume: cache
+            .sessions_ext()
+            .get(old_idx)
+            .and_then(SessionExt::resume),
     })
 }
 

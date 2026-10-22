@@ -2,7 +2,9 @@
 //
 // Runs only on cold-rebuild. The hot path doesn't touch this file.
 
-use super::schema::{Header, LineEntry, MAGIC, PreAgg, SessionEntry, SessionExt, VERSION};
+use super::schema::{
+    Header, LineEntry, MAGIC, PreAgg, RESUMABLE, SessionEntry, SessionExt, VERSION,
+};
 use crate::source::{ParsedSession, Source};
 use rustc_hash::FxHashMap;
 use std::fs;
@@ -128,12 +130,18 @@ pub fn build<S: Source + ?Sized>(mut parsed: Vec<ParsedSession>, source: &S) -> 
             project_id,
             _pad: 0,
         });
+        let (resume_flags, resume_offset, resume_tail_hash) = match p.resume {
+            Some(r) => (r.flags | RESUMABLE, r.offset, r.tail_hash),
+            None => (0, 0, 0),
+        };
         sessions_ext.push(SessionExt {
             display_name_off: dn_off,
             session_id_off: sid_off,
             display_name_len: dn_len,
             session_id_len: sid_len,
-            _pad: 0,
+            resume_flags,
+            resume_offset,
+            resume_tail_hash,
         });
     }
 
@@ -256,8 +264,14 @@ pub fn write_cache(b: &BuiltCache, path: &Path) -> std::io::Result<()> {
     result
 }
 
+// No fsync: the `.db` is derived and rebuildable, and on macOS `sync_all`
+// is F_FULLFSYNC — a drive-cache flush that cost ~14 ms on every rebuild,
+// including the statusline's one-session-appended path. A torn file after
+// a power loss fails `parse_cache_layout`'s magic/version/exact-length
+// checks and is rebuilt.
 fn write_cache_to(b: &BuiltCache, tmp: &Path) -> std::io::Result<()> {
-    let mut f = fs::File::create(tmp)?;
+    // Buffered: the name pools are two small writes per string.
+    let mut f = std::io::BufWriter::with_capacity(1 << 16, fs::File::create(tmp)?);
 
     let header = Header {
         magic: MAGIC,
@@ -280,12 +294,10 @@ fn write_cache_to(b: &BuiltCache, tmp: &Path) -> std::io::Result<()> {
     let slen: u32 = b.strings.len() as u32;
     f.write_all(&slen.to_le_bytes())?;
     f.write_all(&b.strings)?;
-
-    f.sync_all()?;
-    Ok(())
+    f.flush()
 }
 
-fn write_string_vec(f: &mut fs::File, v: &[String]) -> std::io::Result<()> {
+fn write_string_vec(f: &mut impl Write, v: &[String]) -> std::io::Result<()> {
     let count: u32 = v.len() as u32;
     f.write_all(&count.to_le_bytes())?;
     for s in v {

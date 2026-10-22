@@ -5,7 +5,7 @@
 // and named. Adding a new provider means adding a sibling of this file;
 // no other layer needs to change.
 
-use super::{ParsedLine, ParsedSession, Pricing, Source, SourceFile, day_from_ts, fnv1a};
+use super::{ParsedLine, ParsedSession, Pricing, Resume, Source, SourceFile, day_from_ts, fnv1a};
 use crate::parse::{self, Message, MessageKind, Session};
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -53,20 +53,58 @@ impl Source for ClaudeCode {
         // where only the `.db` was wiped (e.g. after `refresh-prices`):
         // 300 .msgs reads beat 300 JSONL re-parses by a factor of ~10.
         if let Some(session) = parse::try_load_cached_full(&src.path) {
-            return Some(to_parsed_session(&src.path, src, &session));
+            let resume = session
+                .fingerprint
+                .and_then(|(_, size)| parse::resume_at_end(&src.path, size));
+            return Some(to_parsed_session(&src.path, src, &session, resume));
         }
         // allow_empty: a readable session with no billable lines must
         // still yield `Some` — see the trait contract. A `None` for a
         // file that keeps being scanned leaves the cache one session
         // short of the scan count, failing validation and forcing a
         // full rebuild on every run.
-        let session = parse::parse_session_allow_empty(&src.path)?;
+        let (session, resume) = parse::parse_session_resumable(&src.path)?;
         // Persist so the matching `try_load_cached_header` in
         // `load_all_projects`'s par_iter (which runs right after
         // `cache::load`) finds a hot cache and skips its own parse —
         // otherwise the cold path parses every file twice.
         parse::save_session_to_cache(&src.path, &session);
-        Some(to_parsed_session(&src.path, src, &session))
+        Some(to_parsed_session(&src.path, src, &session, resume))
+    }
+
+    // A live session's log grows a few lines per turn, and one can run to
+    // hundreds of MB; re-parsing all of it on every `statusline` poll is
+    // what this avoids. The tail is parsed on its own, then folded in by
+    // the same rules `SessionBuilder` and `to_parsed_session` apply to a
+    // whole file — first-wins fields keep `prev`'s value when the resume
+    // flags say it had one, last-wins `summary` takes the tail's.
+    //
+    // The per-session cache is left stale on purpose: its `.msgs` blob
+    // holds every message, and rewriting it per append would cost what
+    // the tail parse saves. The browser re-parses on its next load.
+    fn parse_appended(&self, src: &SourceFile, mut prev: ParsedSession) -> Option<ParsedSession> {
+        let flags = prev.resume?.flags;
+        let (tail, tail_resume) = parse::parse_session_tail(&src.path, prev.resume?)?;
+        push_usage_lines(&mut prev.lines, &mut prev.ts_unix, &tail.messages);
+        if flags & HAS_MESSAGES == 0 {
+            prev.started_at = tail.started_at;
+        }
+        if prev.session_model.is_none() {
+            prev.session_model.clone_from(&tail.model);
+        }
+        // summary > first user message > id: a tail summary always wins;
+        // a tail first message only when `prev` had neither.
+        if tail.summary.is_some() || (flags & HAS_LABEL == 0 && tail.first_user_msg.is_some()) {
+            prev.display_name = display_name_of(&tail);
+        }
+        if flags & HAS_CWD == 0 && tail.cwd.is_some() {
+            prev.project_name = project_name_for(&src.path, tail.cwd.as_deref());
+        }
+        let flags = flags | state_flags(&tail);
+        prev.resume = tail_resume.map(|r| Resume { flags, ..r });
+        prev.mtime = src.mtime;
+        prev.size = src.size;
+        Some(prev)
     }
 
     fn parse_messages(&self, path: &Path) -> Option<Session> {
@@ -236,23 +274,69 @@ fn display_name_of(session: &Session) -> String {
     super::sanitize_control(session.display_name())
 }
 
+// `Resume::flags` for Claude Code: which first-wins `Session` fields the
+// parsed prefix already set, so `parse_appended` knows whether the tail
+// may supply them.
+const HAS_MESSAGES: u32 = 1 << 0; // fixes `started_at` (first message's timestamp)
+const HAS_LABEL: u32 = 1 << 1; // summary or first user message — fixes the display name unless a summary follows
+const HAS_CWD: u32 = 1 << 2; // fixes `project_name`
+
+const fn state_flags(session: &Session) -> u32 {
+    let mut f = 0;
+    if !session.messages.is_empty() {
+        f |= HAS_MESSAGES;
+    }
+    if session.summary.is_some() || session.first_user_msg.is_some() {
+        f |= HAS_LABEL;
+    }
+    if session.cwd.is_some() {
+        f |= HAS_CWD;
+    }
+    f
+}
+
 // Turn the Claude-shaped Session (which the TUI/web data model uses)
-// into a provider-agnostic ParsedSession. Consecutive sub-messages with
-// the same `message_id` are coalesced — the parser emits one per content
-// block, but they all describe a single API call.
+// into a provider-agnostic ParsedSession.
+fn to_parsed_session(
+    path: &Path,
+    src: &SourceFile,
+    session: &Session,
+    resume: Option<Resume>,
+) -> ParsedSession {
+    let mut lines: Vec<ParsedLine> = Vec::new();
+    let mut ts_unix: Vec<i64> = Vec::new();
+    push_usage_lines(&mut lines, &mut ts_unix, &session.messages);
+    let flags = state_flags(session);
+    ParsedSession {
+        path_hash: src.path_hash,
+        mtime: src.mtime,
+        size: src.size,
+        started_at: session.started_at,
+        session_model: session.model.clone(),
+        display_name: display_name_of(session),
+        session_id: session_id_for(path),
+        project_name: project_name_for(path, session.cwd.as_deref()),
+        lines,
+        ts_unix,
+        resume: resume.map(|r| Resume { flags, ..r }),
+    }
+}
+
+// Append the billable rows of `messages` to `lines`. Consecutive
+// sub-messages with the same `message_id` are coalesced — the parser
+// emits one per content block, but they all describe a single API call —
+// including a run that continues the last row already in `lines`, which
+// is how an appended tail joins its prefix.
 //
 // Coalescing keeps the LAST line of a run, not the first. Claude Code
 // rewrites a streamed assistant message as it arrives, and `usage`
 // carries the running total: `input_tokens` and the cache counts are
 // fixed by the request and repeat unchanged, while `output_tokens` grows
-// with each line. Keeping the first line therefore booked a partial
-// output count for every streamed message — 4.4M tokens (~20% of all
-// output) missing across a year of local logs.
-fn to_parsed_session(path: &Path, src: &SourceFile, session: &Session) -> ParsedSession {
-    let mut lines: Vec<ParsedLine> = Vec::new();
-    let mut ts_unix: Vec<i64> = Vec::new();
-    let mut last_id: Option<&str> = None;
-    for msg in &session.messages {
+// with each line. Keeping the first line would book a partial output
+// count for every streamed message — 4.4M tokens (~20% of all output)
+// across a year of local logs.
+fn push_usage_lines(lines: &mut Vec<ParsedLine>, ts_unix: &mut Vec<i64>, messages: &[Message]) {
+    for msg in messages {
         let Message {
             tokens,
             timestamp,
@@ -268,10 +352,10 @@ fn to_parsed_session(path: &Path, src: &SourceFile, session: &Session) -> Parsed
         }
         let Some(t) = tokens.as_ref() else { continue };
         let Some(ts) = *timestamp else { continue };
-        let id = message_id.as_deref();
+        let id_hash = message_id.as_deref().map(|s| fnv1a(s.as_bytes()));
         let line = ParsedLine {
             day: day_from_ts(ts),
-            msg_id_hash: id.map(|s| fnv1a(s.as_bytes())),
+            msg_id_hash: id_hash,
             model: model.clone(),
             input: t.input.min(u64::from(u32::MAX)) as u32,
             output: t.output.min(u64::from(u32::MAX)) as u32,
@@ -283,9 +367,11 @@ fn to_parsed_session(path: &Path, src: &SourceFile, session: &Session) -> Parsed
         // so the run collapses to its final, complete usage. `max` on
         // each column rather than a blind overwrite, because a later
         // line reporting *less* than an earlier one would otherwise
-        // discard tokens that were already billed.
-        if id.is_some() && id == last_id {
-            if let Some(prev) = lines.last_mut() {
+        // discard tokens that were already billed. Ids compare by hash —
+        // the same hash the cache stores per row, so a resumed parse
+        // continues the run from `lines` alone.
+        if let Some(prev) = lines.last_mut() {
+            if id_hash.is_some() && prev.msg_id_hash == id_hash {
                 prev.output = prev.output.max(line.output);
                 prev.input = prev.input.max(line.input);
                 prev.cache_read = prev.cache_read.max(line.cache_read);
@@ -294,21 +380,8 @@ fn to_parsed_session(path: &Path, src: &SourceFile, session: &Session) -> Parsed
                 continue;
             }
         }
-        last_id = id;
         lines.push(line);
         ts_unix.push(ts.timestamp());
-    }
-    ParsedSession {
-        path_hash: src.path_hash,
-        mtime: src.mtime,
-        size: src.size,
-        started_at: session.started_at,
-        session_model: session.model.clone(),
-        display_name: display_name_of(session),
-        session_id: session_id_for(path),
-        project_name: project_name_for(path, session.cwd.as_deref()),
-        lines,
-        ts_unix,
     }
 }
 

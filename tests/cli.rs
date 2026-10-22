@@ -1730,3 +1730,324 @@ fn help_names_every_registered_source() {
         }
     }
 }
+
+// ── Incremental append ──
+//
+// A session whose log only grew is extended by parsing the appended bytes
+// alone. Every test here pins that the result equals a from-scratch parse
+// of the whole file.
+
+fn append_raw(path: &std::path::Path, bytes: &str) {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    f.write_all(bytes.as_bytes()).unwrap();
+}
+
+fn append_lines(path: &std::path::Path, lines: &[&str]) {
+    append_raw(path, &(lines.join("\n") + "\n"));
+}
+
+fn cache_dir(h: &Harness) -> std::path::PathBuf {
+    h.home.path().join(".claude").join("ccaudit-cache")
+}
+
+fn reports(h: &Harness) -> Vec<String> {
+    [
+        &["session", "--json", "--offline"][..],
+        &["daily", "--json", "--offline", "--breakdown"],
+    ]
+    .iter()
+    .map(|args| {
+        let out = h.run(args);
+        require_success(&out, &args.join(" "));
+        read_stdout(&out)
+    })
+    .collect()
+}
+
+/// Reports and the `.db` itself from the cache as it stands, then from a
+/// cold parse of the same files. The `.db` holds what no report prints
+/// (display names, resume points), so it is compared byte for byte. The
+/// cache directory is restored afterwards so the next append resumes from
+/// the incremental state, not the cold one.
+fn assert_matches_cold_parse(h: &Harness, ctx: &str) {
+    let dir = cache_dir(h);
+    let db = dir.join("claude-code.db");
+    let warm = reports(h);
+    let warm_db = std::fs::read(&db).unwrap();
+    let saved = h.home.path().join("cache-saved");
+    std::fs::rename(&dir, &saved).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let cold = reports(h);
+    let cold_db = std::fs::read(&db).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::rename(&saved, &dir).unwrap();
+    assert_eq!(
+        warm, cold,
+        "{ctx}: incremental reports differ from a cold parse"
+    );
+    assert!(
+        warm_db == cold_db,
+        "{ctx}: incremental .db differs from a cold parse"
+    );
+}
+
+fn usage_line(msg_id: &str, model: &str, iso_ts: &str, input: u64, output: u64) -> String {
+    assistant_line(&AssistantLine {
+        msg_id,
+        model,
+        iso_ts,
+        input,
+        output,
+        cache_read: 0,
+        cache_create: 0,
+        text: "reply",
+    })
+}
+
+fn user_line_with_cwd(content: &str, iso_ts: &str, cwd: &str) -> String {
+    serde_json::json!({
+        "type": "user",
+        "cwd": cwd,
+        "message": { "role": "user", "content": content },
+        "timestamp": iso_ts
+    })
+    .to_string()
+}
+
+#[test]
+fn appended_lines_match_a_cold_parse() {
+    let h = Harness::new();
+    let path = h.write_jsonl(
+        "-Users-test-code-alpha",
+        "sess_live",
+        &[&usage_line(
+            "msg_1",
+            "claude-opus-4-7",
+            "2026-04-01T12:00:01.000Z",
+            1000,
+            10,
+        )],
+    );
+    assert_matches_cold_parse(&h, "primed");
+
+    // The first appended line continues the streamed msg_1 across the
+    // append boundary: it must coalesce into the cached row, not add one.
+    // The rest fill first-wins fields the prefix lacked (cwd, first user
+    // message) and add a later day on another model.
+    append_lines(
+        &path,
+        &[
+            &usage_line(
+                "msg_1",
+                "claude-opus-4-7",
+                "2026-04-01T12:00:02.000Z",
+                1000,
+                900,
+            ),
+            &user_line_with_cwd(
+                "now with a prompt",
+                "2026-04-01T12:01:00.000Z",
+                "/Users/test/elsewhere/proj",
+            ),
+            &usage_line(
+                "msg_2",
+                "claude-sonnet-4-6",
+                "2026-04-02T08:00:00.000Z",
+                50,
+                60,
+            ),
+        ],
+    );
+    assert_matches_cold_parse(&h, "after append");
+
+    // A later summary replaces the first-prompt label.
+    append_lines(&path, &[&summary_line("Live session")]);
+    assert_matches_cold_parse(&h, "after summary");
+}
+
+/// A prefix with no messages (a lone summary) leaves `started_at` and the
+/// model for the tail to set.
+#[test]
+fn append_to_a_messageless_prefix_matches_a_cold_parse() {
+    let h = Harness::new();
+    let path = h.write_jsonl(
+        "-Users-test-code-alpha",
+        "sess_empty",
+        &[&summary_line("Named")],
+    );
+    assert_matches_cold_parse(&h, "summary only");
+    append_lines(
+        &path,
+        &[
+            &user_line("first prompt", "2026-04-03T09:00:00.000Z"),
+            &usage_line(
+                "msg_1",
+                "claude-opus-4-7",
+                "2026-04-03T09:00:01.000Z",
+                10,
+                20,
+            ),
+        ],
+    );
+    assert_matches_cold_parse(&h, "after first messages");
+}
+
+/// The append path must leave the per-session `.msgs` blob alone —
+/// rewriting it is the whole-file cost the tail parse exists to skip.
+#[test]
+fn append_does_not_reparse_the_whole_file() {
+    let h = Harness::new();
+    setup_single_project(&h);
+    let _ = reports(&h);
+    let meta_before: Vec<(std::path::PathBuf, Vec<u8>)> = std::fs::read_dir(cache_dir(&h))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "meta"))
+        .map(|p| {
+            let b = std::fs::read(&p).unwrap();
+            (p, b)
+        })
+        .collect();
+    assert!(
+        !meta_before.is_empty(),
+        "the cold parse writes per-session caches"
+    );
+
+    let path = h
+        .project_dir("-Users-test-code-alpha")
+        .join("sess_alpha.jsonl");
+    append_lines(
+        &path,
+        &[&usage_line(
+            "msg_Z",
+            "claude-opus-4-7",
+            "2026-04-03T10:00:00.000Z",
+            7,
+            7,
+        )],
+    );
+    let out = h.run(&["daily", "--json", "--offline"]);
+    require_success(&out, "daily after append");
+    let v: Value = serde_json::from_str(&read_stdout(&out)).unwrap();
+    assert_eq!(
+        v["rows"].as_array().unwrap().len(),
+        3,
+        "the appended day is reported"
+    );
+    for (p, before) in meta_before {
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            before,
+            "{} was rewritten",
+            p.display()
+        );
+    }
+}
+
+/// A file rewritten in place (not appended to) must be parsed in full.
+#[test]
+fn rewritten_file_is_parsed_in_full() {
+    let h = Harness::new();
+    let path = h.write_jsonl(
+        "-Users-test-code-alpha",
+        "sess_rw",
+        &[&usage_line(
+            "msg_1",
+            "claude-opus-4-7",
+            "2026-04-01T12:00:01.000Z",
+            1000,
+            10,
+        )],
+    );
+    let _ = reports(&h);
+    // Longer than before, with different bytes before the old end.
+    std::fs::write(
+        &path,
+        [
+            usage_line(
+                "msg_9",
+                "claude-sonnet-4-6",
+                "2026-04-05T12:00:01.000Z",
+                3,
+                4,
+            ),
+            usage_line(
+                "msg_8",
+                "claude-sonnet-4-6",
+                "2026-04-05T12:00:02.000Z",
+                5,
+                6,
+            ),
+        ]
+        .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    assert_matches_cold_parse(&h, "after rewrite");
+    let out = h.run(&["daily", "--json", "--offline"]);
+    let v: Value = serde_json::from_str(&read_stdout(&out)).unwrap();
+    assert_eq!(
+        v["totals"]["input"].as_u64(),
+        Some(8),
+        "only the rewritten lines count"
+    );
+}
+
+/// A final line without its newline may still be mid-write. Whether it
+/// parsed or not, completing it later must count it exactly once.
+#[test]
+fn unterminated_final_line_is_counted_once() {
+    let h = Harness::new();
+    let first = usage_line(
+        "msg_1",
+        "claude-opus-4-7",
+        "2026-04-01T12:00:01.000Z",
+        1000,
+        10,
+    );
+    let second = usage_line(
+        "msg_2",
+        "claude-opus-4-7",
+        "2026-04-01T12:00:05.000Z",
+        200,
+        20,
+    );
+    let third = usage_line(
+        "msg_3",
+        "claude-opus-4-7",
+        "2026-04-01T12:00:09.000Z",
+        30,
+        3,
+    );
+    let path = h
+        .project_dir("-Users-test-code-alpha")
+        .join("sess_cut.jsonl");
+
+    // Cut mid-line: the fragment doesn't parse.
+    let (head, rest) = second.split_at(second.len() / 2);
+    std::fs::write(&path, format!("{first}\n{head}")).unwrap();
+    assert_matches_cold_parse(&h, "partial line");
+    append_raw(&path, &format!("{rest}\n"));
+    assert_matches_cold_parse(&h, "partial line completed");
+
+    // A complete line still missing its newline does parse.
+    append_raw(&path, &third);
+    assert_matches_cold_parse(&h, "unterminated complete line");
+    append_raw(&path, "\n");
+    append_lines(
+        &path,
+        &[&usage_line(
+            "msg_4",
+            "claude-opus-4-7",
+            "2026-04-01T12:00:12.000Z",
+            4,
+            4,
+        )],
+    );
+    assert_matches_cold_parse(&h, "newline then more lines");
+    let out = h.run(&["daily", "--json", "--offline"]);
+    let v: Value = serde_json::from_str(&read_stdout(&out)).unwrap();
+    assert_eq!(v["totals"]["input"].as_u64(), Some(1234));
+}

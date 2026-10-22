@@ -1,3 +1,4 @@
+use crate::source::Resume;
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -209,6 +210,9 @@ pub fn try_load_cached_full(path: &Path) -> Option<Session> {
     let mut session: Session = postcard::from_bytes(&header_bytes).ok()?;
     let msgs_bytes = fs::read(dir.join(format!("{key}.msgs"))).ok()?;
     session.messages = postcard::from_bytes(&msgs_bytes).ok()?;
+    // The fingerprint this entry was just verified fresh against — also
+    // exactly the bytes the cached parse covered (see `resume_at_end`).
+    session.fingerprint = Some((cur_mtime, cur_size));
     Some(session)
 }
 
@@ -864,8 +868,18 @@ pub fn parse_session(path: &Path) -> Option<Session> {
 /// The aggregation cache validates by matching its session count against
 /// the scanned-file count, so returning `None` for a file that keeps
 /// being scanned would force a full rebuild on every run.
-#[allow(clippy::indexing_slicing)]
 pub fn parse_session_allow_empty(path: &Path) -> Option<Session> {
+    parse_session_resumable(path).map(|(s, _)| s)
+}
+
+/// [`parse_session_allow_empty`], plus where an append can resume (see
+/// [`parse_session_tail`]), with `flags` left 0 for the provider.
+///
+/// The resume point is `None` when the file is empty or ends in a line
+/// that parsed without its newline — one a later append might still be
+/// completing.
+#[allow(clippy::indexing_slicing)]
+pub fn parse_session_resumable(path: &Path) -> Option<(Session, Option<Resume>)> {
     // Fingerprint BEFORE mapping: an append racing the parse must leave
     // the cache entry stale (old fingerprint, old content), never stamp
     // the new (mtime,size) onto content that predates it.
@@ -873,71 +887,138 @@ pub fn parse_session_allow_empty(path: &Path) -> Option<Session> {
     if fingerprint.1 == 0 {
         // Zero-byte file: readable but empty (mmap would reject a
         // zero-length map anyway).
-        return Some(build_session(
-            path,
-            SessionBuilder::with_capacity(0),
-            fingerprint,
+        return Some((
+            build_session(path, SessionBuilder::with_capacity(0), Some(fingerprint)),
+            None,
         ));
     }
+    let mmap = map_file(path)?;
+    // Strip a UTF-8 BOM (files round-tripped through editors add one) so
+    // the first line's JSON parse doesn't silently fail.
+    let bom = if mmap.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        3
+    } else {
+        0
+    };
+    let data = &mmap[bom..];
+    let mut b = SessionBuilder::with_capacity(data.len() / 600);
+    let resume = parse_lines(data, &mut b).and_then(|rel| Resume::at(&mmap, bom + rel, 0));
+    Some((build_session(path, b, Some(fingerprint)), resume))
+}
+
+/// Parse only what was appended to `path` since `prev`, a resume point
+/// from [`parse_session_resumable`] or an earlier tail parse.
+///
+/// `None` when the file no longer extends that parse: it's shorter than
+/// the offset, or the [`crate::source::RESUME_WINDOW`] bytes before it
+/// changed. The returned `Session` covers the tail alone and carries no
+/// fingerprint, so it is never written to the per-session cache.
+#[allow(clippy::indexing_slicing)]
+pub fn parse_session_tail(path: &Path, prev: Resume) -> Option<(Session, Option<Resume>)> {
+    let off = usize::try_from(prev.offset).ok().filter(|&o| o > 0)?;
+    let mmap = map_file(path)?;
+    if crate::source::resume_window_hash(&mmap, off)? != prev.tail_hash {
+        return None;
+    }
+    let data = &mmap[off..];
+    let mut b = SessionBuilder::with_capacity(data.len() / 600);
+    let resume = parse_lines(data, &mut b).and_then(|rel| Resume::at(&mmap, off + rel, 0));
+    Some((build_session(path, b, None), resume))
+}
+
+fn map_file(path: &Path) -> Option<memmap2::Mmap> {
     let file = fs::File::open(path).ok()?;
     // SAFETY: read-only map. Concurrent appends are benign — the mapping
     // length is fixed at map time. A truncation mid-parse would SIGBUS;
     // Claude Code session files are append-only in practice, so this is
     // accepted rather than paying a defensive full read.
     #[allow(unsafe_code)]
-    let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
-    let mut data = &*mmap;
-    // Strip a UTF-8 BOM (files round-tripped through editors add one) so
-    // the first line's JSON parse doesn't silently fail.
-    if data.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        data = &data[3..];
+    unsafe {
+        memmap2::Mmap::map(&file).ok()
     }
+}
 
+/// The resume point for a session loaded from a per-session cache entry
+/// that is fresh at `size` bytes: `size` itself, when the file ends in a
+/// newline. `flags` left 0, as for [`parse_session_resumable`].
+///
+/// A fresh entry means the cached parse read exactly `size` bytes — its
+/// fingerprint was taken before the map, and the file can only have
+/// grown since. Reads just the last [`crate::source::RESUME_WINDOW`]
+/// bytes.
+pub fn resume_at_end(path: &Path, size: u64) -> Option<Resume> {
+    use std::io::{Read, Seek, SeekFrom};
+    let window = (crate::source::RESUME_WINDOW as u64).min(size);
+    let mut f = fs::File::open(path).ok()?;
+    let _ = f.seek(SeekFrom::Start(size - window)).ok()?;
+    let mut buf = vec![0u8; usize::try_from(window).ok()?];
+    f.read_exact(&mut buf).ok()?;
+    if buf.last() != Some(&b'\n') {
+        return None;
+    }
+    Some(Resume {
+        offset: size,
+        tail_hash: crate::source::fnv1a(&buf),
+        flags: 0,
+    })
+}
+
+/// Parse every line of `data` into `b`.
+///
+/// Returns the offset just past the last `\n` — where a later append
+/// resumes — or `None` when an unterminated final line parsed. Bytes
+/// appended next join that line in a whole-file parse, so no offset
+/// reproduces it: resuming after it keeps the line even if the joined
+/// one wouldn't parse, and resuming before it counts it twice. An
+/// unterminated line that *doesn't* parse contributed nothing, so
+/// resuming before it is exact.
+#[allow(clippy::indexing_slicing)]
+fn parse_lines(data: &[u8], b: &mut SessionBuilder) -> Option<usize> {
+    let complete = memchr::memrchr(b'\n', data).map_or(0, |i| i + 1);
+    let body = &data[..complete];
     // ≤10MB: fused single-pass loop. memchr_iter yields line ends, we
     // parse + merge inline. Skips the two intermediate Vecs
     // (`line_ranges` + `Vec<Option<ParsedLine>>`) the parallel path
     // needs. >10MB: collect line ranges, parse them in parallel, then
     // merge sequentially since order matters for first_user_msg / model.
-    let mut b = SessionBuilder::with_capacity(data.len() / 600);
-    if data.len() > 10_000_000 {
-        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(data.len() / 600);
+    if body.len() > 10_000_000 {
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(body.len() / 600);
         let mut start = 0;
-        for pos in memchr::memchr_iter(b'\n', data) {
+        for pos in memchr::memchr_iter(b'\n', body) {
             if pos > start {
                 ranges.push((start, pos));
             }
             start = pos + 1;
         }
-        if start < data.len() {
-            ranges.push((start, data.len()));
-        }
         let parsed: Vec<Option<ParsedLine>> = ranges
             .par_iter()
-            .map(|&(s, e)| parse_one_line(&data[s..e]))
+            .map(|&(s, e)| parse_one_line(&body[s..e]))
             .collect();
         for p in parsed.into_iter().flatten() {
             b.push(p);
         }
     } else {
         let mut start = 0;
-        for pos in memchr::memchr_iter(b'\n', data) {
+        for pos in memchr::memchr_iter(b'\n', body) {
             if pos > start {
-                if let Some(p) = parse_one_line(&data[start..pos]) {
+                if let Some(p) = parse_one_line(&body[start..pos]) {
                     b.push(p);
                 }
             }
             start = pos + 1;
         }
-        if start < data.len() {
-            if let Some(p) = parse_one_line(&data[start..]) {
-                b.push(p);
-            }
+    }
+    let unterminated = &data[complete..];
+    if !unterminated.is_empty() {
+        if let Some(p) = parse_one_line(unterminated) {
+            b.push(p);
+            return None;
         }
     }
-    Some(build_session(path, b, fingerprint))
+    Some(complete)
 }
 
-fn build_session(path: &Path, b: SessionBuilder, fingerprint: (u64, u64)) -> Session {
+fn build_session(path: &Path, b: SessionBuilder, fingerprint: Option<(u64, u64)>) -> Session {
     let SessionBuilder {
         messages,
         summary,
@@ -984,7 +1065,7 @@ fn build_session(path: &Path, b: SessionBuilder, fingerprint: (u64, u64)) -> Ses
         cost_output: 0.0,
         cost_cache_read: 0.0,
         cost_cache_create: 0.0,
-        fingerprint: Some(fingerprint),
+        fingerprint,
     }
 }
 

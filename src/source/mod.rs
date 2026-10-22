@@ -39,6 +39,46 @@ pub struct ParsedSession {
     pub project_name: Option<String>,
     pub lines: Vec<ParsedLine>,
     pub ts_unix: Vec<i64>,
+    /// Where [`Source::parse_appended`] can pick this session back up
+    /// once its log grows. `None` when the provider can't resume it, or
+    /// the parse ended on a line that may still be mid-write.
+    pub resume: Option<Resume>,
+}
+
+/// A point in an append-only log up to which a [`ParsedSession`] already
+/// accounts for every byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resume {
+    /// Byte offset just past the last line consumed.
+    pub offset: u64,
+    /// `fnv1a` of the [`RESUME_WINDOW`] bytes ending at `offset`. A
+    /// mismatch means the file was rewritten, not appended to.
+    pub tail_hash: u64,
+    /// Provider-defined parse state the appended lines are merged
+    /// against (Claude Code: which first-wins fields are already set).
+    pub flags: u32,
+}
+
+/// Bytes before a resume offset that must be unchanged for an append.
+pub const RESUME_WINDOW: usize = 4096;
+
+impl Resume {
+    /// The resume point after `data[..offset]`, which is the start of
+    /// the file the parse read.
+    pub fn at(data: &[u8], offset: usize, flags: u32) -> Option<Self> {
+        Some(Self {
+            offset: offset as u64,
+            tail_hash: resume_window_hash(data, offset)?,
+            flags,
+        })
+    }
+}
+
+/// `fnv1a` of the [`RESUME_WINDOW`] bytes ending at `offset` (fewer when
+/// the file is shorter). `None` when `offset` is past the end of `data`.
+pub fn resume_window_hash(data: &[u8], offset: usize) -> Option<u64> {
+    data.get(offset.saturating_sub(RESUME_WINDOW)..offset)
+        .map(fnv1a)
 }
 
 pub struct ParsedLine {
@@ -270,6 +310,17 @@ pub trait Source: Sync + Send {
     /// rebuild on every run.
     fn parse_session(&self, src: &SourceFile) -> Option<ParsedSession>;
 
+    /// Extend `prev` — this session as of its last parse, with
+    /// `prev.resume` set — by only the bytes appended since.
+    ///
+    /// Must produce exactly what [`Source::parse_session`] would for the
+    /// whole file. `None` (the default) means "can't": the file no longer
+    /// extends what `prev` parsed, or the provider doesn't support
+    /// resuming, and the cache falls back to a full `parse_session`.
+    fn parse_appended(&self, _src: &SourceFile, _prev: ParsedSession) -> Option<ParsedSession> {
+        None
+    }
+
     /// Parse one session's *message content* for the session browser.
     ///
     /// [`Source::parse_session`] feeds the aggregation cache and only
@@ -434,6 +485,10 @@ pub fn default_scan(dir: &Path) -> Vec<SourceFile> {
     out
 }
 
+// Sequential on purpose: a rayon fan-out saves ~1.7 ms of wall time on a
+// 350-directory tree but quadruples CPU time (idle workers spinning,
+// kernel lookup contention) — a poor trade for `statusline`, which a live
+// session invokes on every update.
 fn scan_dir_recursive(dir: &Path, depth_left: usize, out: &mut Vec<SourceFile>) {
     if depth_left == 0 {
         return;
@@ -442,20 +497,23 @@ fn scan_dir_recursive(dir: &Path, depth_left: usize, out: &mut Vec<SourceFile>) 
         return;
     };
     for e in entries.flatten() {
+        // The entry's own type (no symlink follow), from readdir's d_type
+        // where the filesystem reports it. Project trees hold several
+        // non-JSONL files per session (tool-result dumps, images), so
+        // only `*.jsonl` pays for a stat.
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_dir() {
+            scan_dir_recursive(&e.path(), depth_left - 1, out);
+            continue;
+        }
+        if !ft.is_file() {
+            continue;
+        }
         let p = e.path();
-        // metadata() follows symlinks, so symlinked project dirs stay
-        // traversable.
-        let Ok(meta) = e.metadata() else { continue };
-        if meta.is_dir() {
-            scan_dir_recursive(&p, depth_left - 1, out);
-            continue;
-        }
-        if !meta.is_file() {
-            continue;
-        }
         if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
             continue;
         }
+        let Ok(meta) = e.metadata() else { continue };
         let mtime = meta
             .modified()
             .ok()

@@ -17,7 +17,7 @@
 // File layout (all multi-byte integers little-endian):
 //   Header                   (32 B)
 //   Sessions (hot)           (num_sessions × 48 B, sorted by path_hash)
-//   SessionsExt (cold)       (num_sessions × 16 B, parallel to Sessions)
+//   SessionsExt (cold)       (num_sessions × 32 B, parallel to Sessions)
 //   Lines                    (num_lines × 32 B)
 //   ts_unix                  (num_lines × 8 B — parallel to Lines)
 //   PreAggs                  (num_preaggs × 64 B, already deduped)
@@ -42,7 +42,7 @@ pub const MAGIC: u32 = 0x4343_5547; // "CCUG"
 // into them, or to pricing rules that are baked into PreAgg costs; a
 // mismatch forces one full rebuild, which is what keeps a stale `.db`
 // from being reinterpreted under a new layout or an old rate.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -75,8 +75,9 @@ pub struct SessionEntry {
     pub(crate) _pad: u32,
 }
 
-// Cold half — only touched when rendering the `session` report. Lives
-// in a parallel array so the hot section above stays dense in cache.
+// Cold half — only touched when rendering the `session` report or
+// rebuilding. Lives in a parallel array so the hot section above stays
+// dense in cache.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct SessionExt {
@@ -84,7 +85,28 @@ pub struct SessionExt {
     pub session_id_off: u32,
     pub display_name_len: u16,
     pub session_id_len: u16,
-    pub(crate) _pad: u32,
+    /// `Resume::flags`, plus [`RESUMABLE`] when the resume fields hold
+    /// a point to continue from.
+    pub resume_flags: u32,
+    pub resume_offset: u64,
+    pub resume_tail_hash: u64,
+}
+
+/// `SessionExt::resume_flags` bit marking the resume fields as set.
+/// Providers' own flags stay below it.
+pub const RESUMABLE: u32 = 1 << 31;
+
+impl SessionExt {
+    pub const fn resume(&self) -> Option<crate::source::Resume> {
+        if self.resume_flags & RESUMABLE == 0 {
+            return None;
+        }
+        Some(crate::source::Resume {
+            offset: self.resume_offset,
+            tail_hash: self.resume_tail_hash,
+            flags: self.resume_flags & !RESUMABLE,
+        })
+    }
 }
 
 #[repr(C)]
@@ -171,7 +193,7 @@ const _: () = {
     // must be bumped.
     assert!(HDR_SZ == 32);
     assert!(SESS_SZ == 48);
-    assert!(SESS_EXT_SZ == 16);
+    assert!(SESS_EXT_SZ == 32);
     assert!(LINE_SZ == 40);
     assert!(PREAGG_SZ == 64);
 };

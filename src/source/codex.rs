@@ -419,6 +419,7 @@ fn parse_codex_session(src: &SourceFile) -> Option<ParsedSession> {
         project_name,
         lines,
         ts_unix,
+        resume: None,
     })
 }
 
